@@ -2,10 +2,10 @@ import os
 import re
 import html
 import asyncio
-import threading
 from datetime import datetime, time
 from zoneinfo import ZoneInfo
-from http.server import BaseHTTPRequestHandler, HTTPServer
+
+from aiohttp import web
 
 from aiogram import Bot, Dispatcher, F
 from aiogram.client.default import DefaultBotProperties
@@ -60,7 +60,6 @@ def esc(s: str) -> str:
     return html.escape(s or "")
 
 async def safe_answer(message: Message, text: str, reply_markup=None):
-    # Защита от любых символов / сломанной разметки
     try:
         await message.answer(text, reply_markup=reply_markup)
     except Exception:
@@ -138,7 +137,6 @@ TEXT = {
             "ℹ️ Точный размер подтверждает менеджер (по модели и посадке)."
         ),
 
-        # CONTACT
         "contact_title": (
             "📞 <b>Связаться</b>\n"
             "Мы принимаем заявки <b>24/7</b>.\n"
@@ -149,7 +147,6 @@ TEXT = {
             "Если хотите — оставьте ваш номер, и менеджер свяжется с вами очень скоро 👇"
         ),
 
-        # ORDER (без адреса!)
         "order_start": "🧾 <b>Оформляем заказ</b>\nКак вас зовут?",
         "order_phone": "📲 Отправьте номер телефона (или нажмите кнопку «📲 Отправить контакт»).",
         "order_city": "🏙 Ваш город?",
@@ -238,7 +235,6 @@ TEXT = {
             "ℹ️ Aniq o‘lcham menejer tomonidan tasdiqlanadi."
         ),
 
-        # CONTACT
         "contact_title": (
             "📞 <b>Aloqa</b>\n"
             "Buyurtmalar <b>24/7</b> qabul qilinadi.\n"
@@ -247,7 +243,6 @@ TEXT = {
         ),
         "contact_offer_leave": "Xohlasangiz, raqamingizni qoldiring — menejer tez orada bog‘lanadi 👇",
 
-        # ORDER
         "order_start": "🧾 <b>Buyurtma</b>\nIsmingiz?",
         "order_phone": "📲 Telefon raqam yuboring (yoki «📲 Kontakt yuborish» tugmasi).",
         "order_city": "🏙 Shahar?",
@@ -292,7 +287,6 @@ class Flow(StatesGroup):
 
     edit_field = State()
 
-
 # =========================
 # HELPERS
 # =========================
@@ -304,8 +298,7 @@ def in_work_time(dt: datetime) -> bool:
     return WORK_START <= t <= WORK_END
 
 def clean_phone(raw: str) -> str:
-    s = (raw or "").strip().replace(" ", "").replace("-", "")
-    return s
+    return (raw or "").strip().replace(" ", "").replace("-", "")
 
 def looks_like_phone(s: str) -> bool:
     s = clean_phone(s)
@@ -449,7 +442,6 @@ def kb_contact_request(lang: str) -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(keyboard=[[btn], [cancel]], resize_keyboard=True, one_time_keyboard=True)
 
 def kb_contact_actions(lang: str) -> InlineKeyboardMarkup:
-    # Кнопка "Оставить контакт" — запускает шаг телефона в заказе
     if lang == "uz":
         return InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(text="📲 Kontakt qoldirish", callback_data="contact:leave")],
@@ -461,7 +453,7 @@ def kb_contact_actions(lang: str) -> InlineKeyboardMarkup:
     ])
 
 # =========================
-# ORDER VIEW (без фейковых callback)
+# ORDER VIEW
 # =========================
 async def show_order_review(target, state: FSMContext, lang: str):
     data = await state.get_data()
@@ -502,26 +494,26 @@ async def back_menu(call: CallbackQuery, state: FSMContext):
     await safe_answer_call(call, TEXT[lang]["menu_title"], reply_markup=kb_menu(lang))
     await call.answer()
 
-# ---------- MENU BY TEXT ----------
 async def menu_by_text(message: Message, state: FSMContext):
     lang = await get_lang(state)
     txt = (message.text or "").strip()
 
-    # Отмена всегда работает
     if (lang == "ru" and txt == "❌ Отмена") or (lang == "uz" and txt == "❌ Bekor qilish"):
         await set_lang_keep(state, lang)
         await safe_answer(message, TEXT[lang]["cancelled"], reply_markup=kb_menu(lang))
         return
 
-    # Если пользователь в заказе и нажимает меню — не ломаемся
     st = await state.get_state()
     if st and st.startswith("Flow:order_"):
-        # можно продолжить спокойно, но если он нажал меню — покажем подсказку
-        await safe_answer(message, TEXT[lang]["flow_locked"], reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="➡️ Продолжить заказ" if lang == "ru" else "➡️ Buyurtmani davom ettirish", callback_data="order:back_confirm")],
-            [InlineKeyboardButton(text="⬅️ Меню" if lang == "ru" else "⬅️ Menyu", callback_data="back:menu")],
-            [InlineKeyboardButton(text="❌ Отмена" if lang == "ru" else "❌ Bekor qilish", callback_data="order:cancel")],
-        ]))
+        await safe_answer(
+            message,
+            TEXT[lang]["flow_locked"],
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="➡️ Продолжить заказ" if lang == "ru" else "➡️ Buyurtmani davom ettirish", callback_data="order:back_confirm")],
+                [InlineKeyboardButton(text="⬅️ Меню" if lang == "ru" else "⬅️ Menyu", callback_data="back:menu")],
+                [InlineKeyboardButton(text="❌ Отмена" if lang == "ru" else "❌ Bekor qilish", callback_data="order:cancel")],
+            ])
+        )
         return
 
     if (lang == "ru" and txt == "🌐 Язык") or (lang == "uz" and txt == "🌐 Til"):
@@ -560,7 +552,6 @@ async def menu_by_text(message: Message, state: FSMContext):
 
     await safe_answer(message, TEXT[lang]["unknown"], reply_markup=kb_menu(lang))
 
-# ---------- PRICE ----------
 async def price_section(call: CallbackQuery, state: FSMContext):
     lang = await get_lang(state)
     sec = call.data.split(":")[1]
@@ -572,7 +563,6 @@ async def price_section(call: CallbackQuery, state: FSMContext):
         await safe_answer_call(call, TEXT[lang]["price_unisex"], reply_markup=kb_price(lang))
     await call.answer()
 
-# ---------- PHOTOS ----------
 async def photo_section(call: CallbackQuery, state: FSMContext):
     lang = await get_lang(state)
     key = call.data.split(":")[1]
@@ -595,7 +585,6 @@ async def photo_section(call: CallbackQuery, state: FSMContext):
 
     await call.answer()
 
-# ---------- SIZE ----------
 async def size_mode(call: CallbackQuery, state: FSMContext):
     lang = await get_lang(state)
     mode = call.data.split(":")[1]
@@ -644,14 +633,12 @@ async def size_height(message: Message, state: FSMContext):
     )
     await safe_answer(message, TEXT[lang]["subscribe"], reply_markup=kb_menu(lang))
 
-# ---------- CONTACT leave ----------
 async def contact_leave(call: CallbackQuery, state: FSMContext):
     lang = await get_lang(state)
     await state.set_state(Flow.order_phone)
     await safe_answer_call(call, TEXT[lang]["order_phone"], reply_markup=kb_contact_request(lang))
     await call.answer()
 
-# ---------- ORDER (без адреса) ----------
 async def start_order(message: Message, state: FSMContext):
     lang = await get_lang(state)
     await state.set_state(Flow.order_name)
@@ -696,7 +683,6 @@ async def order_phone(message: Message, state: FSMContext):
 
     await state.update_data(order_phone=phone)
 
-    # ✅ сразу благодарим за контакт, но продолжаем заказ
     thanks = "Спасибо! Менеджер свяжется с вами очень скоро ✅" if lang == "ru" else "Rahmat! Menejer tez orada bog‘lanadi ✅"
     await safe_answer(message, thanks, reply_markup=ReplyKeyboardRemove())
 
@@ -780,11 +766,10 @@ async def edit_pick(call: CallbackQuery, state: FSMContext):
         "comment": TEXT[lang]["order_comment"],
     }
 
+    await state.set_state(Flow.edit_field)
     if field == "phone":
-        await state.set_state(Flow.edit_field)
         await safe_answer_call(call, prompts["phone"], reply_markup=kb_contact_request(lang))
     else:
-        await state.set_state(Flow.edit_field)
         await safe_answer_call(call, prompts.get(field, TEXT[lang]["unknown"]), reply_markup=ReplyKeyboardRemove())
 
     await call.answer()
@@ -825,7 +810,6 @@ async def edit_field_value(message: Message, state: FSMContext):
     if field in key_map:
         await state.update_data(**{key_map[field]: value})
 
-    # ✅ просто показываем подтверждение без фейкового callback
     await state.set_state(Flow.order_confirm)
     await show_order_review(message, state, lang)
 
@@ -834,7 +818,6 @@ async def order_confirm(call: CallbackQuery, state: FSMContext):
     data = await state.get_data()
 
     ts = now_local().strftime("%Y-%m-%d %H:%M")
-
     manager_text = (
         f"🛎 <b>Новый заказ</b> ({esc(ts)})\n\n"
         f"• Имя: <b>{esc(data.get('order_name','-'))}</b>\n"
@@ -862,24 +845,23 @@ async def order_confirm(call: CallbackQuery, state: FSMContext):
     await call.answer()
 
 # =========================
-# RENDER PORT BINDING (health server)
+# RENDER HEALTH SERVER (aiohttp)  ✅ FIX
 # =========================
-class _HealthHandler(BaseHTTPRequestHandler):
-    def do_GET(self):
-        self.send_response(200)
-        self.send_header("Content-Type", "text/plain; charset=utf-8")
-        self.end_headers()
-        self.wfile.write(b"OK")
+async def start_health_server():
+    async def health(_request):
+        return web.Response(text="OK")
 
-    def log_message(self, format, *args):
-        return  # mute logs
+    app = web.Application()
+    app.router.add_get("/", health)
+    app.router.add_get("/health", health)
+    app.router.add_get("/healthz", health)
 
-def start_health_server():
     port = int(os.getenv("PORT", "10000"))
-    server = HTTPServer(("0.0.0.0", port), _HealthHandler)
-    t = threading.Thread(target=server.serve_forever, daemon=True)
-    t.start()
-    print(f"✅ Health server listening on port {port} (Render port binding).")
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, "0.0.0.0", port)
+    await site.start()
+    print(f"✅ Health server running on port {port}")
 
 # =========================
 # DISPATCHER
@@ -922,8 +904,8 @@ def build_dp() -> Dispatcher:
     return dp
 
 async def main():
-    # Render port binding fix
-    start_health_server()
+    # ✅ запускаем health сервер (Render + UptimeRobot)
+    await start_health_server()
 
     bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
     dp = build_dp()
