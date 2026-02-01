@@ -1,5 +1,7 @@
 import os
 import re
+import threading
+from http.server import BaseHTTPRequestHandler, HTTPServer
 from datetime import datetime, time
 from zoneinfo import ZoneInfo
 
@@ -24,7 +26,7 @@ from aiogram.types import (
 # =========================
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 if not BOT_TOKEN:
-    raise RuntimeError("BOT_TOKEN env is empty. Set it before запуск: set BOT_TOKEN=...")
+    raise RuntimeError("BOT_TOKEN env is empty. Set it in Render Environment Variables: BOT_TOKEN=...")
 
 MANAGER_CHAT_ID = 7195737024  # твой Telegram ID
 
@@ -42,42 +44,14 @@ MANAGER_USERNAME = ""  # можно оставить пустым
 
 # =========================
 # PHOTO CATALOG (file_id)
-# ВАЖНО: сюда позже вставишь реальные file_id фотографий.
-# Сейчас можно оставить пустым — бот покажет "пока нет фото".
 # =========================
 PHOTO_CATALOG = {
-    "hoodie": {
-        "ru": "Худи",
-        "uz": "Xudi",
-        "items": [
-            # {"file_id": "AgACAgIAAxkBAA...", "caption_ru": "Худи серое", "caption_uz": "Kulrang xudi"},
-        ],
-    },
-    "outerwear": {
-        "ru": "Куртки/Верх",
-        "uz": "Kurtka/Ustki",
-        "items": [],
-    },
-    "sets": {
-        "ru": "Костюмы",
-        "uz": "Kostyumlar",
-        "items": [],
-    },
-    "school": {
-        "ru": "Школьная форма",
-        "uz": "Maktab formasi",
-        "items": [],
-    },
-    "summer": {
-        "ru": "Лето",
-        "uz": "Yozgi",
-        "items": [],
-    },
-    "new": {
-        "ru": "Новинки",
-        "uz": "Yangi",
-        "items": [],
-    },
+    "hoodie": {"ru": "Худи", "uz": "Xudi", "items": []},
+    "outerwear": {"ru": "Куртки/Верх", "uz": "Kurtka/Ustki", "items": []},
+    "sets": {"ru": "Костюмы", "uz": "Kostyumlar", "items": []},
+    "school": {"ru": "Школьная форма", "uz": "Maktab formasi", "items": []},
+    "summer": {"ru": "Лето", "uz": "Yozgi", "items": []},
+    "new": {"ru": "Новинки", "uz": "Yangi", "items": []},
 }
 
 # =========================
@@ -263,7 +237,7 @@ TEXT = {
         ),
         "unknown": "Iltimos, tugmalar orqali tanlang 👇",
         "cancelled": "❌ Tayyor. Menyuga qaytdik 👇",
-    }
+    },
 }
 
 # =========================
@@ -291,44 +265,42 @@ class Flow(StatesGroup):
 def now_local() -> datetime:
     return datetime.now(TZ)
 
+
 def in_work_time(dt: datetime) -> bool:
     t = dt.time()
     return WORK_START <= t <= WORK_END
 
+
 def clean_phone(raw: str) -> str:
-    s = (raw or "").strip().replace(" ", "").replace("-", "")
-    return s
+    return (raw or "").strip().replace(" ", "").replace("-", "")
+
 
 def looks_like_phone(s: str) -> bool:
     s = clean_phone(s)
-    if s.startswith("+"):
-        digits = re.sub(r"\D", "", s)
-        return 9 <= len(digits) <= 15
     digits = re.sub(r"\D", "", s)
     return 9 <= len(digits) <= 15
 
-def parse_age_height(text: str):
-    # accepts: "7 лет, 125 см" / "7 125" / "7y 125"
-    nums = re.findall(r"\d{1,3}", text or "")
-    if len(nums) >= 2:
-        age = int(nums[0])
-        height = int(nums[1])
-        return age, height
-    return None, None
 
 async def get_lang(state: FSMContext) -> str:
     data = await state.get_data()
     return data.get("lang", "ru")
 
+
 async def set_lang_keep(state: FSMContext, lang: str):
     await state.clear()
     await state.update_data(lang=lang)
 
+
 def kb_lang() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="Русский 🇷🇺", callback_data="lang:ru"),
-         InlineKeyboardButton(text="O‘zbek 🇺🇿", callback_data="lang:uz")]
-    ])
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(text="Русский 🇷🇺", callback_data="lang:ru"),
+                InlineKeyboardButton(text="O‘zbek 🇺🇿", callback_data="lang:uz"),
+            ]
+        ]
+    )
+
 
 def kb_menu(lang: str) -> ReplyKeyboardMarkup:
     if lang == "uz":
@@ -347,56 +319,75 @@ def kb_menu(lang: str) -> ReplyKeyboardMarkup:
         ]
     return ReplyKeyboardMarkup(keyboard=rows, resize_keyboard=True)
 
+
 def kb_price(lang: str) -> InlineKeyboardMarkup:
     if lang == "uz":
-        return InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="👶 O‘g‘il bolalar", callback_data="price:boys")],
-            [InlineKeyboardButton(text="👧 Qiz bolalar", callback_data="price:girls")],
-            [InlineKeyboardButton(text="🧒 Uniseks/Baza", callback_data="price:unisex")],
-            [InlineKeyboardButton(text="✅ Buyurtma", callback_data="go:order")],
-            [InlineKeyboardButton(text="⬅️ Menyu", callback_data="back:menu")],
-        ])
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="👶 Мальчики", callback_data="price:boys")],
-        [InlineKeyboardButton(text="👧 Девочки", callback_data="price:girls")],
-        [InlineKeyboardButton(text="🧒 Унисекс/База", callback_data="price:unisex")],
-        [InlineKeyboardButton(text="✅ Оформить заказ", callback_data="go:order")],
-        [InlineKeyboardButton(text="⬅️ Меню", callback_data="back:menu")],
-    ])
+        return InlineKeyboardMarkup(
+            inline_keyboard=[
+                [InlineKeyboardButton(text="👶 O‘g‘il bolalar", callback_data="price:boys")],
+                [InlineKeyboardButton(text="👧 Qiz bolalar", callback_data="price:girls")],
+                [InlineKeyboardButton(text="🧒 Uniseks/Baza", callback_data="price:unisex")],
+                [InlineKeyboardButton(text="✅ Buyurtma", callback_data="go:order")],
+                [InlineKeyboardButton(text="⬅️ Menyu", callback_data="back:menu")],
+            ]
+        )
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="👶 Мальчики", callback_data="price:boys")],
+            [InlineKeyboardButton(text="👧 Девочки", callback_data="price:girls")],
+            [InlineKeyboardButton(text="🧒 Унисекс/База", callback_data="price:unisex")],
+            [InlineKeyboardButton(text="✅ Оформить заказ", callback_data="go:order")],
+            [InlineKeyboardButton(text="⬅️ Меню", callback_data="back:menu")],
+        ]
+    )
+
 
 def kb_photos(lang: str) -> InlineKeyboardMarkup:
     rows = []
     for key, v in PHOTO_CATALOG.items():
         title = v["uz"] if lang == "uz" else v["ru"]
         rows.append([InlineKeyboardButton(text=title, callback_data=f"photo:{key}")])
-    rows.append([InlineKeyboardButton(text="⬅️ Menyu" if lang == "uz" else "⬅️ Меню", callback_data="back:menu")])
+    rows.append(
+        [InlineKeyboardButton(text="⬅️ Menyu" if lang == "uz" else "⬅️ Меню", callback_data="back:menu")]
+    )
     return InlineKeyboardMarkup(inline_keyboard=rows)
+
 
 def kb_size_mode(lang: str) -> InlineKeyboardMarkup:
     if lang == "uz":
-        return InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="👶 Yosh bo‘yicha", callback_data="size:age")],
-            [InlineKeyboardButton(text="📏 Bo‘y bo‘yicha", callback_data="size:height")],
-            [InlineKeyboardButton(text="⬅️ Menyu", callback_data="back:menu")],
-        ])
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="👶 По возрасту", callback_data="size:age")],
-        [InlineKeyboardButton(text="📏 По росту", callback_data="size:height")],
-        [InlineKeyboardButton(text="⬅️ Меню", callback_data="back:menu")],
-    ])
+        return InlineKeyboardMarkup(
+            inline_keyboard=[
+                [InlineKeyboardButton(text="👶 Yosh bo‘yicha", callback_data="size:age")],
+                [InlineKeyboardButton(text="📏 Bo‘y bo‘yicha", callback_data="size:height")],
+                [InlineKeyboardButton(text="⬅️ Menyu", callback_data="back:menu")],
+            ]
+        )
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="👶 По возрасту", callback_data="size:age")],
+            [InlineKeyboardButton(text="📏 По росту", callback_data="size:height")],
+            [InlineKeyboardButton(text="⬅️ Меню", callback_data="back:menu")],
+        ]
+    )
+
 
 def kb_order_confirm(lang: str) -> InlineKeyboardMarkup:
     if lang == "uz":
-        return InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="✅ Tasdiqlash", callback_data="order:confirm")],
-            [InlineKeyboardButton(text="✏️ Tuzatish", callback_data="order:edit")],
-            [InlineKeyboardButton(text="❌ Bekor qilish", callback_data="order:cancel")],
-        ])
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="✅ Подтвердить", callback_data="order:confirm")],
-        [InlineKeyboardButton(text="✏️ Исправить", callback_data="order:edit")],
-        [InlineKeyboardButton(text="❌ Отмена", callback_data="order:cancel")],
-    ])
+        return InlineKeyboardMarkup(
+            inline_keyboard=[
+                [InlineKeyboardButton(text="✅ Tasdiqlash", callback_data="order:confirm")],
+                [InlineKeyboardButton(text="✏️ Tuzatish", callback_data="order:edit")],
+                [InlineKeyboardButton(text="❌ Bekor qilish", callback_data="order:cancel")],
+            ]
+        )
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="✅ Подтвердить", callback_data="order:confirm")],
+            [InlineKeyboardButton(text="✏️ Исправить", callback_data="order:edit")],
+            [InlineKeyboardButton(text="❌ Отмена", callback_data="order:cancel")],
+        ]
+    )
+
 
 def kb_edit_fields(lang: str) -> InlineKeyboardMarkup:
     if lang == "uz":
@@ -423,6 +414,7 @@ def kb_edit_fields(lang: str) -> InlineKeyboardMarkup:
         ]
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
+
 def kb_contact_request(lang: str) -> ReplyKeyboardMarkup:
     if lang == "uz":
         btn = KeyboardButton(text="📲 Kontakt yuborish", request_contact=True)
@@ -432,9 +424,8 @@ def kb_contact_request(lang: str) -> ReplyKeyboardMarkup:
         cancel = KeyboardButton(text="❌ Отмена")
     return ReplyKeyboardMarkup(keyboard=[[btn], [cancel]], resize_keyboard=True, one_time_keyboard=True)
 
+
 def age_to_size_range(age: int) -> str:
-    # Простая “проф-логика”: диапазоны под детские размеры
-    # (можно позже уточнить по вашей таблице)
     mapping = {
         1: "86–92",
         2: "92–98",
@@ -454,30 +445,50 @@ def age_to_size_range(age: int) -> str:
     }
     return mapping.get(age, "—")
 
+
 def height_to_size(height: int) -> int:
-    # округление к ближайшему стандартному размеру
     sizes = [86, 92, 98, 104, 110, 116, 122, 128, 134, 140, 146, 152, 158, 164]
-    # выбрать ближайший
     return min(sizes, key=lambda x: abs(x - height))
 
+
 async def flow_guard(message: Message, state: FSMContext, lang: str) -> bool:
-    """
-    Если пользователь нажимает меню-кнопки во время оформления заказа —
-    мы НЕ ломаемся и предлагаем выбор.
-    """
     st = await state.get_state()
     if st and st.startswith("Flow:order_"):
-        # Разрешаем только "❌ Отмена" напрямую
         if (lang == "ru" and message.text == "❌ Отмена") or (lang == "uz" and message.text == "❌ Bekor qilish"):
             return False
-        # В остальных случаях мягко блокируем
-        await message.answer(TEXT[lang]["flow_locked"], reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="➡️ Продолжить заказ" if lang == "ru" else "➡️ Buyurtmani davom ettirish", callback_data="order:back_confirm")],
-            [InlineKeyboardButton(text="⬅️ Меню" if lang == "ru" else "⬅️ Menyu", callback_data="back:menu")],
-            [InlineKeyboardButton(text="❌ Отмена" if lang == "ru" else "❌ Bekor qilish", callback_data="order:cancel")],
-        ]))
+        await message.answer(
+            TEXT[lang]["flow_locked"],
+            reply_markup=InlineKeyboardMarkup(
+                inline_keyboard=[
+                    [
+                        InlineKeyboardButton(
+                            text="➡️ Продолжить заказ" if lang == "ru" else "➡️ Buyurtmani davom ettirish",
+                            callback_data="order:back_confirm",
+                        )
+                    ],
+                    [InlineKeyboardButton(text="⬅️ Меню" if lang == "ru" else "⬅️ Menyu", callback_data="back:menu")],
+                    [InlineKeyboardButton(text="❌ Отмена" if lang == "ru" else "❌ Bekor qilish", callback_data="order:cancel")],
+                ]
+            ),
+        )
         return True
     return False
+
+
+async def send_order_review(message: Message, state: FSMContext, lang: str):
+    data = await state.get_data()
+    review = TEXT[lang]["order_review"].format(
+        name=data.get("order_name", "-"),
+        phone=data.get("order_phone", "-"),
+        city=data.get("order_city", "-"),
+        addr=data.get("order_addr", "-"),
+        item=data.get("order_item", "-"),
+        size=data.get("order_size", "-"),
+        comment=data.get("order_comment", "-"),
+    )
+    await state.set_state(Flow.order_confirm)
+    await message.answer(review, reply_markup=kb_order_confirm(lang))
+
 
 # =========================
 # HANDLERS
@@ -509,7 +520,6 @@ async def back_menu(call: CallbackQuery, state: FSMContext):
 async def menu_by_text(message: Message, state: FSMContext):
     lang = await get_lang(state)
 
-    # Guard: если идёт заказ — не ломаемся
     if await flow_guard(message, state, lang):
         return
 
@@ -585,16 +595,16 @@ async def photo_section(call: CallbackQuery, state: FSMContext):
         await call.answer()
         return
 
-    # отправим до 10 фото
     for it in items[:10]:
         cap = it.get("caption_uz") if lang == "uz" else it.get("caption_ru")
         cap = cap or ""
-        # кнопка "Заказать это"
         order_btn_text = "✅ Заказать это" if lang == "ru" else "✅ Shu mahsulot"
-        kb = InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text=order_btn_text, callback_data=f"order:prefill:{cap[:30] or block.get('ru','')}")],
-            [InlineKeyboardButton(text="⬅️ Меню" if lang == "ru" else "⬅️ Menyu", callback_data="back:menu")]
-        ])
+        kb = InlineKeyboardMarkup(
+            inline_keyboard=[
+                [InlineKeyboardButton(text=order_btn_text, callback_data=f"order:prefill:{cap[:30] or block.get('ru','')}")],
+                [InlineKeyboardButton(text="⬅️ Меню" if lang == "ru" else "⬅️ Menyu", callback_data="back:menu")],
+            ]
+        )
         await call.message.answer_photo(photo=it["file_id"], caption=cap, reply_markup=kb)
 
     await call.answer()
@@ -612,6 +622,7 @@ async def size_mode(call: CallbackQuery, state: FSMContext):
         await call.message.answer(TEXT[lang]["size_height_ask"], reply_markup=ReplyKeyboardRemove())
     await call.answer()
 
+
 async def size_age(message: Message, state: FSMContext):
     lang = await get_lang(state)
     txt = (message.text or "").strip()
@@ -625,6 +636,7 @@ async def size_age(message: Message, state: FSMContext):
     await state.update_data(_size_age=age)
     await state.set_state(Flow.size_height)
     await message.answer(TEXT[lang]["size_height_ask"])
+
 
 async def size_height(message: Message, state: FSMContext):
     lang = await get_lang(state)
@@ -645,7 +657,7 @@ async def size_height(message: Message, state: FSMContext):
     await set_lang_keep(state, lang)
     await message.answer(
         TEXT[lang]["size_result"].format(age=age, height=height, age_rec=age_rec, height_rec=height_rec),
-        reply_markup=kb_menu(lang)
+        reply_markup=kb_menu(lang),
     )
     await message.answer(TEXT[lang]["subscribe"], reply_markup=kb_menu(lang))
 
@@ -656,20 +668,22 @@ async def start_order(message: Message, state: FSMContext):
     await state.set_state(Flow.order_name)
     await message.answer(TEXT[lang]["order_start"], reply_markup=ReplyKeyboardRemove())
 
+
 async def go_order(call: CallbackQuery, state: FSMContext):
     lang = await get_lang(state)
     await state.set_state(Flow.order_name)
     await call.message.answer(TEXT[lang]["order_start"], reply_markup=ReplyKeyboardRemove())
     await call.answer()
 
+
 async def order_prefill(call: CallbackQuery, state: FSMContext):
-    # from photo: prefill item text
     lang = await get_lang(state)
     payload = call.data.split("order:prefill:", 1)[1]
     await state.update_data(order_item=payload)
     await state.set_state(Flow.order_name)
     await call.message.answer(TEXT[lang]["order_start"], reply_markup=ReplyKeyboardRemove())
     await call.answer()
+
 
 async def order_name(message: Message, state: FSMContext):
     lang = await get_lang(state)
@@ -681,10 +695,10 @@ async def order_name(message: Message, state: FSMContext):
     await state.set_state(Flow.order_phone)
     await message.answer(TEXT[lang]["order_phone"], reply_markup=kb_contact_request(lang))
 
+
 async def order_phone(message: Message, state: FSMContext):
     lang = await get_lang(state)
 
-    phone = ""
     if message.contact and message.contact.phone_number:
         phone = message.contact.phone_number
     else:
@@ -699,6 +713,7 @@ async def order_phone(message: Message, state: FSMContext):
     await state.set_state(Flow.order_city)
     await message.answer(TEXT[lang]["order_city"], reply_markup=ReplyKeyboardRemove())
 
+
 async def order_city(message: Message, state: FSMContext):
     lang = await get_lang(state)
     city = (message.text or "").strip()
@@ -709,6 +724,7 @@ async def order_city(message: Message, state: FSMContext):
     await state.set_state(Flow.order_addr)
     await message.answer(TEXT[lang]["order_addr"])
 
+
 async def order_addr(message: Message, state: FSMContext):
     lang = await get_lang(state)
     addr = (message.text or "").strip()
@@ -717,7 +733,6 @@ async def order_addr(message: Message, state: FSMContext):
         return
     await state.update_data(order_addr=addr)
 
-    # если item уже prefill'нут из каталога — не спрашиваем заново
     data = await state.get_data()
     if data.get("order_item"):
         await state.set_state(Flow.order_size)
@@ -726,6 +741,7 @@ async def order_addr(message: Message, state: FSMContext):
 
     await state.set_state(Flow.order_item)
     await message.answer(TEXT[lang]["order_item"])
+
 
 async def order_item(message: Message, state: FSMContext):
     lang = await get_lang(state)
@@ -737,6 +753,7 @@ async def order_item(message: Message, state: FSMContext):
     await state.set_state(Flow.order_size)
     await message.answer(TEXT[lang]["order_size"])
 
+
 async def order_size(message: Message, state: FSMContext):
     lang = await get_lang(state)
     size = (message.text or "").strip()
@@ -747,6 +764,7 @@ async def order_size(message: Message, state: FSMContext):
     await state.set_state(Flow.order_comment)
     await message.answer(TEXT[lang]["order_comment"])
 
+
 async def order_comment(message: Message, state: FSMContext):
     lang = await get_lang(state)
     comment = (message.text or "").strip()
@@ -754,20 +772,8 @@ async def order_comment(message: Message, state: FSMContext):
         comment = "нет" if lang == "ru" else "yo‘q"
 
     await state.update_data(order_comment=comment)
+    await send_order_review(message, state, lang)
 
-    data = await state.get_data()
-    review = TEXT[lang]["order_review"].format(
-        name=data.get("order_name", "-"),
-        phone=data.get("order_phone", "-"),
-        city=data.get("order_city", "-"),
-        addr=data.get("order_addr", "-"),
-        item=data.get("order_item", "-"),
-        size=data.get("order_size", "-"),
-        comment=data.get("order_comment", "-"),
-    )
-
-    await state.set_state(Flow.order_confirm)
-    await message.answer(review, reply_markup=kb_order_confirm(lang))
 
 async def order_cancel(call: CallbackQuery, state: FSMContext):
     lang = await get_lang(state)
@@ -775,27 +781,18 @@ async def order_cancel(call: CallbackQuery, state: FSMContext):
     await call.message.answer(TEXT[lang]["cancelled"], reply_markup=kb_menu(lang))
     await call.answer()
 
+
 async def order_back_confirm(call: CallbackQuery, state: FSMContext):
-    # show confirm again
     lang = await get_lang(state)
-    data = await state.get_data()
-    review = TEXT[lang]["order_review"].format(
-        name=data.get("order_name", "-"),
-        phone=data.get("order_phone", "-"),
-        city=data.get("order_city", "-"),
-        addr=data.get("order_addr", "-"),
-        item=data.get("order_item", "-"),
-        size=data.get("order_size", "-"),
-        comment=data.get("order_comment", "-"),
-    )
-    await state.set_state(Flow.order_confirm)
-    await call.message.answer(review, reply_markup=kb_order_confirm(lang))
+    await send_order_review(call.message, state, lang)
     await call.answer()
+
 
 async def order_edit(call: CallbackQuery, state: FSMContext):
     lang = await get_lang(state)
     await call.message.answer(TEXT[lang]["edit_choose"], reply_markup=kb_edit_fields(lang))
     await call.answer()
+
 
 async def edit_pick(call: CallbackQuery, state: FSMContext):
     lang = await get_lang(state)
@@ -815,12 +812,12 @@ async def edit_pick(call: CallbackQuery, state: FSMContext):
     await state.set_state(Flow.edit_field)
     await call.answer()
 
+
 async def edit_field_value(message: Message, state: FSMContext):
     lang = await get_lang(state)
     data = await state.get_data()
     field = data.get("_edit_field")
 
-    value = ""
     if field == "phone":
         if message.contact and message.contact.phone_number:
             value = message.contact.phone_number
@@ -848,14 +845,14 @@ async def edit_field_value(message: Message, state: FSMContext):
     if field in key_map:
         await state.update_data(**{key_map[field]: value})
 
-    # возвращаем подтверждение
-    await order_back_confirm(CallbackQuery(id="0", from_user=message.from_user, chat_instance="0", message=message, data="order:back_confirm"), state)
+    # нормально возвращаем подтверждение (без фейкового CallbackQuery)
+    await send_order_review(message, state, lang)
+
 
 async def order_confirm(call: CallbackQuery, state: FSMContext):
     lang = await get_lang(state)
     data = await state.get_data()
 
-    # финальный текст для клиента и менеджера
     summary = (
         "🧾 Данные заказа:\n"
         f"• Имя: {data.get('order_name','-')}\n"
@@ -867,12 +864,12 @@ async def order_confirm(call: CallbackQuery, state: FSMContext):
         f"• Комментарий: {data.get('order_comment','-')}\n"
     )
 
-    # 1) Отправка менеджеру (1 раз)
     ts = now_local().strftime("%Y-%m-%d %H:%M")
+    username = f"@{call.from_user.username}" if call.from_user.username else "-"
     manager_text = (
         f"🛎 Новый заказ ({ts}, lang={lang})\n\n{summary}\n"
         f"👤 user_id: {call.from_user.id}\n"
-        f"👤 username: @{call.from_user.username}" if call.from_user.username else f"👤 username: -"
+        f"👤 username: {username}"
     )
 
     try:
@@ -880,16 +877,12 @@ async def order_confirm(call: CallbackQuery, state: FSMContext):
     except Exception as e:
         print(f"Ошибка отправки менеджеру: {e}")
 
-    # 2) Клиенту: спасибо + график
     msg = TEXT[lang]["worktime_in"] if in_work_time(now_local()) else TEXT[lang]["worktime_out"]
     await call.message.answer(TEXT[lang]["order_sent"])
     await call.message.answer(msg)
     await call.message.answer(TEXT[lang]["subscribe"], reply_markup=kb_menu(lang))
-
-    # 3) Стикер/улыбка (без спама)
     await call.message.answer("😊✨")
 
-    # 4) Сброс состояния и в меню
     await set_lang_keep(state, lang)
     await call.message.answer(TEXT[lang]["menu_title"], reply_markup=kb_menu(lang))
     await call.answer()
@@ -905,20 +898,16 @@ def build_dp() -> Dispatcher:
     dp.callback_query.register(pick_lang, F.data.startswith("lang:"))
     dp.callback_query.register(back_menu, F.data == "back:menu")
 
-    # Price
     dp.callback_query.register(price_section, F.data.startswith("price:"))
     dp.callback_query.register(go_order, F.data == "go:order")
 
-    # Photos
     dp.callback_query.register(photo_section, F.data.startswith("photo:"))
     dp.callback_query.register(order_prefill, F.data.startswith("order:prefill:"))
 
-    # Size
     dp.callback_query.register(size_mode, F.data.startswith("size:"))
     dp.message.register(size_age, Flow.size_age)
     dp.message.register(size_height, Flow.size_height)
 
-    # Order flow
     dp.message.register(order_name, Flow.order_name)
     dp.message.register(order_phone, Flow.order_phone)
     dp.message.register(order_city, Flow.order_city)
@@ -934,13 +923,37 @@ def build_dp() -> Dispatcher:
     dp.callback_query.register(order_back_confirm, F.data == "order:back_confirm")
     dp.callback_query.register(edit_pick, F.data.startswith("edit:"))
 
-    # Menu by text
     dp.message.register(menu_by_text, F.text)
 
     return dp
 
 
+# =========================
+# RENDER PORT BINDING (fix "No open ports detected")
+# =========================
+class _HealthHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.send_header("Content-Type", "text/plain; charset=utf-8")
+        self.end_headers()
+        self.wfile.write(b"OK")
+
+    def log_message(self, format, *args):
+        return  # mute logs
+
+
+def start_health_server():
+    port = int(os.getenv("PORT", "10000"))
+    server = HTTPServer(("0.0.0.0", port), _HealthHandler)
+    t = threading.Thread(target=server.serve_forever, daemon=True)
+    t.start()
+    print(f"✅ Health server listening on порт {port} (Render port binding).")
+
+
 async def main():
+    # IMPORTANT for Render Web Service
+    start_health_server()
+
     bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.MARKDOWN))
     dp = build_dp()
     print("✅ ZARY & CO assistant started (polling).")
