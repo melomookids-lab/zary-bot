@@ -20,7 +20,6 @@ from aiogram.types import (
     InlineKeyboardButton,
     ReplyKeyboardMarkup,
     KeyboardButton,
-    ReplyKeyboardRemove,
 )
 
 # =========================
@@ -30,8 +29,8 @@ BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 if not BOT_TOKEN:
     raise RuntimeError("BOT_TOKEN env is empty. Set it in Render Environment Variables")
 
-MANAGER_CHAT_ID = 7195737024  # твой Telegram ID (куда отправлять заявки)
-MANAGER_PHONE = "+998771202255"  # номер менеджера (покажем клиентам)
+MANAGER_CHAT_ID = 7195737024
+MANAGER_PHONE = "+998771202255"
 
 TZ = ZoneInfo("Asia/Tashkent")
 WORK_START = time(9, 0)
@@ -40,23 +39,21 @@ WORK_END = time(21, 0)
 INSTAGRAM_URL = "https://www.instagram.com/zary.co/"
 YOUTUBE_URL = "https://www.youtube.com/@ZARYCOOFFICIAL"
 
-# ✅ Твой канал
 TELEGRAM_CHANNEL_USERNAME = "zaryco_official"
 TELEGRAM_CHANNEL_URL = f"https://t.me/{TELEGRAM_CHANNEL_USERNAME}"
 
-MANAGER_USERNAME = ""  # если есть username менеджера без @, можно оставить пустым
+MANAGER_USERNAME = ""  # optional without @
 
 # =========================
 # PHOTO CATALOG (file_id)
 # =========================
-# Позже добавишь items: [{"file_id": "...", "caption_ru": "...", "caption_uz":"..."}]
 PHOTO_CATALOG = {
     "hoodie": {"ru": "Худи", "uz": "Xudi", "items": []},
     "outerwear": {"ru": "Куртки/Верх", "uz": "Kurtka/Ustki", "items": []},
     "sets": {"ru": "Костюмы", "uz": "Kostyumlar", "items": []},
     "school": {"ru": "Школьная форма", "uz": "Maktab formasi", "items": []},
-    "summer": {"ru": "Лето", "uz": "Yozgi", "items": []},     # ✅ если пусто → telegram
-    "new": {"ru": "Новинки", "uz": "Yangi", "items": []},     # ✅ если пусто → telegram
+    "summer": {"ru": "Лето", "uz": "Yozgi", "items": []},  # if empty -> telegram
+    "new": {"ru": "Новинки", "uz": "Yangi", "items": []},  # if empty -> telegram
 }
 
 # =========================
@@ -78,10 +75,6 @@ async def safe_answer_call(call: CallbackQuery, text: str, reply_markup=None):
         await call.message.answer(esc(text), reply_markup=reply_markup)
 
 async def safe_edit_call(call: CallbackQuery, text: str, reply_markup=None):
-    """
-    Чтобы не дублировать сообщения (особенно в прайсе).
-    Если edit не получается — просто отправим новым сообщением.
-    """
     try:
         await call.message.edit_text(text, reply_markup=reply_markup)
     except Exception:
@@ -99,7 +92,6 @@ TEXT = {
             "Стиль • качество • комфорт\n\n"
             "Выберите действие кнопками 👇"
         ),
-
         "menu_title": "Выберите действие 👇",
 
         # PRICE
@@ -133,11 +125,11 @@ TEXT = {
 
         # CATALOG
         "photos_title": "📸 <b>Каталог (фото)</b>\nВыберите раздел:",
-        "photos_empty": "В этом разделе пока нет фото. Напишите менеджеру — отправим варианты и цены.",
+        "photos_empty": "📸 В этом разделе пока нет фото. Напишите менеджеру — отправим варианты и цены 😊",
         "photos_empty_newsummer": (
-            "📸 В этом разделе пока нет фото.\n\n"
-            "✅ Новинки/Лето мы публикуем в Telegram-канале:\n"
-            f"👉 <b>@{TELEGRAM_CHANNEL_USERNAME}</b>"
+            "🔥 В разделе <b>Новинки/Лето</b> фото публикуем в Telegram-канале:\n"
+            f"👉 <b>@{TELEGRAM_CHANNEL_USERNAME}</b>\n\n"
+            "Пожалуйста, не забудьте подписаться 😊✨"
         ),
 
         # SIZE
@@ -150,13 +142,13 @@ TEXT = {
             "📏 <b>Рекомендация по возрасту</b>\n"
             "Возраст: {age}\n"
             "Примерный размер: <b>{age_rec}</b>\n\n"
-            "ℹ️ Точный размер подтверждает менеджер (по модели и посадке)."
+            "ℹ️ Точный размер подтверждает менеджер (по модели и посадке). 😊"
         ),
         "size_result_by_height": (
             "📏 <b>Рекомендация по росту</b>\n"
             "Рост: {height} см\n"
             "Рекомендуем размер: <b>{height_rec}</b>\n\n"
-            "ℹ️ Точный размер подтверждает менеджер (по модели и посадке)."
+            "ℹ️ Точный размер подтверждает менеджер (по модели и посадке). 😊"
         ),
 
         # CONTACT
@@ -167,9 +159,16 @@ TEXT = {
             f"☎️ Номер менеджера: <b>{MANAGER_PHONE}</b>\n"
         ),
         "contact_offer_leave": "Если хотите — оставьте ваш номер, и менеджер свяжется с вами 👇",
+        "contact_phone_ask": "📲 Отправьте номер телефона (или нажмите кнопку «📲 Отправить контакт»).",
+        "contact_thanks": (
+            "✅ Спасибо! Вы с нами 😊\n"
+            "Очень скоро менеджер позвонит и уточнит детали заказа.\n\n"
+            "Пока переходите в наш Telegram-канал и посмотрите коллекции 👇\n"
+            "Пожалуйста, не забудьте подписаться 😊✨"
+        ),
 
         # ORDER
-        "order_start": "🧾 <b>Оформляем заказ</b>\nКак вас зовут?",
+        "order_start": "🧾 <b>Оформляем заказ</b>\nКак вас зовут? 😊",
         "order_phone": "📲 Отправьте номер телефона (или нажмите кнопку «📲 Отправить контакт»).",
         "order_city": "🏙 Ваш город?",
         "order_item": "👕 Что хотите заказать? (например: куртка / худи / костюм / школьная форма)",
@@ -187,20 +186,21 @@ TEXT = {
             "Подтвердить?"
         ),
         "order_sent": (
-            "✅ Спасибо! Заказ принят.\n"
-            "Менеджер свяжется с вами, чтобы уточнить детали заказа и доставки ✅"
+            "✅ Спасибо! Заказ принят 😊\n"
+            "Менеджер свяжется с вами, чтобы уточнить детали заказа и доставки."
         ),
-        "worktime_in": "⏱ Сейчас рабочее время — ответ будет быстрее.",
-        "worktime_out": "⏱ Сейчас вне рабочего времени — менеджер ответит в рабочие часы.",
+        "worktime_in": "⏱ Сейчас рабочее время — ответ будет быстрее 😊",
+        "worktime_out": "⏱ Сейчас вне рабочего времени — менеджер ответит в рабочие часы 😊",
         "edit_choose": "✏️ Что хотите исправить?",
         "cancelled": "❌ Отменено. Возвращаю в меню 👇",
         "unknown": "Пожалуйста, используйте кнопки меню 👇",
         "flow_locked": "Сейчас идёт оформление заказа. Продолжить или выйти в меню?",
         "social_end": (
             "📌 <b>Наши ссылки:</b>\n"
-            f"Telegram: {TELEGRAM_CHANNEL_URL}\n"
-            f"Instagram: {INSTAGRAM_URL}\n"
-            f"YouTube: {YOUTUBE_URL}"
+            f"📣 Telegram: {TELEGRAM_CHANNEL_URL}\n"
+            f"📸 Instagram: {INSTAGRAM_URL}\n"
+            f"▶️ YouTube: {YOUTUBE_URL}\n\n"
+            "Спасибо, что вы с нами 😊✨"
         ),
     },
 
@@ -212,10 +212,8 @@ TEXT = {
             "Uslub • sifat • qulaylik\n\n"
             "Bo‘limni tanlang 👇"
         ),
-
         "menu_title": "Bo‘limni tanlang 👇",
 
-        # PRICE
         "price_title": "🧾 <b>Narxlar (qisqa)</b>\nBo‘limni tanlang:",
         "price_boys": (
             "👶 <b>O‘G‘IL BOLALAR</b>\n"
@@ -244,16 +242,14 @@ TEXT = {
             "✅ <b>Agar kerakli kiyimni tanlagan bo‘lsangiz — ✅ Buyurtma tugmasini bosing</b>"
         ),
 
-        # CATALOG
         "photos_title": "📸 <b>Katalog (rasm)</b>\nBo‘limni tanlang:",
-        "photos_empty": "Bu bo‘limda hozircha rasm yo‘q. Menejerga yozing — variant va narxlarni yuboramiz.",
+        "photos_empty": "📸 Bu bo‘limda hozircha rasm yo‘q. Menejerga yozing — variant va narxlarni yuboramiz 😊",
         "photos_empty_newsummer": (
-            "📸 Bu bo‘limda hozircha rasm yo‘q.\n\n"
-            "✅ Yangi/Yozgi mahsulotlar Telegram kanalimizda:\n"
-            f"👉 <b>@{TELEGRAM_CHANNEL_USERNAME}</b>"
+            "🔥 <b>Yangi/Yozgi</b> mahsulotlar Telegram kanalimizda:\n"
+            f"👉 <b>@{TELEGRAM_CHANNEL_USERNAME}</b>\n\n"
+            "Iltimos, obuna bo‘lishni unutmang 😊✨"
         ),
 
-        # SIZE
         "size_title": "📏 <b>O‘lcham tanlash (1–15 yosh)</b>\nUsulni tanlang:",
         "size_age_ask": "Bolaning yoshini yozing (1–15). Masalan: <code>7</code>",
         "size_height_ask": "Bo‘yini sm da yozing. Masalan: <code>125</code>",
@@ -263,16 +259,15 @@ TEXT = {
             "📏 <b>Yosh bo‘yicha tavsiya</b>\n"
             "Yosh: {age}\n"
             "Taxminiy o‘lcham: <b>{age_rec}</b>\n\n"
-            "ℹ️ Aniq o‘lcham menejer tomonidan tasdiqlanadi."
+            "ℹ️ Aniq o‘lcham menejer tomonidan tasdiqlanadi 😊"
         ),
         "size_result_by_height": (
             "📏 <b>Bo‘y bo‘yicha tavsiya</b>\n"
             "Bo‘y: {height} sm\n"
             "Tavsiya o‘lcham: <b>{height_rec}</b>\n\n"
-            "ℹ️ Aniq o‘lcham menejer tomonidan tasdiqlanadi."
+            "ℹ️ Aniq o‘lcham menejer tomonidan tasdiqlanadi 😊"
         ),
 
-        # CONTACT
         "contact_title": (
             "📞 <b>Aloqa</b>\n"
             "Buyurtmalar <b>24/7</b> qabul qilinadi.\n"
@@ -280,9 +275,15 @@ TEXT = {
             f"☎️ Menejer raqami: <b>{MANAGER_PHONE}</b>\n"
         ),
         "contact_offer_leave": "Xohlasangiz, raqamingizni qoldiring — menejer bog‘lanadi 👇",
+        "contact_phone_ask": "📲 Telefon raqam yuboring (yoki «📲 Kontakt yuborish» tugmasi).",
+        "contact_thanks": (
+            "✅ Rahmat! Biz bilan ekansiz 😊\n"
+            "Menejer tez orada qo‘ng‘iroq qilib, buyurtma tafsilotlarini aniqlaydi.\n\n"
+            "Hozircha Telegram kanalimizga o‘ting va kolleksiyalarni ko‘ring 👇\n"
+            "Iltimos, obuna bo‘lishni unutmang 😊✨"
+        ),
 
-        # ORDER
-        "order_start": "🧾 <b>Buyurtma</b>\nIsmingiz?",
+        "order_start": "🧾 <b>Buyurtma</b>\nIsmingiz? 😊",
         "order_phone": "📲 Telefon raqam yuboring (yoki «📲 Kontakt yuborish» tugmasi).",
         "order_city": "🏙 Shahar?",
         "order_item": "👕 Nima buyurtma qilasiz? (masalan: kurtka / xudi / kostyum / maktab formasi)",
@@ -300,20 +301,21 @@ TEXT = {
             "Tasdiqlaysizmi?"
         ),
         "order_sent": (
-            "✅ Rahmat! Buyurtma qabul qilindi.\n"
-            "Menejer bog‘lanib, buyurtma va yetkazib berish tafsilotlarini aniqlashtiradi ✅"
+            "✅ Rahmat! Buyurtma qabul qilindi 😊\n"
+            "Menejer bog‘lanib, buyurtma va yetkazib berish tafsilotlarini aniqlashtiradi."
         ),
-        "worktime_in": "⏱ Hozir ish vaqti — javob tezroq bo‘ladi.",
-        "worktime_out": "⏱ Hozir ish vaqti emas — menejer ish vaqtida javob beradi.",
+        "worktime_in": "⏱ Hozir ish vaqti — javob tezroq bo‘ladi 😊",
+        "worktime_out": "⏱ Hozir ish vaqti emas — menejer ish vaqtida javob beradi 😊",
         "edit_choose": "✏️ Nimani tuzatamiz?",
         "cancelled": "❌ Bekor qilindi. Menyuga qaytdik 👇",
         "unknown": "Iltimos, menyu tugmalaridan foydalaning 👇",
         "flow_locked": "Hozir buyurtma rasmiylashtirilmoqda. Davom etamizmi yoki menyuga chiqamizmi?",
         "social_end": (
             "📌 <b>Havolalarimiz:</b>\n"
-            f"Telegram: {TELEGRAM_CHANNEL_URL}\n"
-            f"Instagram: {INSTAGRAM_URL}\n"
-            f"YouTube: {YOUTUBE_URL}"
+            f"📣 Telegram: {TELEGRAM_CHANNEL_URL}\n"
+            f"📸 Instagram: {INSTAGRAM_URL}\n"
+            f"▶️ YouTube: {YOUTUBE_URL}\n\n"
+            "Rahmat 😊✨"
         ),
     }
 }
@@ -324,6 +326,8 @@ TEXT = {
 class Flow(StatesGroup):
     size_age = State()
     size_height = State()
+
+    contact_phone = State()      # ✅ отдельно для "Связаться -> оставить контакт"
 
     order_name = State()
     order_phone = State()
@@ -346,47 +350,22 @@ def in_work_time(dt: datetime) -> bool:
     return WORK_START <= t <= WORK_END
 
 def clean_phone(raw: str) -> str:
-    s = (raw or "").strip()
-    s = s.replace(" ", "").replace("-", "")
+    s = (raw or "").strip().replace(" ", "").replace("-", "")
     return s
 
 def looks_like_phone(s: str) -> bool:
-    s = clean_phone(s)
-    digits = re.sub(r"\D", "", s)
+    digits = re.sub(r"\D", "", clean_phone(s))
     return 9 <= len(digits) <= 15
 
 def extract_two_numbers_any_order(text: str):
-    """
-    Для заказа: ищем возраст (1-15) и рост (70-190) в любом порядке/формате.
-    Примеры:
-      "7 125", "7лет 125см", "рост 125 возраст 7", "125/7"
-    """
     nums = [int(x) for x in re.findall(r"\d{1,3}", text or "")]
-    if not nums:
-        return None, None
-
-    # кандидаты
     age = None
     height = None
     for n in nums:
         if age is None and 1 <= n <= 15:
             age = n
-        # рост чаще 90-180, но возьмём 70-190
         if height is None and 70 <= n <= 190:
             height = n
-
-    # если один найден, попробуем добрать второй из оставшихся
-    if age is None:
-        for n in nums:
-            if 1 <= n <= 15:
-                age = n
-                break
-    if height is None:
-        for n in nums:
-            if 70 <= n <= 190:
-                height = n
-                break
-
     return age, height
 
 async def get_lang(state: FSMContext) -> str:
@@ -420,7 +399,6 @@ def kb_lang() -> InlineKeyboardMarkup:
     ])
 
 def kb_menu(lang: str) -> ReplyKeyboardMarkup:
-    # ✅ Меню всегда видимое
     if lang == "uz":
         rows = [
             [KeyboardButton(text="🧾 Narxlar"), KeyboardButton(text="📸 Katalog")],
@@ -512,7 +490,6 @@ def kb_edit_fields(lang: str) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 def kb_contact_request(lang: str) -> ReplyKeyboardMarkup:
-    # На шаге телефона — показываем request_contact, потом вернём меню
     if lang == "uz":
         btn = KeyboardButton(text="📲 Kontakt yuborish", request_contact=True)
         cancel = KeyboardButton(text="❌ Bekor qilish")
@@ -533,7 +510,6 @@ def kb_contact_actions(lang: str) -> InlineKeyboardMarkup:
     ])
 
 def kb_channel_only(lang: str) -> InlineKeyboardMarkup:
-    # ✅ Только телеграм-канал + меню
     channel_text = "📣 Telegram канал" if lang == "ru" else "📣 Telegram kanal"
     menu_text = "⬅️ Меню" if lang == "ru" else "⬅️ Menyu"
     return InlineKeyboardMarkup(inline_keyboard=[
@@ -542,15 +518,11 @@ def kb_channel_only(lang: str) -> InlineKeyboardMarkup:
     ])
 
 def kb_social_end(lang: str) -> InlineKeyboardMarkup:
-    # ✅ показываем ВСЕ ссылки только в конце
-    tg_text = "Telegram" if lang == "ru" else "Telegram"
-    ig_text = "Instagram" if lang == "ru" else "Instagram"
-    yt_text = "YouTube" if lang == "ru" else "YouTube"
     menu_text = "⬅️ Меню" if lang == "ru" else "⬅️ Menyu"
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text=tg_text, url=TELEGRAM_CHANNEL_URL)],
-        [InlineKeyboardButton(text=ig_text, url=INSTAGRAM_URL)],
-        [InlineKeyboardButton(text=yt_text, url=YOUTUBE_URL)],
+        [InlineKeyboardButton(text="📣 Telegram", url=TELEGRAM_CHANNEL_URL)],
+        [InlineKeyboardButton(text="📸 Instagram", url=INSTAGRAM_URL)],
+        [InlineKeyboardButton(text="▶️ YouTube", url=YOUTUBE_URL)],
         [InlineKeyboardButton(text=menu_text, callback_data="back:menu")],
     ])
 
@@ -573,7 +545,7 @@ async def show_order_review(target, state: FSMContext, lang: str):
         await safe_answer_call(target, review, reply_markup=kb_order_confirm(lang))
 
 # =========================
-# CORE MENU / START
+# COMMANDS / START / LANG
 # =========================
 async def cmd_start(message: Message, state: FSMContext):
     data = await state.get_data()
@@ -601,45 +573,23 @@ async def back_menu(call: CallbackQuery, state: FSMContext):
     await call.answer()
 
 # =========================
-# MENU BY TEXT (ГЛАВНОЕ: меню не должно исчезать)
+# MENU BY TEXT (меню не исчезает)
 # =========================
 def is_cancel(lang: str, txt: str) -> bool:
     return (lang == "ru" and txt == "❌ Отмена") or (lang == "uz" and txt == "❌ Bekor qilish")
-
-def is_lang_btn(lang: str, txt: str) -> bool:
-    return (lang == "ru" and txt == "🌐 Язык") or (lang == "uz" and txt == "🌐 Til")
-
-def is_price_btn(lang: str, txt: str) -> bool:
-    return (lang == "ru" and txt == "🧾 Прайс") or (lang == "uz" and txt == "🧾 Narxlar")
-
-def is_catalog_btn(lang: str, txt: str) -> bool:
-    return (lang == "ru" and txt == "📸 Каталог") or (lang == "uz" and txt == "📸 Katalog")
-
-def is_size_btn(lang: str, txt: str) -> bool:
-    return (lang == "ru" and txt == "📏 Размер") or (lang == "uz" and txt == "📏 O‘lcham")
-
-def is_order_btn(lang: str, txt: str) -> bool:
-    return (lang == "ru" and txt == "✅ Заказ") or (lang == "uz" and txt == "✅ Buyurtma")
-
-def is_contact_btn(lang: str, txt: str) -> bool:
-    return (lang == "ru" and txt == "📞 Связаться") or (lang == "uz" and txt == "📞 Aloqa")
 
 async def menu_by_text(message: Message, state: FSMContext):
     lang = await get_lang(state)
     txt = (message.text or "").strip()
 
-    # ✅ Cancel работает всегда
     if is_cancel(lang, txt):
         await set_lang_keep(state, lang)
         await safe_answer(message, TEXT[lang]["cancelled"], reply_markup=kb_menu(lang))
-        # ✅ ссылки показываем в конце отмены
         await safe_answer(message, TEXT[lang]["social_end"], reply_markup=kb_social_end(lang))
         return
 
-    # ✅ Если пользователь в процессе заказа — не ломаем сценарий, но меню не исчезает
     st = await state.get_state()
-    if st and st.startswith("Flow:order_") and (is_price_btn(lang, txt) or is_catalog_btn(lang, txt) or is_size_btn(lang, txt) or is_lang_btn(lang, txt) or is_contact_btn(lang, txt)):
-        # не рвём заказ, даём выбор
+    if st and st.startswith("Flow:order_") and txt in ("🧾 Прайс","📸 Каталог","📏 Размер","📞 Связаться","🌐 Язык","🧾 Narxlar","📸 Katalog","📏 O‘lcham","📞 Aloqa","🌐 Til"):
         await safe_answer(message, TEXT[lang]["flow_locked"], reply_markup=InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(text="➡️ Продолжить" if lang == "ru" else "➡️ Davom etish", callback_data="order:back_confirm")],
             [InlineKeyboardButton(text="❌ Отмена" if lang == "ru" else "❌ Bekor qilish", callback_data="order:cancel")],
@@ -647,27 +597,27 @@ async def menu_by_text(message: Message, state: FSMContext):
         ]))
         return
 
-    if is_lang_btn(lang, txt):
+    if txt in ("🌐 Язык","🌐 Til"):
         await safe_answer(message, TEXT[lang]["hello_ask_lang"], reply_markup=kb_lang())
         return
 
-    if is_price_btn(lang, txt):
+    if txt in ("🧾 Прайс","🧾 Narxlar"):
         await safe_answer(message, TEXT[lang]["price_title"], reply_markup=kb_price(lang))
         return
 
-    if is_catalog_btn(lang, txt):
+    if txt in ("📸 Каталог","📸 Katalog"):
         await safe_answer(message, TEXT[lang]["photos_title"], reply_markup=kb_photos(lang))
         return
 
-    if is_size_btn(lang, txt):
+    if txt in ("📏 Размер","📏 O‘lcham"):
         await safe_answer(message, TEXT[lang]["size_title"], reply_markup=kb_size_mode(lang))
         return
 
-    if is_order_btn(lang, txt):
+    if txt in ("✅ Заказ","✅ Buyurtma"):
         await start_order(message, state)
         return
 
-    if is_contact_btn(lang, txt):
+    if txt in ("📞 Связаться","📞 Aloqa"):
         msg = TEXT[lang]["contact_title"]
         if MANAGER_USERNAME:
             msg += (f"\n👩‍💼 Menejer: @{MANAGER_USERNAME}" if lang == "uz" else f"\n👩‍💼 Менеджер: @{MANAGER_USERNAME}")
@@ -675,11 +625,10 @@ async def menu_by_text(message: Message, state: FSMContext):
         await safe_answer(message, TEXT[lang]["contact_offer_leave"], reply_markup=kb_contact_actions(lang))
         return
 
-    # ✅ Любой непонятный текст → просто вернуть меню (важно: кнопки НЕ пропадают)
     await safe_answer(message, TEXT[lang]["unknown"], reply_markup=kb_menu(lang))
 
 # =========================
-# PRICE (через edit, чтобы не дублировать)
+# PRICE
 # =========================
 async def price_section(call: CallbackQuery, state: FSMContext):
     lang = await get_lang(state)
@@ -700,9 +649,7 @@ async def photo_section(call: CallbackQuery, state: FSMContext):
     key = call.data.split(":")[1]
     block = PHOTO_CATALOG.get(key)
 
-    # если пусто
     if not block or not block.get("items"):
-        # ✅ Новинки/Лето → только Telegram канал
         if key in ("new", "summer"):
             await safe_edit_call(call, TEXT[lang]["photos_empty_newsummer"], reply_markup=kb_channel_only(lang))
         else:
@@ -710,7 +657,6 @@ async def photo_section(call: CallbackQuery, state: FSMContext):
         await call.answer()
         return
 
-    # если есть фото — отправляем максимум 10
     items = block["items"][:10]
     for it in items:
         cap = it.get("caption_uz") if lang == "uz" else it.get("caption_ru")
@@ -725,7 +671,7 @@ async def photo_section(call: CallbackQuery, state: FSMContext):
     await call.answer()
 
 # =========================
-# SIZE (ВАЖНО: возраст без роста и рост без возраста)
+# SIZE (возраст отдельно / рост отдельно)
 # =========================
 async def size_mode(call: CallbackQuery, state: FSMContext):
     lang = await get_lang(state)
@@ -748,15 +694,9 @@ async def size_age(message: Message, state: FSMContext):
     if not (1 <= age <= 15):
         await safe_answer(message, TEXT[lang]["size_bad_age"], reply_markup=kb_menu(lang))
         return
-
     age_rec = age_to_size_range(age)
     await set_lang_keep(state, lang)
-    await safe_answer(
-        message,
-        TEXT[lang]["size_result_by_age"].format(age=age, age_rec=age_rec),
-        reply_markup=kb_menu(lang)
-    )
-    # ✅ ссылки здесь НЕ показываем (по твоему ТЗ)
+    await safe_answer(message, TEXT[lang]["size_result_by_age"].format(age=age, age_rec=age_rec), reply_markup=kb_menu(lang))
 
 async def size_height(message: Message, state: FSMContext):
     lang = await get_lang(state)
@@ -768,27 +708,58 @@ async def size_height(message: Message, state: FSMContext):
     if height < 70 or height > 190:
         await safe_answer(message, TEXT[lang]["size_bad_height"], reply_markup=kb_menu(lang))
         return
-
     height_rec = height_to_size(height)
     await set_lang_keep(state, lang)
-    await safe_answer(
-        message,
-        TEXT[lang]["size_result_by_height"].format(height=height, height_rec=height_rec),
-        reply_markup=kb_menu(lang)
-    )
-    # ✅ ссылки здесь НЕ показываем
+    await safe_answer(message, TEXT[lang]["size_result_by_height"].format(height=height, height_rec=height_rec), reply_markup=kb_menu(lang))
 
 # =========================
-# CONTACT leave
+# CONTACT FLOW (ВАЖНО: НЕ ЗАПУСКАЕТ ЗАКАЗ)
 # =========================
 async def contact_leave(call: CallbackQuery, state: FSMContext):
     lang = await get_lang(state)
-    await state.set_state(Flow.order_phone)
-    await safe_answer_call(call, TEXT[lang]["order_phone"], reply_markup=kb_contact_request(lang))
+    await state.set_state(Flow.contact_phone)
+    await safe_answer_call(call, TEXT[lang]["contact_phone_ask"], reply_markup=kb_contact_request(lang))
     await call.answer()
 
+async def contact_phone(message: Message, state: FSMContext):
+    lang = await get_lang(state)
+
+    if message.contact and message.contact.phone_number:
+        phone = message.contact.phone_number
+    else:
+        phone = (message.text or "").strip()
+
+    if is_cancel(lang, phone):
+        await set_lang_keep(state, lang)
+        await safe_answer(message, TEXT[lang]["cancelled"], reply_markup=kb_menu(lang))
+        await safe_answer(message, TEXT[lang]["social_end"], reply_markup=kb_social_end(lang))
+        return
+
+    phone = clean_phone(phone)
+    if not looks_like_phone(phone):
+        await safe_answer(message, TEXT[lang]["contact_phone_ask"], reply_markup=kb_contact_request(lang))
+        return
+
+    # ✅ Отправим менеджеру лид
+    ts = now_local().strftime("%Y-%m-%d %H:%M")
+    lead_text = (
+        f"📩 <b>Лид (контакт)</b> ({esc(ts)})\n"
+        f"Телефон: <b>{esc(phone)}</b>\n"
+        f"user_id: <code>{message.from_user.id}</code>\n"
+        f"username: <code>@{esc(message.from_user.username) if message.from_user.username else '-'}</code>"
+    )
+    try:
+        await message.bot.send_message(chat_id=MANAGER_CHAT_ID, text=lead_text)
+    except Exception as e:
+        print(f"Manager lead send error: {e}")
+
+    # ✅ Клиенту: спасибо + канал (без инсты/ютуба)
+    await set_lang_keep(state, lang)
+    await safe_answer(message, TEXT[lang]["contact_thanks"], reply_markup=kb_channel_only(lang))
+    await safe_answer(message, "😊✨", reply_markup=kb_menu(lang))
+
 # =========================
-# ORDER
+# ORDER FLOW
 # =========================
 async def start_order(message: Message, state: FSMContext):
     lang = await get_lang(state)
@@ -821,14 +792,15 @@ async def order_name(message: Message, state: FSMContext):
 
 async def order_phone(message: Message, state: FSMContext):
     lang = await get_lang(state)
-
     if message.contact and message.contact.phone_number:
         phone = message.contact.phone_number
     else:
         phone = (message.text or "").strip()
 
     if is_cancel(lang, phone):
-        await order_cancel_by_message(message, state)
+        await set_lang_keep(state, lang)
+        await safe_answer(message, TEXT[lang]["cancelled"], reply_markup=kb_menu(lang))
+        await safe_answer(message, TEXT[lang]["social_end"], reply_markup=kb_social_end(lang))
         return
 
     phone = clean_phone(phone)
@@ -837,8 +809,6 @@ async def order_phone(message: Message, state: FSMContext):
         return
 
     await state.update_data(order_phone=phone)
-
-    # ✅ После телефона возвращаем обычное меню (важно: меню не пропадает)
     await state.set_state(Flow.order_city)
     await safe_answer(message, TEXT[lang]["order_city"], reply_markup=kb_menu(lang))
 
@@ -846,7 +816,9 @@ async def order_city(message: Message, state: FSMContext):
     lang = await get_lang(state)
     city = (message.text or "").strip()
     if is_cancel(lang, city):
-        await order_cancel_by_message(message, state)
+        await set_lang_keep(state, lang)
+        await safe_answer(message, TEXT[lang]["cancelled"], reply_markup=kb_menu(lang))
+        await safe_answer(message, TEXT[lang]["social_end"], reply_markup=kb_social_end(lang))
         return
     if not city:
         await safe_answer(message, TEXT[lang]["order_city"], reply_markup=kb_menu(lang))
@@ -859,7 +831,9 @@ async def order_item(message: Message, state: FSMContext):
     lang = await get_lang(state)
     item = (message.text or "").strip()
     if is_cancel(lang, item):
-        await order_cancel_by_message(message, state)
+        await set_lang_keep(state, lang)
+        await safe_answer(message, TEXT[lang]["cancelled"], reply_markup=kb_menu(lang))
+        await safe_answer(message, TEXT[lang]["social_end"], reply_markup=kb_social_end(lang))
         return
     if not item:
         await safe_answer(message, TEXT[lang]["order_item"], reply_markup=kb_menu(lang))
@@ -872,10 +846,9 @@ async def order_size(message: Message, state: FSMContext):
     lang = await get_lang(state)
     raw = (message.text or "").strip()
     if is_cancel(lang, raw):
-        await order_cancel_by_message(message, state)
-        return
-    if not raw:
-        await safe_answer(message, TEXT[lang]["order_size"], reply_markup=kb_menu(lang))
+        await set_lang_keep(state, lang)
+        await safe_answer(message, TEXT[lang]["cancelled"], reply_markup=kb_menu(lang))
+        await safe_answer(message, TEXT[lang]["social_end"], reply_markup=kb_social_end(lang))
         return
 
     age, height = extract_two_numbers_any_order(raw)
@@ -892,27 +865,20 @@ async def order_comment(message: Message, state: FSMContext):
     lang = await get_lang(state)
     comment = (message.text or "").strip()
     if is_cancel(lang, comment):
-        await order_cancel_by_message(message, state)
+        await set_lang_keep(state, lang)
+        await safe_answer(message, TEXT[lang]["cancelled"], reply_markup=kb_menu(lang))
+        await safe_answer(message, TEXT[lang]["social_end"], reply_markup=kb_social_end(lang))
         return
     if not comment:
         comment = "нет" if lang == "ru" else "yo‘q"
-
     await state.update_data(order_comment=comment)
     await state.set_state(Flow.order_confirm)
     await show_order_review(message, state, lang)
-
-async def order_cancel_by_message(message: Message, state: FSMContext):
-    lang = await get_lang(state)
-    await set_lang_keep(state, lang)
-    await safe_answer(message, TEXT[lang]["cancelled"], reply_markup=kb_menu(lang))
-    # ✅ В конце отмены показываем все ссылки
-    await safe_answer(message, TEXT[lang]["social_end"], reply_markup=kb_social_end(lang))
 
 async def order_cancel(call: CallbackQuery, state: FSMContext):
     lang = await get_lang(state)
     await set_lang_keep(state, lang)
     await safe_answer_call(call, TEXT[lang]["cancelled"], reply_markup=kb_menu(lang))
-    # ✅ В конце отмены показываем все ссылки
     await safe_answer_call(call, TEXT[lang]["social_end"], reply_markup=kb_social_end(lang))
     await call.answer()
 
@@ -953,31 +919,25 @@ async def edit_field_value(message: Message, state: FSMContext):
     lang = await get_lang(state)
     data = await state.get_data()
     field = data.get("_edit_field")
+    value = (message.text or "").strip()
+
+    if is_cancel(lang, value):
+        await set_lang_keep(state, lang)
+        await safe_answer(message, TEXT[lang]["cancelled"], reply_markup=kb_menu(lang))
+        await safe_answer(message, TEXT[lang]["social_end"], reply_markup=kb_social_end(lang))
+        return
 
     if field == "phone":
         if message.contact and message.contact.phone_number:
             value = message.contact.phone_number
-        else:
-            value = (message.text or "").strip()
-
-        if is_cancel(lang, value):
-            await order_cancel_by_message(message, state)
-            return
-
         value = clean_phone(value)
         if not looks_like_phone(value):
             await safe_answer(message, TEXT[lang]["order_phone"], reply_markup=kb_contact_request(lang))
             return
-
     else:
-        value = (message.text or "").strip()
-        if is_cancel(lang, value):
-            await order_cancel_by_message(message, state)
-            return
         if not value:
             await safe_answer(message, TEXT[lang]["unknown"], reply_markup=kb_menu(lang))
             return
-
         if field == "size":
             age, height = extract_two_numbers_any_order(value)
             if age is None or height is None:
@@ -1024,21 +984,28 @@ async def order_confirm(call: CallbackQuery, state: FSMContext):
     await safe_answer_call(call, TEXT[lang]["order_sent"], reply_markup=kb_menu(lang))
     await safe_answer_call(call, TEXT[lang]["worktime_in"] if in_work_time(now_local()) else TEXT[lang]["worktime_out"], reply_markup=kb_menu(lang))
 
-    # ✅ В конце заказа показываем все ссылки
+    # ✅ В конце заказа показываем все ссылки (телега/инста/ютуб)
     await safe_answer_call(call, TEXT[lang]["social_end"], reply_markup=kb_social_end(lang))
 
     await set_lang_keep(state, lang)
     await call.answer()
 
 # =========================
-# RENDER HEALTH SERVER (OK)
+# RENDER HEALTH SERVER (FIX: HEAD)
 # =========================
 class _HealthHandler(BaseHTTPRequestHandler):
-    def do_GET(self):
+    def _ok(self):
         self.send_response(200)
         self.send_header("Content-Type", "text/plain; charset=utf-8")
         self.end_headers()
+
+    def do_GET(self):
+        self._ok()
         self.wfile.write(b"OK")
+
+    # ✅ важно для UptimeRobot (он часто делает HEAD)
+    def do_HEAD(self):
+        self._ok()
 
     def log_message(self, format, *args):
         return
@@ -1048,7 +1015,7 @@ def start_health_server():
     server = HTTPServer(("0.0.0.0", port), _HealthHandler)
     t = threading.Thread(target=server.serve_forever, daemon=True)
     t.start()
-    print(f"✅ Health server listening on port {port} (Render port binding).")
+    print(f"✅ Health server listening on port {port}.")
 
 # =========================
 # DISPATCHER
@@ -1056,29 +1023,25 @@ def start_health_server():
 def build_dp() -> Dispatcher:
     dp = Dispatcher()
 
-    # commands
     dp.message.register(cmd_start, CommandStart())
     dp.message.register(cmd_menu, Command("menu"))
 
-    # language
     dp.callback_query.register(pick_lang, F.data.startswith("lang:"))
     dp.callback_query.register(back_menu, F.data == "back:menu")
 
-    # price
     dp.callback_query.register(price_section, F.data.startswith("price:"))
     dp.callback_query.register(go_order, F.data == "go:order")
 
-    # catalog
     dp.callback_query.register(photo_section, F.data.startswith("photo:"))
     dp.callback_query.register(order_prefill, F.data.startswith("order:prefill:"))
 
-    # size
     dp.callback_query.register(size_mode, F.data.startswith("size:"))
     dp.message.register(size_age, Flow.size_age)
     dp.message.register(size_height, Flow.size_height)
 
-    # contact -> leave
+    # ✅ contact flow
     dp.callback_query.register(contact_leave, F.data == "contact:leave")
+    dp.message.register(contact_phone, Flow.contact_phone)
 
     # order states
     dp.message.register(order_name, Flow.order_name)
@@ -1088,17 +1051,14 @@ def build_dp() -> Dispatcher:
     dp.message.register(order_size, Flow.order_size)
     dp.message.register(order_comment, Flow.order_comment)
 
-    # order callbacks
     dp.callback_query.register(order_cancel, F.data == "order:cancel")
     dp.callback_query.register(order_confirm, F.data == "order:confirm")
     dp.callback_query.register(order_edit, F.data == "order:edit")
     dp.callback_query.register(order_back_confirm, F.data == "order:back_confirm")
 
-    # edit
     dp.callback_query.register(edit_pick, F.data.startswith("edit:"))
     dp.message.register(edit_field_value, Flow.edit_field)
 
-    # ✅ главный текстовый роутер (в конце!)
     dp.message.register(menu_by_text, F.text)
 
     return dp
