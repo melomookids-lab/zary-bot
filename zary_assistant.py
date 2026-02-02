@@ -4,7 +4,7 @@ import html
 import asyncio
 import threading
 import sqlite3
-from datetime import datetime, time
+from datetime import datetime, time as dtime
 from zoneinfo import ZoneInfo
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
@@ -30,25 +30,19 @@ BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 if not BOT_TOKEN:
     raise RuntimeError("BOT_TOKEN env is empty. Set it in Render Environment Variables")
 
-# username бота БЕЗ @ (нужно для deep-links в кнопках под постом)
-BOT_USERNAME = os.getenv("BOT_USERNAME", "").strip().lstrip("@")
-if not BOT_USERNAME:
-    # можно оставить пустым, но deep-links будут хуже
-    BOT_USERNAME = ""
+BOT_USERNAME = os.getenv("BOT_USERNAME", "").strip().lstrip("@")  # optional
 
-# ID канала (пример: -1001234567890). Бот должен быть админом канала с правом постинга.
-CHANNEL_ID = os.getenv("CHANNEL_ID", "").strip()
-CHANNEL_ID = int(CHANNEL_ID) if CHANNEL_ID else 0
+# ВАЖНО: может быть и канал, и группа. Главное: правильный ID и права.
+CHANNEL_ID_RAW = os.getenv("CHANNEL_ID", "").strip()
+CHANNEL_ID = int(CHANNEL_ID_RAW) if CHANNEL_ID_RAW else 0
 
-MANAGER_CHAT_ID = 7195737024
-MANAGER_PHONE = "+998771202255"
-
-# username менеджера БЕЗ @ — чтобы работала кнопка "Написать менеджеру"
+MANAGER_CHAT_ID = int(os.getenv("MANAGER_CHAT_ID", "7195737024").strip())  # можно хранить в env
+MANAGER_PHONE = os.getenv("MANAGER_PHONE", "+998771202255").strip()
 MANAGER_USERNAME = os.getenv("MANAGER_USERNAME", "").strip().lstrip("@")  # optional
 
 TZ = ZoneInfo("Asia/Tashkent")
-WORK_START = time(9, 0)
-WORK_END = time(21, 0)
+WORK_START = dtime(9, 0)
+WORK_END = dtime(21, 0)
 
 INSTAGRAM_URL = "https://www.instagram.com/zary.co/"
 YOUTUBE_URL = "https://www.youtube.com/@ZARYCOOFFICIAL"
@@ -57,9 +51,9 @@ TELEGRAM_CHANNEL_URL = f"https://t.me/{TELEGRAM_CHANNEL_USERNAME}"
 
 DB_PATH = os.getenv("DB_PATH", "bot.db")
 
-# Автопостинг в 18:00
-AUTOPOST_HOUR = 18
-AUTOPOST_MINUTE = 0
+# Автопостинг: время публикации (локальное, Ташкент)
+AUTOPOST_HOUR = int(os.getenv("AUTOPOST_HOUR", "18"))
+AUTOPOST_MINUTE = int(os.getenv("AUTOPOST_MINUTE", "0"))
 
 # =========================
 # CATALOG SECTIONS
@@ -93,12 +87,7 @@ FAQ = {
     },
 }
 
-# =========================
-# PROMO
-# =========================
-PROMO_CODES = {
-    "PROMO10": 10,  # 10% скидка
-}
+PROMO_CODES = {"PROMO10": 10}
 
 # =========================
 # SAFE HTML
@@ -138,8 +127,7 @@ def in_work_time(dt: datetime) -> bool:
     return WORK_START <= t <= WORK_END
 
 def clean_phone(raw: str) -> str:
-    s = (raw or "").strip().replace(" ", "").replace("-", "")
-    return s
+    return (raw or "").strip().replace(" ", "").replace("-", "")
 
 def looks_like_phone(s: str) -> bool:
     digits = re.sub(r"\D", "", clean_phone(s))
@@ -170,7 +158,6 @@ def height_to_size(height: int) -> int:
     return min(sizes, key=lambda x: abs(x - height))
 
 def detect_lang_from_tg(message: Message) -> str:
-    # авто по языку Telegram
     code = (message.from_user.language_code or "").lower() if message.from_user else ""
     if code.startswith("uz"):
         return "uz"
@@ -179,7 +166,6 @@ def detect_lang_from_tg(message: Message) -> str:
 def deep_link(param: str) -> str:
     if BOT_USERNAME:
         return f"https://t.me/{BOT_USERNAME}?start={param}"
-    # fallback (без username ссылки будут неудобнее)
     return "https://t.me/"
 
 # =========================
@@ -245,7 +231,6 @@ def db_init():
         )
     """)
 
-    # очередь постов для канала
     cur.execute("""
         CREATE TABLE IF NOT EXISTS posts_queue (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -263,22 +248,13 @@ def db_init():
     con.commit()
     con.close()
 
-def user_upsert(message: Message, lang: str):
+def user_exists(user_id: int) -> bool:
     con = db_conn()
     cur = con.cursor()
-    uid = message.from_user.id
-    uname = message.from_user.username or ""
-    cur.execute("SELECT user_id FROM users WHERE user_id=?", (uid,))
+    cur.execute("SELECT 1 FROM users WHERE user_id=?", (user_id,))
     row = cur.fetchone()
-    if row:
-        cur.execute("UPDATE users SET username=?, lang=? WHERE user_id=?", (uname, lang, uid))
-    else:
-        cur.execute("""
-            INSERT INTO users (user_id, username, lang, created_at, created_ts)
-            VALUES (?, ?, ?, ?, ?)
-        """, (uid, uname, lang, now_local().strftime("%Y-%m-%d %H:%M:%S"), now_ts()))
-    con.commit()
     con.close()
+    return bool(row)
 
 def user_get_lang(user_id: int) -> str:
     con = db_conn()
@@ -287,6 +263,21 @@ def user_get_lang(user_id: int) -> str:
     row = cur.fetchone()
     con.close()
     return row[0] if row and row[0] in ("ru", "uz") else "ru"
+
+def user_upsert(user_id: int, username: str, lang: str):
+    con = db_conn()
+    cur = con.cursor()
+    cur.execute("SELECT user_id FROM users WHERE user_id=?", (user_id,))
+    row = cur.fetchone()
+    if row:
+        cur.execute("UPDATE users SET username=?, lang=? WHERE user_id=?", (username or "", lang, user_id))
+    else:
+        cur.execute("""
+            INSERT INTO users (user_id, username, lang, created_at, created_ts)
+            VALUES (?, ?, ?, ?, ?)
+        """, (user_id, username or "", lang, now_local().strftime("%Y-%m-%d %H:%M:%S"), now_ts()))
+    con.commit()
+    con.close()
 
 def cart_add(user_id: int, item: str, qty: int = 1):
     con = db_conn()
@@ -447,19 +438,16 @@ TEXT = {
             "Выберите действие кнопками 👇"
         ),
         "menu_title": "Выберите действие 👇",
-
         "subscribe_hint": (
             "📣 <b>Чтобы не пропустить новинки</b>\n"
             "Все коллекции и фото мы публикуем в Telegram-канале 👇\n"
             f"👉 <b>@{TELEGRAM_CHANNEL_USERNAME}</b>\n\n"
             "Нажмите кнопку ниже, чтобы перейти и подписаться 😊✨"
         ),
-
         "price_title": "🧾 <b>Прайс (укороченный)</b>\nВыберите раздел:",
         "price_boys": "👶 <b>МАЛЬЧИКИ</b>\n• Верх • Толстовки • Низ • Комплекты\n\n✅ Нажмите ✅ Оформить заказ",
         "price_girls": "👧 <b>ДЕВОЧКИ</b>\n• Верх • Платья/юбки • Толстовки • Низ • Комплекты\n\n✅ Нажмите ✅ Оформить заказ",
         "price_unisex": "🧒 <b>УНИСЕКС / БАЗА</b>\n• Футболка • Свитер • Спорт • Школа\n\n✅ Нажмите ✅ Оформить заказ",
-
         "photos_title": "📸 <b>Каталог (разделы)</b>\nВыберите раздел:",
         "photos_no": (
             "Извините, сейчас в этом разделе фото нет.\n"
@@ -467,7 +455,6 @@ TEXT = {
             f"👉 <b>@{TELEGRAM_CHANNEL_USERNAME}</b>\n\n"
             "Нажмите кнопку ниже, чтобы перейти и подписаться 😊✨"
         ),
-
         "size_title": "📏 <b>Подбор размера (1–15 лет)</b>\nВыберите способ:",
         "size_age_ask": "Напишите возраст ребёнка (1–15). Пример: <code>7</code>",
         "size_height_ask": "Напишите рост в см. Пример: <code>125</code>",
@@ -475,7 +462,6 @@ TEXT = {
         "size_bad_height": "Введите рост цифрой (например: 125).",
         "size_result_by_age": "📏 <b>По возрасту</b>\nВозраст: {age}\nРазмер: <b>{age_rec}</b>",
         "size_result_by_height": "📏 <b>По росту</b>\nРост: {height} см\nРазмер: <b>{height_rec}</b>",
-
         "contact_title": (
             "📞 <b>Связаться</b>\n"
             "Мы принимаем заявки <b>24/7</b>.\n"
@@ -489,7 +475,6 @@ TEXT = {
             "Очень скоро менеджер позвонит и уточнит детали.\n\n"
             "Пока переходите в Telegram-канал и посмотрите коллекции 👇"
         ),
-
         "order_start": "🧾 <b>Оформляем заказ</b>\nКак вас зовут? 😊",
         "order_phone": "📲 Отправьте номер телефона (или нажмите кнопку «📲 Отправить контакт»).",
         "order_city": "🏙 Ваш город/район?",
@@ -513,36 +498,28 @@ TEXT = {
         "payment_info": "💳 <b>Оплата</b>\nПосле подтверждения менеджер отправит реквизиты.\nПосле оплаты отправьте чек/скрин.",
         "worktime_in": "⏱ Сейчас рабочее время — ответ будет быстрее 😊",
         "worktime_out": "⏱ Сейчас вне рабочего времени — менеджер ответит в рабочие часы 😊",
-
         "status_processing": "🟡 Ваш заказ в обработке. Менеджер уже работает 😊",
         "status_done": "🟢 Ваш заказ готов/обработан. Менеджер уточнит детали 😊",
-
         "edit_choose": "✏️ Что хотите исправить?",
         "cancelled": "❌ Отменено. Возвращаю в меню 👇",
         "unknown": "Пожалуйста, используйте кнопки меню 👇",
         "flow_locked": "Сейчас идёт оформление заказа. Продолжить или выйти в меню?",
-
         "social_end": (
             "📌 <b>Наши ссылки:</b>\n"
             f"📣 Telegram: {TELEGRAM_CHANNEL_URL}\n"
             f"📸 Instagram: {INSTAGRAM_URL}\n"
             f"▶️ YouTube: {YOUTUBE_URL}\n"
         ),
-
         "cart_title": "🧺 <b>Ваша корзина</b>",
         "cart_empty": "🧺 Корзина пустая. Нажмите «➕ Добавить в корзину» и напишите название товара 😊",
         "cart_add_ask": "🧺 Напишите название товара для корзины (например: «школьная форма»).",
         "cart_added": "✅ Добавлено в корзину 😊",
         "cart_cleared": "🧹 Корзина очищена.",
-
         "history_title": "📜 <b>История заказов</b>",
         "history_empty": "📜 История заказов пока пустая.",
-
         "admin_only": "⛔ Это команда только для менеджера.",
         "addpost_help": "✅ Отправьте мне пост (текст / фото / видео). Я добавлю в очередь автопостинга.",
         "addpost_added": "✅ Добавлено в очередь: #{pid}",
-        "autopost_no_channel": "⚠️ CHANNEL_ID не задан. Автопостинг отключён.",
-        "autopost_no_posts": "ℹ️ Очередь постов пустая. Добавьте /addpost",
     },
 
     "uz": {
@@ -553,19 +530,16 @@ TEXT = {
             "Bo‘limni tanlang 👇"
         ),
         "menu_title": "Bo‘limni tanlang 👇",
-
         "subscribe_hint": (
             "📣 <b>Yangiliklarni o‘tkazib yubormaslik uchun</b>\n"
             "Barcha kolleksiyalar va rasmlar Telegram kanalimizda 👇\n"
             f"👉 <b>@{TELEGRAM_CHANNEL_USERNAME}</b>\n\n"
             "Pastdagi tugmani bosing va obuna bo‘ling 😊✨"
         ),
-
         "price_title": "🧾 <b>Narxlar (qisqa)</b>\nBo‘limni tanlang:",
         "price_boys": "👶 <b>O‘G‘IL BOLALAR</b>\n• Ustki • Xudi • Past • To‘plam\n\n✅ ✅ Buyurtma tugmasini bosing",
         "price_girls": "👧 <b>QIZ BOLALAR</b>\n• Ustki • Ko‘ylak/yubka • Xudi • Past\n\n✅ ✅ Buyurtma tugmasini bosing",
         "price_unisex": "🧒 <b>UNISEKS / BAZA</b>\n• Futbolka • Sviter • Sport • Maktab\n\n✅ ✅ Buyurtma tugmasini bosing",
-
         "photos_title": "📸 <b>Katalog (bo‘limlar)</b>\nBo‘limni tanlang:",
         "photos_no": (
             "Kechirasiz, hozir bu bo‘limda rasm yo‘q.\n"
@@ -573,7 +547,6 @@ TEXT = {
             f"👉 <b>@{TELEGRAM_CHANNEL_USERNAME}</b>\n\n"
             "Pastdagi tugmani bosing va obuna bo‘ling 😊✨"
         ),
-
         "size_title": "📏 <b>O‘lcham tanlash (1–15 yosh)</b>\nUsulni tanlang:",
         "size_age_ask": "Yoshini yozing (1–15). Masalan: <code>7</code>",
         "size_height_ask": "Bo‘yini sm da yozing. Masalan: <code>125</code>",
@@ -581,7 +554,6 @@ TEXT = {
         "size_bad_height": "Bo‘yini raqam bilan yozing (masalan: 125).",
         "size_result_by_age": "📏 <b>Yosh bo‘yicha</b>\nYosh: {age}\nO‘lcham: <b>{age_rec}</b>",
         "size_result_by_height": "📏 <b>Bo‘y bo‘yicha</b>\nBo‘y: {height} sm\nO‘lcham: <b>{height_rec}</b>",
-
         "contact_title": (
             "📞 <b>Aloqa</b>\n"
             "Buyurtmalar <b>24/7</b> qabul qilinadi.\n"
@@ -595,7 +567,6 @@ TEXT = {
             "Menejer tez orada qo‘ng‘iroq qiladi.\n\n"
             "Hozircha kanalga o‘ting va kolleksiyalarni ko‘ring 👇"
         ),
-
         "order_start": "🧾 <b>Buyurtma</b>\nIsmingiz? 😊",
         "order_phone": "📲 Telefon raqam yuboring (yoki «📲 Kontakt yuborish» tugmasi).",
         "order_city": "🏙 Shahar/tuman?",
@@ -619,36 +590,28 @@ TEXT = {
         "payment_info": "💳 <b>To‘lov</b>\nTasdiqlangach menejer karta/revizit yuboradi.\nTo‘lovdan so‘ng чек/skrinni yuboring.",
         "worktime_in": "⏱ Hozir ish vaqti — javob tezroq 😊",
         "worktime_out": "⏱ Hozir ish vaqti emas — menejer ish vaqtida javob beradi 😊",
-
         "status_processing": "🟡 Buyurtmangiz ko‘rib chiqilmoqda. Menejer ishlayapti 😊",
         "status_done": "🟢 Buyurtmangiz tayyor/ko‘rib chiqildi. Menejer aniqlashtiradi 😊",
-
         "edit_choose": "✏️ Nimani tuzatamiz?",
         "cancelled": "❌ Bekor qilindi. Menyuga qaytdik 👇",
         "unknown": "Iltimos, menyu tugmalaridan foydalaning 👇",
         "flow_locked": "Hozir buyurtma rasmiylashtirilmoqda. Davom etamizmi yoki menyuga chiqamizmi?",
-
         "social_end": (
             "📌 <b>Havolalarimiz:</b>\n"
             f"📣 Telegram: {TELEGRAM_CHANNEL_URL}\n"
             f"📸 Instagram: {INSTAGRAM_URL}\n"
             f"▶️ YouTube: {YOUTUBE_URL}\n"
         ),
-
         "cart_title": "🧺 <b>Savatingiz</b>",
         "cart_empty": "🧺 Savat bo‘sh. «➕ Savatga qo‘shish» ni bosing va mahsulot nomini yozing 😊",
         "cart_add_ask": "🧺 Mahsulot nomini yozing (masalan: «maktab formasi»).",
         "cart_added": "✅ Savatga qo‘shildi 😊",
         "cart_cleared": "🧹 Savat tozalandi.",
-
         "history_title": "📜 <b>Buyurtmalar tarixi</b>",
         "history_empty": "📜 Hozircha buyurtmalar tarixi yo‘q.",
-
         "admin_only": "⛔ Bu buyruq faqat menejer uchun.",
         "addpost_help": "✅ Post yuboring (matn / rasm / video). Men navbatga qo‘shaman.",
         "addpost_added": "✅ Navbatga qo‘shildi: #{pid}",
-        "autopost_no_channel": "⚠️ CHANNEL_ID berilmagan. Avtopost o‘chiq.",
-        "autopost_no_posts": "ℹ️ Post navbati bo‘sh. /addpost qiling",
     }
 }
 
@@ -672,7 +635,6 @@ class Flow(StatesGroup):
     order_confirm = State()
 
     edit_field = State()
-
     addpost_wait = State()
 
 # =========================
@@ -857,16 +819,13 @@ def kb_faq(lang: str) -> InlineKeyboardMarkup:
     ])
 
 def kb_manager_status(order_id: int) -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [
-            InlineKeyboardButton(text="🆕 new", callback_data=f"mstatus:{order_id}:new"),
-            InlineKeyboardButton(text="🟡 processing", callback_data=f"mstatus:{order_id}:processing"),
-            InlineKeyboardButton(text="🟢 done", callback_data=f"mstatus:{order_id}:done"),
-        ]
-    ])
+    return InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text="🆕 new", callback_data=f"mstatus:{order_id}:new"),
+        InlineKeyboardButton(text="🟡 processing", callback_data=f"mstatus:{order_id}:processing"),
+        InlineKeyboardButton(text="🟢 done", callback_data=f"mstatus:{order_id}:done"),
+    ]])
 
 def kb_post_under(lang: str) -> InlineKeyboardMarkup:
-    # кнопки под постом в канале (deep links)
     return InlineKeyboardMarkup(inline_keyboard=[
         [
             InlineKeyboardButton(text="✅ Заказать" if lang == "ru" else "✅ Buyurtma", url=deep_link("order")),
@@ -881,40 +840,16 @@ def kb_post_under(lang: str) -> InlineKeyboardMarkup:
 # =========================
 # LANG in FSM (cache)
 # =========================
-async def get_lang(state: FSMContext, user_id: int | None = None) -> str:
+async def get_lang(state: FSMContext, user_id: int) -> str:
     data = await state.get_data()
     lang = data.get("lang")
     if lang in ("ru", "uz"):
         return lang
-    if user_id:
-        return user_get_lang(user_id)
-    return "ru"
+    return user_get_lang(user_id)
 
 async def set_lang_keep(state: FSMContext, lang: str):
     await state.clear()
     await state.update_data(lang=lang)
-
-# =========================
-# ORDER REVIEW
-# =========================
-async def show_order_review(target, state: FSMContext, lang: str):
-    data = await state.get_data()
-    review = TEXT[lang]["order_review"].format(
-        name=esc(data.get("order_name", "-")),
-        phone=esc(data.get("order_phone", "-")),
-        city=esc(data.get("order_city", "-")),
-        item=esc(data.get("order_item", "-")),
-        size=esc(data.get("order_size", "-")),
-        comment=esc(data.get("order_comment", "-")),
-        promo=esc(data.get("order_promo", "—")),
-    )
-    if isinstance(target, Message):
-        await safe_answer(target, review, reply_markup=kb_order_confirm(lang))
-    else:
-        await safe_answer_call(target, review, reply_markup=kb_order_confirm(lang))
-
-async def send_subscribe_hint(message: Message, lang: str):
-    await safe_answer(message, TEXT[lang]["subscribe_hint"], reply_markup=kb_channel_only(lang))
 
 # =========================
 # START / DEEP-LINK
@@ -927,16 +862,25 @@ def parse_start_arg(message: Message) -> str:
             return parts[1].strip()
     return ""
 
+async def send_subscribe_hint(message: Message, lang: str):
+    await safe_answer(message, TEXT[lang]["subscribe_hint"], reply_markup=kb_channel_only(lang))
+
 async def cmd_start(message: Message, state: FSMContext):
-    # автоязык по Telegram + сохранить в БД
-    lang = detect_lang_from_tg(message)
-    user_upsert(message, lang)
+    uid = message.from_user.id
+    uname = message.from_user.username or ""
+
+    # ✅ фикс: если пользователь уже есть — НЕ перетираем язык телеграмом
+    if user_exists(uid):
+        lang = user_get_lang(uid)
+    else:
+        lang = detect_lang_from_tg(message)
+
+    user_upsert(uid, uname, lang)
     await set_lang_keep(state, lang)
 
     await safe_answer(message, TEXT[lang]["hello"], reply_markup=kb_menu(lang))
     await send_subscribe_hint(message, lang)
 
-    # deep link: /start order | size | catalog | contact | frompost_123
     arg = parse_start_arg(message)
     if arg == "order":
         await start_order(message, state)
@@ -946,9 +890,6 @@ async def cmd_start(message: Message, state: FSMContext):
         await safe_answer(message, TEXT[lang]["photos_title"], reply_markup=kb_photos(lang))
     elif arg == "contact":
         await show_contact(message, state)
-    elif arg.startswith("frompost_"):
-        # автоответ если пришёл из поста
-        await safe_answer(message, "✅ Вы пришли из поста. Давайте оформим заказ 😊" if lang == "ru" else "✅ Postdan keldingiz. Buyurtma qilamiz 😊", reply_markup=kb_menu(lang))
 
 async def cmd_menu(message: Message, state: FSMContext):
     lang = await get_lang(state, message.from_user.id)
@@ -956,12 +897,12 @@ async def cmd_menu(message: Message, state: FSMContext):
 
 async def pick_lang(call: CallbackQuery, state: FSMContext):
     lang = call.data.split(":")[1]
-    # сохранить язык и в БД
-    fake_msg = call.message
-    fake_msg.from_user = call.from_user  # type: ignore
-    user_upsert(fake_msg, lang)
+    uid = call.from_user.id
+    uname = call.from_user.username or ""
 
+    user_upsert(uid, uname, lang)
     await set_lang_keep(state, lang)
+
     await safe_answer_call(call, TEXT[lang]["hello"], reply_markup=kb_menu(lang))
     await call.message.answer(TEXT[lang]["subscribe_hint"], reply_markup=kb_channel_only(lang))
     await call.answer()
@@ -972,9 +913,6 @@ async def back_menu(call: CallbackQuery, state: FSMContext):
     await safe_answer_call(call, TEXT[lang]["menu_title"], reply_markup=kb_menu(lang))
     await call.answer()
 
-# =========================
-# MENU HELPERS
-# =========================
 def is_cancel(lang: str, txt: str) -> bool:
     return (lang == "ru" and txt == "❌ Отмена") or (lang == "uz" and txt == "❌ Bekor qilish")
 
@@ -993,7 +931,6 @@ async def menu_by_text(message: Message, state: FSMContext):
     lang = await get_lang(state, message.from_user.id)
     txt = (message.text or "").strip()
 
-    # Telegram button is always allowed
     if txt in ("📣 Telegram канал", "📣 Telegram kanal"):
         msg = (
             "📣 <b>Наш Telegram-канал</b>\n"
@@ -1122,9 +1059,8 @@ async def size_age(message: Message, state: FSMContext):
     if not (1 <= age <= 15):
         await safe_answer(message, TEXT[lang]["size_bad_age"], reply_markup=kb_menu(lang))
         return
-    age_rec = age_to_size_range(age)
     await set_lang_keep(state, lang)
-    await safe_answer(message, TEXT[lang]["size_result_by_age"].format(age=age, age_rec=age_rec), reply_markup=kb_menu(lang))
+    await safe_answer(message, TEXT[lang]["size_result_by_age"].format(age=age, age_rec=age_to_size_range(age)), reply_markup=kb_menu(lang))
 
 async def size_height(message: Message, state: FSMContext):
     lang = await get_lang(state, message.from_user.id)
@@ -1136,9 +1072,8 @@ async def size_height(message: Message, state: FSMContext):
     if height < 70 or height > 190:
         await safe_answer(message, TEXT[lang]["size_bad_height"], reply_markup=kb_menu(lang))
         return
-    height_rec = height_to_size(height)
     await set_lang_keep(state, lang)
-    await safe_answer(message, TEXT[lang]["size_result_by_height"].format(height=height, height_rec=height_rec), reply_markup=kb_menu(lang))
+    await safe_answer(message, TEXT[lang]["size_result_by_height"].format(height=height, height_rec=height_to_size(height)), reply_markup=kb_menu(lang))
 
 async def faq_section(call: CallbackQuery, state: FSMContext):
     lang = await get_lang(state, call.from_user.id)
@@ -1248,6 +1183,22 @@ async def go_order(call: CallbackQuery, state: FSMContext):
     await state.set_state(Flow.order_name)
     await safe_answer_call(call, TEXT[lang]["order_start"], reply_markup=kb_menu(lang))
     await call.answer()
+
+async def show_order_review(target, state: FSMContext, lang: str):
+    data = await state.get_data()
+    review = TEXT[lang]["order_review"].format(
+        name=esc(data.get("order_name", "-")),
+        phone=esc(data.get("order_phone", "-")),
+        city=esc(data.get("order_city", "-")),
+        item=esc(data.get("order_item", "-")),
+        size=esc(data.get("order_size", "-")),
+        comment=esc(data.get("order_comment", "-")),
+        promo=esc(data.get("order_promo", "—")),
+    )
+    if isinstance(target, Message):
+        await safe_answer(target, review, reply_markup=kb_order_confirm(lang))
+    else:
+        await safe_answer_call(target, review, reply_markup=kb_order_confirm(lang))
 
 async def order_name(message: Message, state: FSMContext):
     lang = await get_lang(state, message.from_user.id)
@@ -1399,7 +1350,6 @@ async def edit_pick(call: CallbackQuery, state: FSMContext):
         await safe_answer_call(call, prompts["phone"], reply_markup=kb_contact_request(lang))
     else:
         await safe_answer_call(call, prompts.get(field, TEXT[lang]["unknown"]), reply_markup=kb_menu(lang))
-
     await call.answer()
 
 async def edit_field_value(message: Message, state: FSMContext):
@@ -1459,7 +1409,6 @@ async def order_confirm(call: CallbackQuery, state: FSMContext):
     promo_code = (data.get("order_promo") or "").upper().strip()
     discount = PROMO_CODES.get(promo_code, 0) if promo_code else 0
 
-    # save order
     order_id = orders_insert(
         user_id=call.from_user.id,
         username=call.from_user.username or "",
@@ -1476,7 +1425,6 @@ async def order_confirm(call: CallbackQuery, state: FSMContext):
     if data.get("_from_cart"):
         cart_clear(call.from_user.id)
 
-    # manager message with status buttons
     promo_line = f"\n• Промокод: <b>{esc(promo_code)}</b> (-{discount}%)" if discount else ""
     manager_text = (
         f"🛎 <b>Новый заказ</b> #{order_id} ({esc(ts)})\n\n"
@@ -1495,7 +1443,6 @@ async def order_confirm(call: CallbackQuery, state: FSMContext):
     except Exception as e:
         print(f"Manager send error: {e}")
 
-    # client reply
     await safe_answer_call(call, TEXT[lang]["order_sent"], reply_markup=kb_menu(lang))
     await safe_answer_call(call, TEXT[lang]["payment_info"], reply_markup=kb_menu(lang))
     await safe_answer_call(call, TEXT[lang]["worktime_in"] if in_work_time(now_local()) else TEXT[lang]["worktime_out"], reply_markup=kb_menu(lang))
@@ -1525,7 +1472,6 @@ async def manager_set_status(call: CallbackQuery, state: FSMContext):
     order_set_status(order_id, status)
     await call.answer("OK")
 
-    # notify client
     user_id = int(o["user_id"])
     cl_lang = user_get_lang(user_id)
     try:
@@ -1537,7 +1483,7 @@ async def manager_set_status(call: CallbackQuery, state: FSMContext):
         print("client notify error:", e)
 
 # =========================
-# /addpost (manager only)
+# /addpost and /autopostnow
 # =========================
 async def cmd_addpost(message: Message, state: FSMContext):
     lang = user_get_lang(message.from_user.id)
@@ -1572,6 +1518,13 @@ async def addpost_wait(message: Message, state: FSMContext):
     pid = postqueue_add(media_type, file_id, text)
     await safe_answer(message, TEXT[lang]["addpost_added"].format(pid=pid))
     await set_lang_keep(state, lang)
+
+async def cmd_autopost_now(message: Message, state: FSMContext):
+    if message.from_user.id != MANAGER_CHAT_ID:
+        return
+    bot = message.bot
+    ok, info = await autopost_once(bot)
+    await safe_answer(message, f"✅ Autopost: {info}" if ok else f"⚠️ Autopost ERROR: {info}")
 
 # =========================
 # DAILY REPORT + REMINDERS + AUTOPOST
@@ -1625,64 +1578,83 @@ async def reminder_tick(bot: Bot):
 
 async def autopost_once(bot: Bot):
     if not CHANNEL_ID:
-        return
+        return False, "CHANNEL_ID не задан в env"
+
     nxt = postqueue_next()
     if not nxt:
-        return
+        return False, "Очередь пустая (нет queued)"
 
     pid = nxt["id"]
-    media_type = nxt["media_type"] or "text"
+    media_type = (nxt["media_type"] or "text").lower()
     file_id = nxt["file_id"] or ""
     text = nxt["text"] or ""
 
-    # язык для кнопок под постом: по умолчанию RU (можешь поменять на UZ, если хочешь)
     under = kb_post_under("ru")
 
     try:
         if media_type == "photo" and file_id:
-            await bot.send_photo(CHANNEL_ID, photo=file_id, caption=text or None, reply_markup=under)
+            await bot.send_photo(CHANNEL_ID, photo=file_id, caption=(text if text else None), reply_markup=under)
         elif media_type == "video" and file_id:
-            await bot.send_video(CHANNEL_ID, video=file_id, caption=text or None, reply_markup=under)
+            await bot.send_video(CHANNEL_ID, video=file_id, caption=(text if text else None), reply_markup=under)
         else:
-            await bot.send_message(CHANNEL_ID, text or " ", reply_markup=under)
+            await bot.send_message(CHANNEL_ID, text if text else " ", reply_markup=under)
+
         postqueue_mark_posted(pid)
+        return True, f"posted #{pid} to {CHANNEL_ID}"
+
     except Exception as e:
-        print("autopost error:", e)
+        err = f"{type(e).__name__}: {e}"
+        # сообщаем менеджеру, чтобы ты точно видел причину
+        try:
+            await bot.send_message(MANAGER_CHAT_ID, f"⚠️ Autopost error for #{pid}\nchat_id={CHANNEL_ID}\n{esc(err)}")
+        except Exception:
+            pass
+        return False, err
 
 async def scheduler_loop(bot: Bot):
     last_report_date = None
     last_autopost_date = None
 
+    last_reminder_ts = 0
+
     while True:
         dt = now_local()
+        today = dt.strftime("%Y-%m-%d")
 
-        # daily report at 21:05
-        if dt.hour == 21 and dt.minute == 5:
-            d = dt.strftime("%Y-%m-%d")
-            if last_report_date != d:
+        # ✅ daily report: после 21:05, один раз в день
+        if (dt.hour > 21) or (dt.hour == 21 and dt.minute >= 5):
+            if last_report_date != today:
                 try:
                     await send_daily_report(bot)
-                    last_report_date = d
+                    last_report_date = today
                 except Exception as e:
                     print("daily report error:", e)
 
-        # autopost at 18:00 once per day
-        if dt.hour == AUTOPOST_HOUR and dt.minute == AUTOPOST_MINUTE:
-            d = dt.strftime("%Y-%m-%d")
-            if last_autopost_date != d:
-                try:
-                    await autopost_once(bot)
-                    last_autopost_date = d
-                except Exception as e:
-                    print("autopost tick error:", e)
+        # ✅ autopost: после AUTOPOST_HOUR:AUTOPOST_MINUTE, один раз в день
+        scheduled_passed = (dt.hour > AUTOPOST_HOUR) or (dt.hour == AUTOPOST_HOUR and dt.minute >= AUTOPOST_MINUTE)
+        if scheduled_passed and last_autopost_date != today:
+            try:
+                ok, info = await autopost_once(bot)
+                # даже если очередь пустая — пометим день, чтобы не спамило попытками
+                last_autopost_date = today
+                if not ok:
+                    # если ошибка — всё равно отметим, иначе будет пытаться весь вечер
+                    print("autopost not done:", info)
+            except Exception as e:
+                last_autopost_date = today
+                print("autopost tick error:", e)
 
-        # reminders every 2 minutes
-        try:
-            await reminder_tick(bot)
-        except Exception as e:
-            print("reminder tick error:", e)
+        # ✅ reminders: раз в 2 минуты
+        now_sec = int(dt.timestamp())
+        if now_sec - last_reminder_ts >= 120:
+            last_reminder_ts = now_sec
+            try:
+                await reminder_tick(bot)
+            except Exception as e:
+                print("reminder tick error:", e)
 
-        await asyncio.sleep(120)
+        # ✅ частый тик, чтобы ничего не пропускать
+        await asyncio.sleep(20)
 
 # =========================
 # HEALTH SERVER (Render)
@@ -1733,17 +1705,14 @@ def build_dp() -> Dispatcher:
 
     dp.callback_query.register(faq_section, F.data.startswith("faq:"))
 
-    # contact flow
     dp.callback_query.register(contact_leave, F.data == "contact:leave")
     dp.message.register(contact_phone, Flow.contact_phone)
 
-    # cart flow
     dp.callback_query.register(cart_add_manual, F.data == "cart:add_manual")
     dp.message.register(cart_add_item, Flow.cart_add_item)
     dp.callback_query.register(cart_clear_cb, F.data == "cart:clear")
     dp.callback_query.register(cart_checkout_cb, F.data == "cart:checkout")
 
-    # order states
     dp.message.register(order_name, Flow.order_name)
     dp.message.register(order_phone, Flow.order_phone)
     dp.message.register(order_city, Flow.order_city)
@@ -1760,12 +1729,13 @@ def build_dp() -> Dispatcher:
     dp.callback_query.register(edit_pick, F.data.startswith("edit:"))
     dp.message.register(edit_field_value, Flow.edit_field)
 
-    # manager status callback
     dp.callback_query.register(manager_set_status, F.data.startswith("mstatus:"))
 
-    # addpost
     dp.message.register(cmd_addpost, Command("addpost"))
     dp.message.register(addpost_wait, Flow.addpost_wait)
+
+    # ✅ тест автопостинга
+    dp.message.register(cmd_autopost_now, Command("autopostnow"))
 
     dp.message.register(menu_by_text, F.text)
 
@@ -1774,6 +1744,11 @@ def build_dp() -> Dispatcher:
 async def main():
     start_health_server()
     db_init()
+
+    print("✅ Config:")
+    print("CHANNEL_ID =", CHANNEL_ID)
+    print("MANAGER_CHAT_ID =", MANAGER_CHAT_ID)
+    print("AUTOPOST =", f"{AUTOPOST_HOUR:02d}:{AUTOPOST_MINUTE:02d}", "TZ=Asia/Tashkent")
 
     bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
     dp = build_dp()
