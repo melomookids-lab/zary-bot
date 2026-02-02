@@ -4,7 +4,7 @@ import html
 import asyncio
 import threading
 import sqlite3
-from datetime import datetime, time, timedelta
+from datetime import datetime, time
 from zoneinfo import ZoneInfo
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
@@ -30,21 +30,54 @@ BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 if not BOT_TOKEN:
     raise RuntimeError("BOT_TOKEN env is empty. Set it in Render Environment Variables")
 
+BOT_USERNAME = os.getenv("BOT_USERNAME", "").strip()  # without @
+if not BOT_USERNAME:
+    print("⚠️ BOT_USERNAME is empty. Deep-links under channel posts will NOT work until you set BOT_USERNAME env.")
+
+CHANNEL_ID = int(os.getenv("CHANNEL_ID", "0"))  # -100xxxxxxxxxx
+if CHANNEL_ID == 0:
+    print("⚠️ CHANNEL_ID is 0. Autoposting will NOT work until you set CHANNEL_ID env.")
+
+DB_PATH = os.getenv("DB_PATH", "bot.db")
+
+# Manager settings
 MANAGER_CHAT_ID = 7195737024
 MANAGER_PHONE = "+998771202255"
-MANAGER_USERNAME = ""  # optional without @
+MANAGER_USERNAME = ""  # without @ (optional)
 
+# Timezone & schedules
 TZ = ZoneInfo("Asia/Tashkent")
-WORK_START = time(9, 0)
-WORK_END = time(21, 0)
+POST_TIME = time(18, 0)  # daily autopost at 18:00
 
+# Links
 INSTAGRAM_URL = "https://www.instagram.com/zary.co/"
 YOUTUBE_URL = "https://www.youtube.com/@ZARYCOOFFICIAL"
-
 TELEGRAM_CHANNEL_USERNAME = "zaryco_official"
 TELEGRAM_CHANNEL_URL = f"https://t.me/{TELEGRAM_CHANNEL_USERNAME}"
 
-DB_PATH = os.getenv("DB_PATH", "bot.db")
+# Deep links
+BOT_URL = f"https://t.me/{BOT_USERNAME}" if BOT_USERNAME else ""
+
+def start_link(payload: str) -> str:
+    if not BOT_URL:
+        return TELEGRAM_CHANNEL_URL
+    return f"{BOT_URL}?start={payload}"
+
+def is_admin(user_id: int) -> bool:
+    return user_id == MANAGER_CHAT_ID
+
+# =========================
+# PROMO
+# =========================
+PROMO_CODES = {
+    "PROMO10": 10,   # 10% discount
+}
+
+def promo_normalize(s: str) -> str:
+    return (s or "").strip().upper().replace(" ", "")
+
+def promo_discount(code: str) -> int:
+    return PROMO_CODES.get(promo_normalize(code), 0)
 
 # =========================
 # PHOTO CATALOG (sections)
@@ -91,13 +124,8 @@ def now_local() -> datetime:
 def now_ts() -> int:
     return int(now_local().timestamp())
 
-def in_work_time(dt: datetime) -> bool:
-    t = dt.time()
-    return WORK_START <= t <= WORK_END
-
 def clean_phone(raw: str) -> str:
-    s = (raw or "").strip().replace(" ", "").replace("-", "")
-    return s
+    return (raw or "").strip().replace(" ", "").replace("-", "")
 
 def looks_like_phone(s: str) -> bool:
     digits = re.sub(r"\D", "", clean_phone(s))
@@ -127,24 +155,36 @@ def height_to_size(height: int) -> int:
     sizes = [86, 92, 98, 104, 110, 116, 122, 128, 134, 140, 146, 152, 158, 164]
     return min(sizes, key=lambda x: abs(x - height))
 
-async def get_lang(state: FSMContext) -> str:
-    data = await state.get_data()
-    return data.get("lang", "ru")
-
-async def set_lang_keep(state: FSMContext, lang: str):
-    await state.clear()
-    await state.update_data(lang=lang)
-
 # =========================
 # DATABASE
 # =========================
 def db_conn():
     return sqlite3.connect(DB_PATH)
 
+def _ensure_column(con: sqlite3.Connection, table: str, col: str, col_def: str):
+    cur = con.cursor()
+    cur.execute(f"PRAGMA table_info({table})")
+    cols = [r[1] for r in cur.fetchall()]
+    if col not in cols:
+        cur.execute(f"ALTER TABLE {table} ADD COLUMN {col} {col_def}")
+        con.commit()
+
 def db_init():
     con = db_conn()
     cur = con.cursor()
 
+    # users: store lang per user
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS users (
+            user_id INTEGER PRIMARY KEY,
+            username TEXT,
+            lang TEXT NOT NULL DEFAULT 'ru',
+            updated_at TEXT NOT NULL,
+            updated_ts INTEGER NOT NULL
+        )
+    """)
+
+    # cart
     cur.execute("""
         CREATE TABLE IF NOT EXISTS carts (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -156,6 +196,7 @@ def db_init():
         )
     """)
 
+    # orders
     cur.execute("""
         CREATE TABLE IF NOT EXISTS orders (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -168,12 +209,15 @@ def db_init():
             size TEXT,
             comment TEXT,
             status TEXT NOT NULL DEFAULT 'new',
+            promo_code TEXT DEFAULT '',
+            promo_discount INTEGER NOT NULL DEFAULT 0,
             created_at TEXT NOT NULL,
             created_ts INTEGER NOT NULL,
             reminded_ts INTEGER NOT NULL DEFAULT 0
         )
     """)
 
+    # leads
     cur.execute("""
         CREATE TABLE IF NOT EXISTS leads (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -186,8 +230,50 @@ def db_init():
         )
     """)
 
+    # autopost templates
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS posts (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            media_type TEXT NOT NULL,
+            file_id TEXT,
+            text TEXT,
+            used INTEGER NOT NULL DEFAULT 0,
+            created_at TEXT NOT NULL,
+            created_ts INTEGER NOT NULL
+        )
+    """)
+
+    con.commit()
+
+    _ensure_column(con, "orders", "promo_code", "TEXT DEFAULT ''")
+    _ensure_column(con, "orders", "promo_discount", "INTEGER NOT NULL DEFAULT 0")
+
+    con.close()
+
+def user_upsert(user_id: int, username: str, lang: str):
+    con = db_conn()
+    cur = con.cursor()
+    cur.execute("""
+        INSERT INTO users (user_id, username, lang, updated_at, updated_ts)
+        VALUES (?, ?, ?, ?, ?)
+        ON CONFLICT(user_id) DO UPDATE SET
+            username=excluded.username,
+            lang=excluded.lang,
+            updated_at=excluded.updated_at,
+            updated_ts=excluded.updated_ts
+    """, (user_id, username or "", lang or "ru", now_local().strftime("%Y-%m-%d %H:%M:%S"), now_ts()))
     con.commit()
     con.close()
+
+def user_get_lang(user_id: int) -> str:
+    con = db_conn()
+    cur = con.cursor()
+    cur.execute("SELECT lang FROM users WHERE user_id=?", (user_id,))
+    row = cur.fetchone()
+    con.close()
+    if row and row[0] in ("ru", "uz"):
+        return row[0]
+    return "ru"
 
 def cart_add(user_id: int, item: str, qty: int = 1):
     con = db_conn()
@@ -214,32 +300,66 @@ def cart_clear(user_id: int):
     con.commit()
     con.close()
 
-def orders_insert(user_id: int, username: str, name: str, phone: str, city: str, item: str, size: str, comment: str):
+def orders_insert(user_id: int, username: str, name: str, phone: str, city: str, item: str, size: str, comment: str,
+                  promo_code: str, promo_disc: int):
     con = db_conn()
     cur = con.cursor()
     cur.execute("""
-        INSERT INTO orders (user_id, username, name, phone, city, item, size, comment, status, created_at, created_ts, reminded_ts)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'new', ?, ?, 0)
+        INSERT INTO orders (user_id, username, name, phone, city, item, size, comment, status,
+                            promo_code, promo_discount, created_at, created_ts, reminded_ts)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'new', ?, ?, ?, ?, 0)
     """, (
         user_id, username or "", name or "", phone or "", city or "", item or "", size or "", comment or "",
-        now_local().strftime("%Y-%m-%d %H:%M:%S"),
-        now_ts()
+        promo_code or "", int(promo_disc or 0),
+        now_local().strftime("%Y-%m-%d %H:%M:%S"), now_ts()
     ))
     con.commit()
+    order_id = cur.lastrowid
     con.close()
+    return order_id
 
-def orders_list(user_id: int, limit: int = 10):
+def orders_list_by_user(user_id: int, limit: int = 10):
     con = db_conn()
     cur = con.cursor()
     cur.execute("""
-        SELECT id, item, city, status, created_at
+        SELECT id, item, city, status, promo_code, promo_discount, created_at
         FROM orders
         WHERE user_id=?
         ORDER BY id DESC LIMIT ?
     """, (user_id, limit))
     rows = cur.fetchall()
     con.close()
-    return [{"id": r[0], "item": r[1], "city": r[2], "status": r[3], "created_at": r[4]} for r in rows]
+    return [{
+        "id": r[0], "item": r[1], "city": r[2], "status": r[3],
+        "promo_code": r[4], "promo_discount": r[5], "created_at": r[6]
+    } for r in rows]
+
+def orders_list_all(limit: int = 30):
+    con = db_conn()
+    cur = con.cursor()
+    cur.execute("""
+        SELECT id, user_id, name, phone, city, item, status, promo_code, promo_discount, created_at
+        FROM orders
+        ORDER BY id DESC LIMIT ?
+    """, (limit,))
+    rows = cur.fetchall()
+    con.close()
+    return rows
+
+def order_set_status(order_id: int, status: str):
+    con = db_conn()
+    cur = con.cursor()
+    cur.execute("UPDATE orders SET status=? WHERE id=?", (status, order_id))
+    con.commit()
+    con.close()
+
+def order_get(order_id: int):
+    con = db_conn()
+    cur = con.cursor()
+    cur.execute("SELECT user_id, name, status FROM orders WHERE id=?", (order_id,))
+    row = cur.fetchone()
+    con.close()
+    return row  # (user_id, name, status) or None
 
 def leads_insert(user_id: int, username: str, phone: str):
     con = db_conn()
@@ -252,7 +372,6 @@ def leads_insert(user_id: int, username: str, phone: str):
     con.close()
 
 def daily_counts(date_str: str):
-    # date_str: YYYY-MM-DD (local)
     con = db_conn()
     cur = con.cursor()
     cur.execute("SELECT COUNT(*) FROM orders WHERE substr(created_at,1,10)=?", (date_str,))
@@ -261,6 +380,86 @@ def daily_counts(date_str: str):
     leads_cnt = cur.fetchone()[0]
     con.close()
     return orders_cnt, leads_cnt
+
+def post_add(media_type: str, file_id: str | None, text: str | None):
+    con = db_conn()
+    cur = con.cursor()
+    cur.execute("""
+        INSERT INTO posts (media_type, file_id, text, used, created_at, created_ts)
+        VALUES (?, ?, ?, 0, ?, ?)
+    """, (media_type, file_id or "", text or "", now_local().strftime("%Y-%m-%d %H:%M:%S"), now_ts()))
+    con.commit()
+    con.close()
+
+def post_pick_next():
+    con = db_conn()
+    cur = con.cursor()
+    cur.execute("""
+        SELECT id, media_type, file_id, text
+        FROM posts
+        WHERE used=0
+        ORDER BY id ASC
+        LIMIT 1
+    """)
+    row = cur.fetchone()
+
+    # если закончились — начинаем сначала
+    if not row:
+        cur.execute("UPDATE posts SET used=0")
+        con.commit()
+        cur.execute("""
+            SELECT id, media_type, file_id, text
+            FROM posts
+            WHERE used=0
+            ORDER BY id ASC
+            LIMIT 1
+        """)
+        row = cur.fetchone()
+
+    if not row:
+        con.close()
+        return None
+
+    post_id, media_type, file_id, text = row
+    cur.execute("UPDATE posts SET used=1 WHERE id=?", (post_id,))
+    con.commit()
+    con.close()
+    return {"id": post_id, "media_type": media_type, "file_id": file_id, "text": text}
+
+# =========================
+# FAQ TEXTS
+# =========================
+FAQ_RU = (
+    "❓ <b>FAQ — Частые вопросы</b>\n\n"
+    "🚚 <b>Доставка</b>\n"
+    "• Доставляем по Узбекистану\n"
+    "• Стоимость и сроки зависят от города\n\n"
+    "💳 <b>Оплата</b>\n"
+    "• После подтверждения заказа менеджер отправит реквизиты\n"
+    "• После оплаты отправьте чек/скрин\n\n"
+    "↩️ <b>Возврат/обмен</b>\n"
+    "• Возврат/обмен обсуждается с менеджером\n"
+    "• Важно сохранить товарный вид\n\n"
+    "⏳ <b>Сроки пошива</b>\n"
+    "• Если модель в наличии — отправка быстрее\n"
+    "• Если индивидуальный пошив — менеджер уточнит сроки\n"
+)
+
+FAQ_UZ = (
+    "❓ <b>FAQ — Ko‘p so‘raladigan savollar</b>\n\n"
+    "🚚 <b>Yetkazib berish</b>\n"
+    "• O‘zbekiston bo‘ylab yetkazamiz\n"
+    "• Narx va muddat shaharga bog‘liq\n\n"
+    "💳 <b>To‘lov</b>\n"
+    "• Buyurtma tasdiqlangach menejer rekvizit yuboradi\n"
+    "• To‘lovdan keyin чек/skrinni yuboring\n\n"
+    "↩️ <b>Qaytarish/almashtirish</b>\n"
+    "• Menejer bilan kelishiladi\n"
+    "• Mahsulot ko‘rinishi saqlanishi kerak\n\n"
+    "⏳ <b>Tikish muddati</b>\n"
+    "• Tayyor bo‘lsa — tezroq yuboriladi\n"
+    "• Individual tikuv — muddatni menejer aytadi\n"
+)
 
 # =========================
 # TEXTS
@@ -275,44 +474,14 @@ TEXT = {
             "Выберите действие кнопками 👇"
         ),
         "menu_title": "Выберите действие 👇",
-
         "subscribe_hint": (
             "📣 <b>Чтобы не пропустить новинки</b>\n"
             "Все коллекции и фото мы публикуем в Telegram-канале 👇\n"
             f"👉 <b>@{TELEGRAM_CHANNEL_USERNAME}</b>\n\n"
             "Нажмите кнопку ниже, чтобы перейти и подписаться 😊✨"
         ),
+        "from_post_hint": "✨ Вы пришли из поста в канале. Чем помочь? 👇",
 
-        # PRICE
-        "price_title": "🧾 <b>Прайс (укороченный)</b>\nВыберите раздел:",
-        "price_boys": (
-            "👶 <b>МАЛЬЧИКИ</b>\n"
-            "• Верх: куртка/ветровка/бомбер/парка/анорак/жилетка\n"
-            "• Толстовки: худи/свитшот/лонгслив/кардиган/флис\n"
-            "• Низ: брюки/джинсы/шорты/комбинезон\n"
-            "• Комплекты: спорткостюм/домашний/пижама/летний комплект\n\n"
-            "✅ <b>Если выбрали нужную вам одежду — нажмите ✅ Оформить заказ</b>"
-        ),
-        "price_girls": (
-            "👧 <b>ДЕВОЧКИ</b>\n"
-            "• Верх: куртка/ветровка/пальто/парка/анорак/жилетка\n"
-            "• Платья/юбки: повседневное/нарядное/сарафан/юбка\n"
-            "• Толстовки: худи/свитшот/лонгслив/кардиган/флис\n"
-            "• Низ: брюки/джинсы/леггинсы/шорты/комбинезон\n"
-            "• Комплекты: костюм/домашний/пижама/летний комплект\n\n"
-            "✅ <b>Если выбрали нужную вам одежду — нажмите ✅ Оформить заказ</b>"
-        ),
-        "price_unisex": (
-            "🧒 <b>УНИСЕКС / БАЗА</b>\n"
-            "• Футболка/лонгслив/водолазка/рубашка\n"
-            "• Свитер/жилет/пижама/домашний комплект\n"
-            "• Спорткостюм/комбинезоны\n"
-            "• Школьный костюм\n"
-            "• Индивидуальная модель под ТЗ\n\n"
-            "✅ <b>Если выбрали нужную вам одежду — нажмите ✅ Оформить заказ</b>"
-        ),
-
-        # CATALOG
         "photos_title": "📸 <b>Каталог (разделы)</b>\nВыберите раздел:",
         "photos_no": (
             "Извините, сейчас в этом разделе фото нет.\n"
@@ -321,7 +490,6 @@ TEXT = {
             "Нажмите кнопку ниже, чтобы перейти и подписаться 😊✨"
         ),
 
-        # SIZE
         "size_title": "📏 <b>Подбор размера (1–15 лет)</b>\nВыберите способ:",
         "size_age_ask": "Напишите возраст ребёнка (1–15). Пример: <code>7</code>",
         "size_height_ask": "Напишите рост в см. Пример: <code>125</code>",
@@ -331,16 +499,17 @@ TEXT = {
             "📏 <b>Рекомендация по возрасту</b>\n"
             "Возраст: {age}\n"
             "Примерный размер: <b>{age_rec}</b>\n\n"
-            "ℹ️ Точный размер подтверждает менеджер (по модели и посадке). 😊"
+            "ℹ️ Точный размер подтверждает менеджер 😊"
         ),
         "size_result_by_height": (
             "📏 <b>Рекомендация по росту</b>\n"
             "Рост: {height} см\n"
             "Рекомендуем размер: <b>{height_rec}</b>\n\n"
-            "ℹ️ Точный размер подтверждает менеджер (по модели и посадке). 😊"
+            "ℹ️ Точный размер подтверждает менеджер 😊"
         ),
 
-        # CONTACT
+        "faq_text": FAQ_RU,
+
         "contact_title": (
             "📞 <b>Связаться</b>\n"
             "Мы принимаем заявки <b>24/7</b>.\n"
@@ -356,39 +525,37 @@ TEXT = {
             "Пожалуйста, не забудьте подписаться 😊✨"
         ),
 
-        # ORDER
         "order_start": "🧾 <b>Оформляем заказ</b>\nКак вас зовут? 😊",
         "order_phone": "📲 Отправьте номер телефона (или нажмите кнопку «📲 Отправить контакт»).",
         "order_city": "🏙 Ваш город/район?",
         "order_item": "👕 Что хотите заказать? (например: куртка / худи / костюм / школьная форма)",
         "order_size": "👶 Возраст и рост одним сообщением.\nПример: <code>7 лет, 125 см</code>",
         "order_size_bad": "Напишите <b>и возраст, и рост</b> одним сообщением.\nПример: <code>7 лет, 125 см</code>",
+        "order_promo": "🏷 Есть промокод? Напишите (например: <code>PROMO10</code>) или напишите <b>нет</b>.",
+        "order_promo_ok": "✅ Промокод принят: <b>{code}</b> (скидка {disc}%)",
+        "order_promo_bad": "⚠️ Такой промокод не найден. Напишите другой или <b>нет</b>.",
         "order_comment": "✍️ Комментарий (цвет/кол-во) или напишите «нет»",
-        "order_review": (
-            "🧾 <b>Проверьте заказ:</b>\n"
-            "• Имя: {name}\n"
-            "• Телефон: {phone}\n"
-            "• Город: {city}\n"
-            "• Товар: {item}\n"
-            "• Возраст/рост: {size}\n"
-            "• Комментарий: {comment}\n\n"
-            "Подтвердить?"
-        ),
         "order_sent": (
             "✅ Спасибо! Заказ принят 😊\n"
             "Менеджер свяжется с вами, чтобы уточнить детали заказа и доставки."
         ),
         "payment_info": (
             "💳 <b>Оплата</b>\n"
-            "После подтверждения заказа менеджер отправит реквизиты/карту для оплаты.\n\n"
-            "✅ После оплаты отправьте, пожалуйста, чек/скрин менеджеру — и мы сразу оформим доставку 😊"
+            "После подтверждения заказа менеджер отправит реквизиты/карту.\n\n"
+            "✅ После оплаты отправьте чек/скрин менеджеру — и мы оформим доставку 😊"
         ),
-        "worktime_in": "⏱ Сейчас рабочее время — ответ будет быстрее 😊",
-        "worktime_out": "⏱ Сейчас вне рабочего времени — менеджер ответит в рабочие часы 😊",
-        "edit_choose": "✏️ Что хотите исправить?",
+        "after_order": (
+            "📣 Пока менеджер готовит ответ — зайдите в наш Telegram-канал и посмотрите коллекции 👇\n"
+            "Там все фото и новинки 😊✨"
+        ),
+
+        "client_processing": "✅ Ваш заказ #{order_id} принят в работу. Менеджер уже занимается вашим заказом 😊",
+        "client_done": "🎉 Ваш заказ #{order_id} готов / обработан! Если нужно — менеджер уточнит доставку 😊",
+        "client_new": "ℹ️ Статус заказа #{order_id} обновлён: <b>new</b>.",
+
         "cancelled": "❌ Отменено. Возвращаю в меню 👇",
         "unknown": "Пожалуйста, используйте кнопки меню 👇",
-        "flow_locked": "Сейчас идёт оформление заказа. Продолжить или выйти в меню?",
+
         "social_end": (
             "📌 <b>Наши ссылки:</b>\n"
             f"📣 Telegram: {TELEGRAM_CHANNEL_URL}\n"
@@ -397,7 +564,6 @@ TEXT = {
             "Спасибо, что вы с нами 😊✨"
         ),
 
-        # CART / HISTORY
         "cart_title": "🧺 <b>Ваша корзина</b>",
         "cart_empty": "🧺 Корзина пустая. Нажмите «➕ Добавить в корзину» и напишите название товара 😊",
         "cart_add_ask": "🧺 Напишите название товара для корзины (например: «школьная форма»).",
@@ -416,41 +582,13 @@ TEXT = {
             "Bo‘limni tanlang 👇"
         ),
         "menu_title": "Bo‘limni tanlang 👇",
-
         "subscribe_hint": (
             "📣 <b>Yangiliklarni o‘tkazib yubormaslik uchun</b>\n"
             "Barcha kolleksiyalar va rasmlar Telegram kanalimizda 👇\n"
             f"👉 <b>@{TELEGRAM_CHANNEL_USERNAME}</b>\n\n"
             "Pastdagi tugmani bosing va obuna bo‘ling 😊✨"
         ),
-
-        "price_title": "🧾 <b>Narxlar (qisqa)</b>\nBo‘limni tanlang:",
-        "price_boys": (
-            "👶 <b>O‘G‘IL BOLALAR</b>\n"
-            "• Ustki: kurtka/vetrovka/bomber/parka/anorak/jilet\n"
-            "• Ustki: xudi/svitshot/longsliv/kardigan/flis\n"
-            "• Past: shim/jins/shorti/kombinezon\n"
-            "• To‘plam: sport/uy/pijama/yozgi\n\n"
-            "✅ <b>Agar kerakli kiyimni tanlagan bo‘lsangiz — ✅ Buyurtma tugmasini bosing</b>"
-        ),
-        "price_girls": (
-            "👧 <b>QIZ BOLALAR</b>\n"
-            "• Ustki: kurtka/vetrovka/palto/parka/anorak/jilet\n"
-            "• Ko‘ylak/yubka: oddiy/bayram/sarafan/yubka\n"
-            "• Ustki: xudi/svitshot/longsliv/kardigan/flis\n"
-            "• Past: shim/jins/leggins/shorti/kombinezon\n"
-            "• To‘plam: kostyum/uy/pijama/yozgi\n\n"
-            "✅ <b>Agar kerakli kiyimni tanlagan bo‘lsangiz — ✅ Buyurtma tugmasini bosing</b>"
-        ),
-        "price_unisex": (
-            "🧒 <b>UNISEKS / BAZA</b>\n"
-            "• Futbolka/longsliv/vodolazka/ko‘ylak\n"
-            "• Sviter/jilet/pijama/uy to‘plami\n"
-            "• Sport kostyum/kombinezon\n"
-            "• Maktab kostyumi\n"
-            "• Individual model (TZ)\n\n"
-            "✅ <b>Agar kerakli kiyimni tanlagan bo‘lsangiz — ✅ Buyurtma tugmasini bosing</b>"
-        ),
+        "from_post_hint": "✨ Siz kanal postidan kirdingiz. Qanday yordam beray? 👇",
 
         "photos_title": "📸 <b>Katalog (bo‘limlar)</b>\nBo‘limni tanlang:",
         "photos_no": (
@@ -478,6 +616,8 @@ TEXT = {
             "ℹ️ Aniq o‘lcham menejer tomonidan tasdiqlanadi 😊"
         ),
 
+        "faq_text": FAQ_UZ,
+
         "contact_title": (
             "📞 <b>Aloqa</b>\n"
             "Buyurtmalar <b>24/7</b> qabul qilinadi.\n"
@@ -499,32 +639,31 @@ TEXT = {
         "order_item": "👕 Nima buyurtma qilasiz? (masalan: kurtka / xudi / kostyum / maktab formasi)",
         "order_size": "👶 Yosh va bo‘yni bitta xabarda.\nMasalan: <code>7 yosh, 125 sm</code>",
         "order_size_bad": "Iltimos, <b>yosh va bo‘y</b> ni bitta xabarda yozing.\nMasalan: <code>7 yosh, 125 sm</code>",
+        "order_promo": "🏷 Promokod bormi? (masalan: <code>PROMO10</code>) yoki <b>yo‘q</b> deb yozing.",
+        "order_promo_ok": "✅ Promokod qabul qilindi: <b>{code}</b> (chegirma {disc}%)",
+        "order_promo_bad": "⚠️ Bunday promokod yo‘q. Boshqasini yozing yoki <b>yo‘q</b> deb yozing.",
         "order_comment": "✍️ Izoh (rang/soni) yoki «yo‘q» deb yozing",
-        "order_review": (
-            "🧾 <b>Buyurtmani tekshiring:</b>\n"
-            "• Ism: {name}\n"
-            "• Telefon: {phone}\n"
-            "• Shahar: {city}\n"
-            "• Mahsulot: {item}\n"
-            "• Yosh/bo‘y: {size}\n"
-            "• Izoh: {comment}\n\n"
-            "Tasdiqlaysizmi?"
-        ),
         "order_sent": (
             "✅ Rahmat! Buyurtma qabul qilindi 😊\n"
             "Menejer bog‘lanib, buyurtma va yetkazib berish tafsilotlarini aniqlashtiradi."
         ),
         "payment_info": (
             "💳 <b>To‘lov</b>\n"
-            "Buyurtma tasdiqlangandan so‘ng menejer to‘lov uchun karta/revizitlarni yuboradi.\n\n"
-            "✅ To‘lovdan keyin чек/skrinni menejerga yuboring — yetkazib berishni tez boshlaymiz 😊"
+            "Buyurtma tasdiqlangandan so‘ng menejer karta/revizitlarni yuboradi.\n\n"
+            "✅ To‘lovdan keyin чек/skrinni menejerga yuboring 😊"
         ),
-        "worktime_in": "⏱ Hozir ish vaqti — javob tezroq bo‘ladi 😊",
-        "worktime_out": "⏱ Hozir ish vaqti emas — menejer ish vaqtida javob beradi 😊",
-        "edit_choose": "✏️ Nimani tuzatamiz?",
+        "after_order": (
+            "📣 Menejer javob tayyorlayotgan paytda — Telegram kanalimizga o‘ting va kolleksiyalarni ko‘ring 👇\n"
+            "U yerda barcha rasmlar va yangiliklar bor 😊✨"
+        ),
+
+        "client_processing": "✅ Buyurtmangiz #{order_id} ishga olindi. Menejer buyurtmangizni ko‘rib chiqmoqda 😊",
+        "client_done": "🎉 Buyurtmangiz #{order_id} tayyor / bajarildi! Yetkazib berish bo‘yicha menejer aniqlashtiradi 😊",
+        "client_new": "ℹ️ Buyurtma #{order_id} holati yangilandi: <b>new</b>.",
+
         "cancelled": "❌ Bekor qilindi. Menyuga qaytdik 👇",
         "unknown": "Iltimos, menyu tugmalaridan foydalaning 👇",
-        "flow_locked": "Hozir buyurtma rasmiylashtirilmoqda. Davom etamizmi yoki menyuga chiqamizmi?",
+
         "social_end": (
             "📌 <b>Havolalarimiz:</b>\n"
             f"📣 Telegram: {TELEGRAM_CHANNEL_URL}\n"
@@ -559,10 +698,25 @@ class Flow(StatesGroup):
     order_city = State()
     order_item = State()
     order_size = State()
+    order_promo = State()
     order_comment = State()
-    order_confirm = State()
 
-    edit_field = State()
+# =========================
+# LANGUAGE helpers (FSM + DB)
+# =========================
+async def get_lang(state: FSMContext, user_id: int) -> str:
+    data = await state.get_data()
+    if data.get("lang") in ("ru", "uz"):
+        return data["lang"]
+    # fallback to DB
+    lang = user_get_lang(user_id)
+    await state.update_data(lang=lang)
+    return lang
+
+async def set_lang_keep(state: FSMContext, user_id: int, username: str, lang: str):
+    await state.clear()
+    await state.update_data(lang=lang)
+    user_upsert(user_id, username or "", lang)
 
 # =========================
 # KEYBOARDS
@@ -577,7 +731,7 @@ def kb_menu(lang: str) -> ReplyKeyboardMarkup:
     if lang == "uz":
         rows = [
             [KeyboardButton(text="📣 Telegram kanal"), KeyboardButton(text="📸 Katalog")],
-            [KeyboardButton(text="🧾 Narxlar"), KeyboardButton(text="📏 O‘lcham")],
+            [KeyboardButton(text="📏 O‘lcham"), KeyboardButton(text="❓ FAQ")],
             [KeyboardButton(text="🧺 Savat"), KeyboardButton(text="📜 Buyurtmalar")],
             [KeyboardButton(text="✅ Buyurtma"), KeyboardButton(text="📞 Aloqa")],
             [KeyboardButton(text="🌐 Til"), KeyboardButton(text="❌ Bekor qilish")],
@@ -585,7 +739,7 @@ def kb_menu(lang: str) -> ReplyKeyboardMarkup:
     else:
         rows = [
             [KeyboardButton(text="📣 Telegram канал"), KeyboardButton(text="📸 Каталог")],
-            [KeyboardButton(text="🧾 Прайс"), KeyboardButton(text="📏 Размер")],
+            [KeyboardButton(text="📏 Размер"), KeyboardButton(text="❓ FAQ")],
             [KeyboardButton(text="🧺 Корзина"), KeyboardButton(text="📜 История")],
             [KeyboardButton(text="✅ Заказ"), KeyboardButton(text="📞 Связаться")],
             [KeyboardButton(text="🌐 Язык"), KeyboardButton(text="❌ Отмена")],
@@ -600,6 +754,14 @@ def kb_channel_only(lang: str) -> InlineKeyboardMarkup:
         [InlineKeyboardButton(text=menu_text, callback_data="back:menu")],
     ])
 
+def kb_after_order(lang: str) -> InlineKeyboardMarkup:
+    channel_text = "📣 Перейти в канал" if lang == "ru" else "📣 Kanalga o‘tish"
+    menu_text = "⬅️ Меню" if lang == "ru" else "⬅️ Menyu"
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text=channel_text, url=TELEGRAM_CHANNEL_URL)],
+        [InlineKeyboardButton(text=menu_text, callback_data="back:menu")]
+    ])
+
 def kb_social_end(lang: str) -> InlineKeyboardMarkup:
     menu_text = "⬅️ Меню" if lang == "ru" else "⬅️ Menyu"
     return InlineKeyboardMarkup(inline_keyboard=[
@@ -607,23 +769,6 @@ def kb_social_end(lang: str) -> InlineKeyboardMarkup:
         [InlineKeyboardButton(text="📸 Instagram", url=INSTAGRAM_URL)],
         [InlineKeyboardButton(text="▶️ YouTube", url=YOUTUBE_URL)],
         [InlineKeyboardButton(text=menu_text, callback_data="back:menu")],
-    ])
-
-def kb_price(lang: str) -> InlineKeyboardMarkup:
-    if lang == "uz":
-        return InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="👶 O‘g‘il bolalar", callback_data="price:boys")],
-            [InlineKeyboardButton(text="👧 Qiz bolalar", callback_data="price:girls")],
-            [InlineKeyboardButton(text="🧒 Uniseks/Baza", callback_data="price:unisex")],
-            [InlineKeyboardButton(text="✅ Buyurtma", callback_data="go:order")],
-            [InlineKeyboardButton(text="⬅️ Menyu", callback_data="back:menu")],
-        ])
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="👶 Мальчики", callback_data="price:boys")],
-        [InlineKeyboardButton(text="👧 Девочки", callback_data="price:girls")],
-        [InlineKeyboardButton(text="🧒 Унисекс/База", callback_data="price:unisex")],
-        [InlineKeyboardButton(text="✅ Оформить заказ", callback_data="go:order")],
-        [InlineKeyboardButton(text="⬅️ Меню", callback_data="back:menu")],
     ])
 
 def kb_photos(lang: str) -> InlineKeyboardMarkup:
@@ -646,42 +791,6 @@ def kb_size_mode(lang: str) -> InlineKeyboardMarkup:
         [InlineKeyboardButton(text="📏 По росту", callback_data="size:height")],
         [InlineKeyboardButton(text="⬅️ Меню", callback_data="back:menu")],
     ])
-
-def kb_order_confirm(lang: str) -> InlineKeyboardMarkup:
-    if lang == "uz":
-        return InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="✅ Tasdiqlash", callback_data="order:confirm")],
-            [InlineKeyboardButton(text="✏️ Tuzatish", callback_data="order:edit")],
-            [InlineKeyboardButton(text="❌ Bekor qilish", callback_data="order:cancel")],
-        ])
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="✅ Подтвердить", callback_data="order:confirm")],
-        [InlineKeyboardButton(text="✏️ Исправить", callback_data="order:edit")],
-        [InlineKeyboardButton(text="❌ Отмена", callback_data="order:cancel")],
-    ])
-
-def kb_edit_fields(lang: str) -> InlineKeyboardMarkup:
-    if lang == "uz":
-        rows = [
-            [InlineKeyboardButton(text="Ism", callback_data="edit:name")],
-            [InlineKeyboardButton(text="Telefon", callback_data="edit:phone")],
-            [InlineKeyboardButton(text="Shahar", callback_data="edit:city")],
-            [InlineKeyboardButton(text="Mahsulot", callback_data="edit:item")],
-            [InlineKeyboardButton(text="Yosh/bo‘y", callback_data="edit:size")],
-            [InlineKeyboardButton(text="Izoh", callback_data="edit:comment")],
-            [InlineKeyboardButton(text="⬅️ Orqaga", callback_data="order:back_confirm")],
-        ]
-    else:
-        rows = [
-            [InlineKeyboardButton(text="Имя", callback_data="edit:name")],
-            [InlineKeyboardButton(text="Телефон", callback_data="edit:phone")],
-            [InlineKeyboardButton(text="Город", callback_data="edit:city")],
-            [InlineKeyboardButton(text="Товар", callback_data="edit:item")],
-            [InlineKeyboardButton(text="Возраст/рост", callback_data="edit:size")],
-            [InlineKeyboardButton(text="Комментарий", callback_data="edit:comment")],
-            [InlineKeyboardButton(text="⬅️ Назад", callback_data="order:back_confirm")],
-        ]
-    return InlineKeyboardMarkup(inline_keyboard=rows)
 
 def kb_contact_request(lang: str) -> ReplyKeyboardMarkup:
     if lang == "uz":
@@ -718,54 +827,115 @@ def kb_cart_actions(lang: str) -> InlineKeyboardMarkup:
         [InlineKeyboardButton(text="⬅️ Меню", callback_data="back:menu")],
     ])
 
-# =========================
-# ORDER REVIEW
-# =========================
-async def show_order_review(target, state: FSMContext, lang: str):
-    data = await state.get_data()
-    review = TEXT[lang]["order_review"].format(
-        name=esc(data.get("order_name", "-")),
-        phone=esc(data.get("order_phone", "-")),
-        city=esc(data.get("order_city", "-")),
-        item=esc(data.get("order_item", "-")),
-        size=esc(data.get("order_size", "-")),
-        comment=esc(data.get("order_comment", "-")),
-    )
-    if isinstance(target, Message):
-        await safe_answer(target, review, reply_markup=kb_order_confirm(lang))
+def kb_write_manager(lang: str) -> InlineKeyboardMarkup:
+    menu_text = "⬅️ Меню" if lang == "ru" else "⬅️ Menyu"
+    if not MANAGER_USERNAME:
+        return InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text=menu_text, callback_data="back:menu")]
+        ])
+    btn_text = "✍️ Написать менеджеру" if lang == "ru" else "✍️ Menejerga yozish"
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text=btn_text, url=f"https://t.me/{MANAGER_USERNAME}")],
+        [InlineKeyboardButton(text=menu_text, callback_data="back:menu")],
+    ])
+
+def kb_post_cta(lang: str) -> InlineKeyboardMarkup:
+    # buttons under channel posts
+    if lang == "uz":
+        return InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="🛒 Buyurtma", url=start_link("order")),
+             InlineKeyboardButton(text="📏 O‘lcham", url=start_link("size"))],
+            [InlineKeyboardButton(text="📸 Katalog", url=start_link("catalog")),
+             InlineKeyboardButton(text="📞 Aloqa", url=start_link("contact"))],
+        ])
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🛒 Заказать", url=start_link("order")),
+         InlineKeyboardButton(text="📏 Выбрать размер", url=start_link("size"))],
+        [InlineKeyboardButton(text="📸 Каталог", url=start_link("catalog")),
+         InlineKeyboardButton(text="📞 Связаться", url=start_link("contact"))],
+    ])
+
+def kb_admin_status(order_id: int, current_status: str = "new") -> InlineKeyboardMarkup:
+    # callback: adm:status:<id>:<status>
+    btns = []
+    if current_status != "processing":
+        btns.append(InlineKeyboardButton(text="✅ processing", callback_data=f"adm:status:{order_id}:processing"))
+    if current_status != "done":
+        btns.append(InlineKeyboardButton(text="✅ done", callback_data=f"adm:status:{order_id}:done"))
+    if current_status != "new":
+        btns.append(InlineKeyboardButton(text="↩️ new", callback_data=f"adm:status:{order_id}:new"))
+
+    rows = []
+    if len(btns) <= 2:
+        rows.append(btns)
     else:
-        await safe_answer_call(target, review, reply_markup=kb_order_confirm(lang))
-
-async def send_subscribe_hint(message: Message, lang: str):
-    await safe_answer(message, TEXT[lang]["subscribe_hint"], reply_markup=kb_channel_only(lang))
+        rows.append(btns[:2])
+        rows.append(btns[2:])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
 
 # =========================
-# COMMANDS / START / LANG
+# START / LANG + deep-link routing
 # =========================
+def parse_start_payload(message: Message) -> str:
+    txt = (message.text or "").strip()
+    parts = txt.split(maxsplit=1)
+    if len(parts) == 2:
+        return parts[1].strip()
+    return ""
+
 async def cmd_start(message: Message, state: FSMContext):
+    user_id = message.from_user.id
+    username = message.from_user.username or ""
+
     data = await state.get_data()
     if "lang" not in data:
-        await safe_answer(message, TEXT["ru"]["hello_ask_lang"], reply_markup=kb_lang())
-        return
-    lang = await get_lang(state)
-    await set_lang_keep(state, lang)
+        # If user already has lang in DB - we can skip language ask
+        saved = user_get_lang(user_id)
+        if saved in ("ru", "uz"):
+            await state.update_data(lang=saved)
+        else:
+            await safe_answer(message, TEXT["ru"]["hello_ask_lang"], reply_markup=kb_lang())
+            return
+
+    lang = await get_lang(state, user_id)
+    await set_lang_keep(state, user_id, username, lang)
+
+    payload = parse_start_payload(message)
+
+    if payload in ("order", "size", "catalog", "contact"):
+        await safe_answer(message, TEXT[lang]["from_post_hint"], reply_markup=kb_menu(lang))
+        if payload == "order":
+            await start_order(message, state)
+            return
+        if payload == "size":
+            await safe_answer(message, TEXT[lang]["size_title"], reply_markup=kb_size_mode(lang))
+            return
+        if payload == "catalog":
+            await safe_answer(message, TEXT[lang]["photos_title"], reply_markup=kb_photos(lang))
+            return
+        if payload == "contact":
+            await show_contact(message, state)
+            return
+
     await safe_answer(message, TEXT[lang]["hello"], reply_markup=kb_menu(lang))
-    await send_subscribe_hint(message, lang)
+    await safe_answer(message, TEXT[lang]["subscribe_hint"], reply_markup=kb_channel_only(lang))
 
 async def cmd_menu(message: Message, state: FSMContext):
-    lang = await get_lang(state)
+    lang = await get_lang(state, message.from_user.id)
     await safe_answer(message, TEXT[lang]["menu_title"], reply_markup=kb_menu(lang))
 
 async def pick_lang(call: CallbackQuery, state: FSMContext):
     lang = call.data.split(":")[1]
-    await set_lang_keep(state, lang)
+    user_id = call.from_user.id
+    username = call.from_user.username or ""
+    await set_lang_keep(state, user_id, username, lang)
     await safe_answer_call(call, TEXT[lang]["hello"], reply_markup=kb_menu(lang))
     await call.message.answer(TEXT[lang]["subscribe_hint"], reply_markup=kb_channel_only(lang))
     await call.answer()
 
 async def back_menu(call: CallbackQuery, state: FSMContext):
-    lang = await get_lang(state)
-    await set_lang_keep(state, lang)
+    lang = await get_lang(state, call.from_user.id)
+    await set_lang_keep(state, call.from_user.id, call.from_user.username or "", lang)
     await safe_answer_call(call, TEXT[lang]["menu_title"], reply_markup=kb_menu(lang))
     await call.answer()
 
@@ -775,52 +945,31 @@ async def back_menu(call: CallbackQuery, state: FSMContext):
 def is_cancel(lang: str, txt: str) -> bool:
     return (lang == "ru" and txt == "❌ Отмена") or (lang == "uz" and txt == "❌ Bekor qilish")
 
-def is_telegram_btn(lang: str, txt: str) -> bool:
-    return (lang == "ru" and txt == "📣 Telegram канал") or (lang == "uz" and txt == "📣 Telegram kanal")
+async def show_contact(message: Message, state: FSMContext):
+    lang = await get_lang(state, message.from_user.id)
+    msg = TEXT[lang]["contact_title"]
+    if MANAGER_USERNAME:
+        msg += (f"\n👩‍💼 Menejer: @{MANAGER_USERNAME}" if lang == "uz" else f"\n👩‍💼 Менеджер: @{MANAGER_USERNAME}")
+    await safe_answer(message, msg, reply_markup=kb_write_manager(lang))
+    await safe_answer(message, TEXT[lang]["contact_offer_leave"], reply_markup=kb_contact_actions(lang))
 
 async def menu_by_text(message: Message, state: FSMContext):
-    lang = await get_lang(state)
+    user_id = message.from_user.id
+    lang = await get_lang(state, user_id)
     txt = (message.text or "").strip()
 
-    # ✅ Telegram кнопка разрешена даже во время оформления заказа
-    if txt in ("📣 Telegram канал", "📣 Telegram kanal"):
-        msg = (
-            "📣 <b>Наш Telegram-канал</b>\n"
-            f"👉 <b>@{TELEGRAM_CHANNEL_USERNAME}</b>\n\n"
-            "Там все коллекции, фото и новинки. Подпишитесь 😊✨"
-        ) if lang == "ru" else (
-            "📣 <b>Telegram kanalimiz</b>\n"
-            f"👉 <b>@{TELEGRAM_CHANNEL_USERNAME}</b>\n\n"
-            "Kolleksiyalar, rasmlar va yangiliklar shu yerda. Obuna bo‘ling 😊✨"
-        )
-        await safe_answer(message, msg, reply_markup=kb_channel_only(lang))
-        return
-
     if is_cancel(lang, txt):
-        await set_lang_keep(state, lang)
+        await set_lang_keep(state, user_id, message.from_user.username or "", lang)
         await safe_answer(message, TEXT[lang]["cancelled"], reply_markup=kb_menu(lang))
         await safe_answer(message, TEXT[lang]["social_end"], reply_markup=kb_social_end(lang))
-        return
-
-    # ✅ блокировка только для кнопок меню (но не для Telegram)
-    st = await state.get_state()
-    if st and st.startswith("Flow:order_") and txt in (
-        "🧾 Прайс","📸 Каталог","📏 Размер","📞 Связаться","🌐 Язык","🧺 Корзина","📜 История",
-        "🧾 Narxlar","📸 Katalog","📏 O‘lcham","📞 Aloqa","🌐 Til","🧺 Savat","📜 Buyurtmalar"
-    ):
-        await safe_answer(message, TEXT[lang]["flow_locked"], reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="➡️ Продолжить" if lang == "ru" else "➡️ Davom etish", callback_data="order:back_confirm")],
-            [InlineKeyboardButton(text="❌ Отмена" if lang == "ru" else "❌ Bekor qilish", callback_data="order:cancel")],
-            [InlineKeyboardButton(text="⬅️ Меню" if lang == "ru" else "⬅️ Menyu", callback_data="back:menu")],
-        ]))
         return
 
     if txt in ("🌐 Язык","🌐 Til"):
         await safe_answer(message, TEXT[lang]["hello_ask_lang"], reply_markup=kb_lang())
         return
 
-    if txt in ("🧾 Прайс","🧾 Narxlar"):
-        await safe_answer(message, TEXT[lang]["price_title"], reply_markup=kb_price(lang))
+    if txt in ("❓ FAQ",):
+        await safe_answer(message, TEXT[lang]["faq_text"], reply_markup=kb_menu(lang))
         return
 
     if txt in ("📸 Каталог","📸 Katalog"):
@@ -836,62 +985,56 @@ async def menu_by_text(message: Message, state: FSMContext):
         return
 
     if txt in ("📞 Связаться","📞 Aloqa"):
-        msg = TEXT[lang]["contact_title"]
-        if MANAGER_USERNAME:
-            msg += (f"\n👩‍💼 Menejer: @{MANAGER_USERNAME}" if lang == "uz" else f"\n👩‍💼 Менеджер: @{MANAGER_USERNAME}")
-        await safe_answer(message, msg, reply_markup=kb_menu(lang))
-        await safe_answer(message, TEXT[lang]["contact_offer_leave"], reply_markup=kb_contact_actions(lang))
+        await show_contact(message, state)
         return
 
     if txt in ("🧺 Корзина","🧺 Savat"):
-        items = cart_list(message.from_user.id)
+        items = cart_list(user_id)
         if not items:
             await safe_answer(message, TEXT[lang]["cart_empty"], reply_markup=kb_menu(lang))
             await safe_answer(message, "👇", reply_markup=kb_cart_actions(lang))
             return
-        lines = []
-        for i, it in enumerate(items, 1):
-            lines.append(f"{i}) {esc(it['item'])} × {it['qty']}")
-        text = TEXT[lang]["cart_title"] + "\n\n" + "\n".join(lines)
-        await safe_answer(message, text, reply_markup=kb_cart_actions(lang))
+        lines = [f"{i}) {esc(it['item'])} × {it['qty']}" for i, it in enumerate(items, 1)]
+        await safe_answer(message, TEXT[lang]["cart_title"] + "\n\n" + "\n".join(lines), reply_markup=kb_cart_actions(lang))
         return
 
     if txt in ("📜 История","📜 Buyurtmalar"):
-        hist = orders_list(message.from_user.id, limit=10)
+        hist = orders_list_by_user(user_id, limit=10)  # ✅ ONLY USER ORDERS
         if not hist:
             await safe_answer(message, TEXT[lang]["history_empty"], reply_markup=kb_menu(lang))
             return
         lines = []
         for o in hist:
-            lines.append(f"#{o['id']} • {esc(o['item'])} • {esc(o['city'])} • {esc(o['status'])} • {esc(o['created_at'])}")
+            promo_line = ""
+            if o["promo_code"] and o["promo_discount"]:
+                promo_line = f" • promo {esc(o['promo_code'])} (-{o['promo_discount']}%)"
+            lines.append(f"#{o['id']} • {esc(o['item'])} • {esc(o['city'])} • {esc(o['status'])}{promo_line} • {esc(o['created_at'])}")
         await safe_answer(message, TEXT[lang]["history_title"] + "\n\n" + "\n".join(lines), reply_markup=kb_menu(lang))
+        return
+
+    if txt in ("📣 Telegram канал","📣 Telegram kanal"):
+        msg = (
+            "📣 <b>Наш Telegram-канал</b>\n"
+            f"👉 <b>@{TELEGRAM_CHANNEL_USERNAME}</b>\n\n"
+            "Там все коллекции, фото и новинки. Подпишитесь 😊✨"
+        ) if lang == "ru" else (
+            "📣 <b>Telegram kanalimiz</b>\n"
+            f"👉 <b>@{TELEGRAM_CHANNEL_USERNAME}</b>\n\n"
+            "Kolleksiyalar, rasmlar va yangiliklar shu yerda. Obuna bo‘ling 😊✨"
+        )
+        await safe_answer(message, msg, reply_markup=kb_channel_only(lang))
         return
 
     await safe_answer(message, TEXT[lang]["unknown"], reply_markup=kb_menu(lang))
 
 # =========================
-# PRICE
-# =========================
-async def price_section(call: CallbackQuery, state: FSMContext):
-    lang = await get_lang(state)
-    sec = call.data.split(":")[1]
-    if sec == "boys":
-        await safe_edit_call(call, TEXT[lang]["price_boys"], reply_markup=kb_price(lang))
-    elif sec == "girls":
-        await safe_edit_call(call, TEXT[lang]["price_girls"], reply_markup=kb_price(lang))
-    else:
-        await safe_edit_call(call, TEXT[lang]["price_unisex"], reply_markup=kb_price(lang))
-    await call.answer()
-
-# =========================
-# CATALOG (IMPORTANT: always "no photos" + channel button)
+# CATALOG
 # =========================
 async def photo_section(call: CallbackQuery, state: FSMContext):
-    lang = await get_lang(state)
+    lang = await get_lang(state, call.from_user.id)
     key = call.data.split(":")[1]
     block = PHOTO_CATALOG.get(key)
     title = (block["uz"] if lang == "uz" else block["ru"]) if block else ("Каталог" if lang == "ru" else "Katalog")
-
     msg = f"📸 <b>{esc(title)}</b>\n\n" + TEXT[lang]["photos_no"]
     await safe_edit_call(call, msg, reply_markup=kb_channel_only(lang))
     await call.answer()
@@ -900,7 +1043,7 @@ async def photo_section(call: CallbackQuery, state: FSMContext):
 # SIZE
 # =========================
 async def size_mode(call: CallbackQuery, state: FSMContext):
-    lang = await get_lang(state)
+    lang = await get_lang(state, call.from_user.id)
     mode = call.data.split(":")[1]
     if mode == "age":
         await state.set_state(Flow.size_age)
@@ -911,7 +1054,7 @@ async def size_mode(call: CallbackQuery, state: FSMContext):
     await call.answer()
 
 async def size_age(message: Message, state: FSMContext):
-    lang = await get_lang(state)
+    lang = await get_lang(state, message.from_user.id)
     txt = (message.text or "").strip()
     if not txt.isdigit():
         await safe_answer(message, TEXT[lang]["size_bad_age"], reply_markup=kb_menu(lang))
@@ -921,11 +1064,11 @@ async def size_age(message: Message, state: FSMContext):
         await safe_answer(message, TEXT[lang]["size_bad_age"], reply_markup=kb_menu(lang))
         return
     age_rec = age_to_size_range(age)
-    await set_lang_keep(state, lang)
+    await set_lang_keep(state, message.from_user.id, message.from_user.username or "", lang)
     await safe_answer(message, TEXT[lang]["size_result_by_age"].format(age=age, age_rec=age_rec), reply_markup=kb_menu(lang))
 
 async def size_height(message: Message, state: FSMContext):
-    lang = await get_lang(state)
+    lang = await get_lang(state, message.from_user.id)
     txt = (message.text or "").strip()
     if not txt.isdigit():
         await safe_answer(message, TEXT[lang]["size_bad_height"], reply_markup=kb_menu(lang))
@@ -935,20 +1078,20 @@ async def size_height(message: Message, state: FSMContext):
         await safe_answer(message, TEXT[lang]["size_bad_height"], reply_markup=kb_menu(lang))
         return
     height_rec = height_to_size(height)
-    await set_lang_keep(state, lang)
+    await set_lang_keep(state, message.from_user.id, message.from_user.username or "", lang)
     await safe_answer(message, TEXT[lang]["size_result_by_height"].format(height=height, height_rec=height_rec), reply_markup=kb_menu(lang))
 
 # =========================
-# CONTACT FLOW (lead -> DB + manager)
+# CONTACT FLOW
 # =========================
 async def contact_leave(call: CallbackQuery, state: FSMContext):
-    lang = await get_lang(state)
+    lang = await get_lang(state, call.from_user.id)
     await state.set_state(Flow.contact_phone)
     await safe_answer_call(call, TEXT[lang]["contact_phone_ask"], reply_markup=kb_contact_request(lang))
     await call.answer()
 
 async def contact_phone(message: Message, state: FSMContext):
-    lang = await get_lang(state)
+    lang = await get_lang(state, message.from_user.id)
 
     if message.contact and message.contact.phone_number:
         phone = message.contact.phone_number
@@ -956,7 +1099,7 @@ async def contact_phone(message: Message, state: FSMContext):
         phone = (message.text or "").strip()
 
     if is_cancel(lang, phone):
-        await set_lang_keep(state, lang)
+        await set_lang_keep(state, message.from_user.id, message.from_user.username or "", lang)
         await safe_answer(message, TEXT[lang]["cancelled"], reply_markup=kb_menu(lang))
         await safe_answer(message, TEXT[lang]["social_end"], reply_markup=kb_social_end(lang))
         return
@@ -966,7 +1109,6 @@ async def contact_phone(message: Message, state: FSMContext):
         await safe_answer(message, TEXT[lang]["contact_phone_ask"], reply_markup=kb_contact_request(lang))
         return
 
-    # save lead
     leads_insert(message.from_user.id, message.from_user.username or "", phone)
 
     ts = now_local().strftime("%Y-%m-%d %H:%M")
@@ -981,7 +1123,7 @@ async def contact_phone(message: Message, state: FSMContext):
     except Exception as e:
         print(f"Manager lead send error: {e}")
 
-    await set_lang_keep(state, lang)
+    await set_lang_keep(state, message.from_user.id, message.from_user.username or "", lang)
     await safe_answer(message, TEXT[lang]["contact_thanks"], reply_markup=kb_channel_only(lang))
     await safe_answer(message, "😊✨", reply_markup=kb_menu(lang))
 
@@ -989,33 +1131,33 @@ async def contact_phone(message: Message, state: FSMContext):
 # CART FLOW
 # =========================
 async def cart_add_manual(call: CallbackQuery, state: FSMContext):
-    lang = await get_lang(state)
+    lang = await get_lang(state, call.from_user.id)
     await state.set_state(Flow.cart_add_item)
     await safe_answer_call(call, TEXT[lang]["cart_add_ask"], reply_markup=kb_menu(lang))
     await call.answer()
 
 async def cart_add_item(message: Message, state: FSMContext):
-    lang = await get_lang(state)
+    lang = await get_lang(state, message.from_user.id)
     txt = (message.text or "").strip()
     if is_cancel(lang, txt):
-        await set_lang_keep(state, lang)
+        await set_lang_keep(state, message.from_user.id, message.from_user.username or "", lang)
         await safe_answer(message, TEXT[lang]["cancelled"], reply_markup=kb_menu(lang))
         return
     if not txt:
         await safe_answer(message, TEXT[lang]["cart_add_ask"], reply_markup=kb_menu(lang))
         return
     cart_add(message.from_user.id, txt, 1)
-    await set_lang_keep(state, lang)
+    await set_lang_keep(state, message.from_user.id, message.from_user.username or "", lang)
     await safe_answer(message, TEXT[lang]["cart_added"], reply_markup=kb_menu(lang))
 
 async def cart_clear_cb(call: CallbackQuery, state: FSMContext):
-    lang = await get_lang(state)
+    lang = await get_lang(state, call.from_user.id)
     cart_clear(call.from_user.id)
     await safe_answer_call(call, TEXT[lang]["cart_cleared"], reply_markup=kb_menu(lang))
     await call.answer()
 
 async def cart_checkout_cb(call: CallbackQuery, state: FSMContext):
-    lang = await get_lang(state)
+    lang = await get_lang(state, call.from_user.id)
     items = cart_list(call.from_user.id)
     if not items:
         await safe_answer_call(call, TEXT[lang]["cart_empty"], reply_markup=kb_menu(lang))
@@ -1031,18 +1173,12 @@ async def cart_checkout_cb(call: CallbackQuery, state: FSMContext):
 # ORDER FLOW
 # =========================
 async def start_order(message: Message, state: FSMContext):
-    lang = await get_lang(state)
+    lang = await get_lang(state, message.from_user.id)
     await state.set_state(Flow.order_name)
     await safe_answer(message, TEXT[lang]["order_start"], reply_markup=kb_menu(lang))
 
-async def go_order(call: CallbackQuery, state: FSMContext):
-    lang = await get_lang(state)
-    await state.set_state(Flow.order_name)
-    await safe_answer_call(call, TEXT[lang]["order_start"], reply_markup=kb_menu(lang))
-    await call.answer()
-
 async def order_name(message: Message, state: FSMContext):
-    lang = await get_lang(state)
+    lang = await get_lang(state, message.from_user.id)
     name = (message.text or "").strip()
     if not name or is_cancel(lang, name):
         await safe_answer(message, TEXT[lang]["order_start"], reply_markup=kb_menu(lang))
@@ -1052,14 +1188,14 @@ async def order_name(message: Message, state: FSMContext):
     await safe_answer(message, TEXT[lang]["order_phone"], reply_markup=kb_contact_request(lang))
 
 async def order_phone(message: Message, state: FSMContext):
-    lang = await get_lang(state)
+    lang = await get_lang(state, message.from_user.id)
     if message.contact and message.contact.phone_number:
         phone = message.contact.phone_number
     else:
         phone = (message.text or "").strip()
 
     if is_cancel(lang, phone):
-        await set_lang_keep(state, lang)
+        await set_lang_keep(state, message.from_user.id, message.from_user.username or "", lang)
         await safe_answer(message, TEXT[lang]["cancelled"], reply_markup=kb_menu(lang))
         await safe_answer(message, TEXT[lang]["social_end"], reply_markup=kb_social_end(lang))
         return
@@ -1074,10 +1210,10 @@ async def order_phone(message: Message, state: FSMContext):
     await safe_answer(message, TEXT[lang]["order_city"], reply_markup=kb_menu(lang))
 
 async def order_city(message: Message, state: FSMContext):
-    lang = await get_lang(state)
+    lang = await get_lang(state, message.from_user.id)
     city = (message.text or "").strip()
     if is_cancel(lang, city):
-        await set_lang_keep(state, lang)
+        await set_lang_keep(state, message.from_user.id, message.from_user.username or "", lang)
         await safe_answer(message, TEXT[lang]["cancelled"], reply_markup=kb_menu(lang))
         await safe_answer(message, TEXT[lang]["social_end"], reply_markup=kb_social_end(lang))
         return
@@ -1087,7 +1223,6 @@ async def order_city(message: Message, state: FSMContext):
     await state.update_data(order_city=city)
 
     data = await state.get_data()
-    # если заказ из корзины — item уже заполнен
     if data.get("order_item"):
         await state.set_state(Flow.order_size)
         await safe_answer(message, TEXT[lang]["order_size"], reply_markup=kb_menu(lang))
@@ -1096,10 +1231,10 @@ async def order_city(message: Message, state: FSMContext):
         await safe_answer(message, TEXT[lang]["order_item"], reply_markup=kb_menu(lang))
 
 async def order_item(message: Message, state: FSMContext):
-    lang = await get_lang(state)
+    lang = await get_lang(state, message.from_user.id)
     item = (message.text or "").strip()
     if is_cancel(lang, item):
-        await set_lang_keep(state, lang)
+        await set_lang_keep(state, message.from_user.id, message.from_user.username or "", lang)
         await safe_answer(message, TEXT[lang]["cancelled"], reply_markup=kb_menu(lang))
         await safe_answer(message, TEXT[lang]["social_end"], reply_markup=kb_social_end(lang))
         return
@@ -1111,10 +1246,10 @@ async def order_item(message: Message, state: FSMContext):
     await safe_answer(message, TEXT[lang]["order_size"], reply_markup=kb_menu(lang))
 
 async def order_size(message: Message, state: FSMContext):
-    lang = await get_lang(state)
+    lang = await get_lang(state, message.from_user.id)
     raw = (message.text or "").strip()
     if is_cancel(lang, raw):
-        await set_lang_keep(state, lang)
+        await set_lang_keep(state, message.from_user.id, message.from_user.username or "", lang)
         await safe_answer(message, TEXT[lang]["cancelled"], reply_markup=kb_menu(lang))
         await safe_answer(message, TEXT[lang]["social_end"], reply_markup=kb_social_end(lang))
         return
@@ -1126,164 +1261,282 @@ async def order_size(message: Message, state: FSMContext):
 
     normalized = f"{age} лет, {height} см" if lang == "ru" else f"{age} yosh, {height} sm"
     await state.update_data(order_size=normalized)
+    await state.set_state(Flow.order_promo)
+    await safe_answer(message, TEXT[lang]["order_promo"], reply_markup=kb_menu(lang))
+
+async def order_promo(message: Message, state: FSMContext):
+    lang = await get_lang(state, message.from_user.id)
+    raw = (message.text or "").strip()
+
+    if is_cancel(lang, raw):
+        await set_lang_keep(state, message.from_user.id, message.from_user.username or "", lang)
+        await safe_answer(message, TEXT[lang]["cancelled"], reply_markup=kb_menu(lang))
+        await safe_answer(message, TEXT[lang]["social_end"], reply_markup=kb_social_end(lang))
+        return
+
+    none_words = {"нет", "yo‘q", "yo'q", "yoq", "нету", "no"}
+    if promo_normalize(raw).lower() in none_words:
+        await state.update_data(promo_code="", promo_discount=0)
+        await state.set_state(Flow.order_comment)
+        await safe_answer(message, TEXT[lang]["order_comment"], reply_markup=kb_menu(lang))
+        return
+
+    code = promo_normalize(raw)
+    disc = promo_discount(code)
+    if disc <= 0:
+        await safe_answer(message, TEXT[lang]["order_promo_bad"], reply_markup=kb_menu(lang))
+        return
+
+    await state.update_data(promo_code=code, promo_discount=disc)
+    await safe_answer(message, TEXT[lang]["order_promo_ok"].format(code=esc(code), disc=disc), reply_markup=kb_menu(lang))
     await state.set_state(Flow.order_comment)
     await safe_answer(message, TEXT[lang]["order_comment"], reply_markup=kb_menu(lang))
 
 async def order_comment(message: Message, state: FSMContext):
-    lang = await get_lang(state)
+    lang = await get_lang(state, message.from_user.id)
     comment = (message.text or "").strip()
+
     if is_cancel(lang, comment):
-        await set_lang_keep(state, lang)
+        await set_lang_keep(state, message.from_user.id, message.from_user.username or "", lang)
         await safe_answer(message, TEXT[lang]["cancelled"], reply_markup=kb_menu(lang))
         await safe_answer(message, TEXT[lang]["social_end"], reply_markup=kb_social_end(lang))
         return
+
     if not comment:
         comment = "нет" if lang == "ru" else "yo‘q"
-    await state.update_data(order_comment=comment)
-    await state.set_state(Flow.order_confirm)
-    await show_order_review(message, state, lang)
 
-async def order_cancel(call: CallbackQuery, state: FSMContext):
-    lang = await get_lang(state)
-    await set_lang_keep(state, lang)
-    await safe_answer_call(call, TEXT[lang]["cancelled"], reply_markup=kb_menu(lang))
-    await safe_answer_call(call, TEXT[lang]["social_end"], reply_markup=kb_social_end(lang))
-    await call.answer()
-
-async def order_back_confirm(call: CallbackQuery, state: FSMContext):
-    lang = await get_lang(state)
-    await state.set_state(Flow.order_confirm)
-    await show_order_review(call, state, lang)
-    await call.answer()
-
-async def order_edit(call: CallbackQuery, state: FSMContext):
-    lang = await get_lang(state)
-    await safe_answer_call(call, TEXT[lang]["edit_choose"], reply_markup=kb_edit_fields(lang))
-    await call.answer()
-
-async def edit_pick(call: CallbackQuery, state: FSMContext):
-    lang = await get_lang(state)
-    field = call.data.split(":")[1]
-    await state.update_data(_edit_field=field)
-    await state.set_state(Flow.edit_field)
-
-    prompts = {
-        "name": TEXT[lang]["order_start"],
-        "phone": TEXT[lang]["order_phone"],
-        "city": TEXT[lang]["order_city"],
-        "item": TEXT[lang]["order_item"],
-        "size": TEXT[lang]["order_size"],
-        "comment": TEXT[lang]["order_comment"],
-    }
-
-    if field == "phone":
-        await safe_answer_call(call, prompts["phone"], reply_markup=kb_contact_request(lang))
-    else:
-        await safe_answer_call(call, prompts.get(field, TEXT[lang]["unknown"]), reply_markup=kb_menu(lang))
-
-    await call.answer()
-
-async def edit_field_value(message: Message, state: FSMContext):
-    lang = await get_lang(state)
     data = await state.get_data()
-    field = data.get("_edit_field")
-    value = (message.text or "").strip()
+    promo_code = data.get("promo_code", "") or ""
+    promo_disc = int(data.get("promo_discount", 0) or 0)
 
-    if is_cancel(lang, value):
-        await set_lang_keep(state, lang)
-        await safe_answer(message, TEXT[lang]["cancelled"], reply_markup=kb_menu(lang))
-        await safe_answer(message, TEXT[lang]["social_end"], reply_markup=kb_social_end(lang))
-        return
-
-    if field == "phone":
-        if message.contact and message.contact.phone_number:
-            value = message.contact.phone_number
-        value = clean_phone(value)
-        if not looks_like_phone(value):
-            await safe_answer(message, TEXT[lang]["order_phone"], reply_markup=kb_contact_request(lang))
-            return
-    else:
-        if not value:
-            await safe_answer(message, TEXT[lang]["unknown"], reply_markup=kb_menu(lang))
-            return
-        if field == "size":
-            age, height = extract_two_numbers_any_order(value)
-            if age is None or height is None:
-                await safe_answer(message, TEXT[lang]["order_size_bad"], reply_markup=kb_menu(lang))
-                return
-            value = f"{age} лет, {height} см" if lang == "ru" else f"{age} yosh, {height} sm"
-
-    key_map = {
-        "name": "order_name",
-        "phone": "order_phone",
-        "city": "order_city",
-        "item": "order_item",
-        "size": "order_size",
-        "comment": "order_comment",
-    }
-    if field in key_map:
-        await state.update_data(**{key_map[field]: value})
-
-    await state.set_state(Flow.order_confirm)
-    await show_order_review(message, state, lang)
-
-async def order_confirm(call: CallbackQuery, state: FSMContext):
-    lang = await get_lang(state)
-    data = await state.get_data()
-    ts = now_local().strftime("%Y-%m-%d %H:%M")
-
-    # save order to DB (history)
-    orders_insert(
-        user_id=call.from_user.id,
-        username=call.from_user.username or "",
+    order_id = orders_insert(
+        user_id=message.from_user.id,
+        username=message.from_user.username or "",
         name=data.get("order_name", ""),
         phone=data.get("order_phone", ""),
         city=data.get("order_city", ""),
         item=data.get("order_item", ""),
         size=data.get("order_size", ""),
-        comment=data.get("order_comment", ""),
+        comment=comment,
+        promo_code=promo_code,
+        promo_disc=promo_disc,
     )
 
-    # if order from cart -> clear cart
     if data.get("_from_cart"):
-        cart_clear(call.from_user.id)
+        cart_clear(message.from_user.id)
+
+    # ✅ send to manager + status buttons
+    ts = now_local().strftime("%Y-%m-%d %H:%M")
+    promo_line = ""
+    if promo_code and promo_disc:
+        promo_line = f"\n🏷 Promo: <b>{esc(promo_code)}</b> (-{promo_disc}%)"
 
     manager_text = (
-        f"🛎 <b>Новый заказ</b> ({esc(ts)})\n\n"
+        f"🛎 <b>Новый заказ</b> #{order_id} ({esc(ts)})\n\n"
         f"• Имя: <b>{esc(data.get('order_name','-'))}</b>\n"
         f"• Телефон: <b>{esc(data.get('order_phone','-'))}</b>\n"
         f"• Город: <b>{esc(data.get('order_city','-'))}</b>\n"
         f"• Товар: <b>{esc(data.get('order_item','-'))}</b>\n"
         f"• Возраст/рост: <b>{esc(data.get('order_size','-'))}</b>\n"
-        f"• Комментарий: <b>{esc(data.get('order_comment','-'))}</b>\n\n"
-        f"👤 user_id: <code>{call.from_user.id}</code>\n"
-        f"👤 username: <code>@{esc(call.from_user.username) if call.from_user.username else '-'}</code>"
+        f"• Комментарий: <b>{esc(comment)}</b>"
+        f"{promo_line}\n\n"
+        f"Статус: <b>new</b>\n"
+        f"👤 user_id: <code>{message.from_user.id}</code>\n"
+        f"👤 username: <code>@{esc(message.from_user.username) if message.from_user.username else '-'}</code>"
     )
     try:
-        await call.message.bot.send_message(chat_id=MANAGER_CHAT_ID, text=manager_text)
+        await message.bot.send_message(
+            chat_id=MANAGER_CHAT_ID,
+            text=manager_text,
+            reply_markup=kb_admin_status(order_id, "new")
+        )
     except Exception as e:
         print(f"Manager send error: {e}")
 
-    # auto-reply to client
-    await safe_answer_call(call, TEXT[lang]["order_sent"], reply_markup=kb_menu(lang))
-    await safe_answer_call(call, TEXT[lang]["payment_info"], reply_markup=kb_menu(lang))
-    await safe_answer_call(call, TEXT[lang]["worktime_in"] if in_work_time(now_local()) else TEXT[lang]["worktime_out"], reply_markup=kb_menu(lang))
-    await safe_answer_call(call, TEXT[lang]["social_end"], reply_markup=kb_social_end(lang))
+    await set_lang_keep(state, message.from_user.id, message.from_user.username or "", lang)
 
-    await set_lang_keep(state, lang)
-    await call.answer()
+    await safe_answer(message, TEXT[lang]["order_sent"], reply_markup=kb_menu(lang))
+    await safe_answer(message, TEXT[lang]["payment_info"], reply_markup=kb_menu(lang))
+    await safe_answer(message, TEXT[lang]["after_order"], reply_markup=kb_after_order(lang))
 
 # =========================
-# CALLBACKS: CART
+# ADMIN CALLBACK: status buttons + notify client
 # =========================
-async def cart_clear_cb_wrap(call: CallbackQuery, state: FSMContext):
-    await cart_clear_cb(call, state)
+async def admin_set_status(call: CallbackQuery, state: FSMContext):
+    if not is_admin(call.from_user.id):
+        await call.answer("Нет доступа", show_alert=True)
+        return
 
-async def cart_checkout_cb_wrap(call: CallbackQuery, state: FSMContext):
-    await cart_checkout_cb(call, state)
+    # adm:status:<id>:<status>
+    try:
+        _, _, sid, st = call.data.split(":", 3)
+    except Exception:
+        await call.answer("Ошибка данных", show_alert=True)
+        return
+
+    if not sid.isdigit():
+        await call.answer("Неверный ID", show_alert=True)
+        return
+
+    st = (st or "").lower().strip()
+    if st not in ("new", "processing", "done"):
+        await call.answer("Неверный статус", show_alert=True)
+        return
+
+    order_id = int(sid)
+    order_set_status(order_id, st)
+
+    # update manager message text
+    try:
+        old = call.message.text or ""
+        new_text = re.sub(r"Статус:\s*<b>.*?</b>", f"Статус: <b>{st}</b>", old)
+        await call.message.edit_text(new_text, reply_markup=kb_admin_status(order_id, st))
+    except Exception:
+        pass
+
+    # notify client in THEIR language (from DB)
+    row = order_get(order_id)
+    if row:
+        client_id, _name, _old_status = row
+        client_lang = user_get_lang(client_id)
+        if st == "processing":
+            text_client = TEXT[client_lang]["client_processing"].format(order_id=order_id)
+            try:
+                await call.bot.send_message(client_id, text_client)
+            except Exception:
+                pass
+        elif st == "done":
+            text_client = TEXT[client_lang]["client_done"].format(order_id=order_id)
+            try:
+                await call.bot.send_message(client_id, text_client, reply_markup=kb_after_order(client_lang))
+            except Exception:
+                pass
+        else:  # new
+            text_client = TEXT[client_lang]["client_new"].format(order_id=order_id)
+            try:
+                await call.bot.send_message(client_id, text_client)
+            except Exception:
+                pass
+
+    await call.answer(f"✅ Статус: {st}")
 
 # =========================
-# AUTOMATIONS: DAILY REPORT + MANAGER REMINDERS
+# ADMIN COMMANDS
+# =========================
+async def cmd_orders(message: Message, state: FSMContext):
+    if not is_admin(message.from_user.id):
+        return
+    rows = orders_list_all(limit=20)
+    if not rows:
+        await safe_answer(message, "Заказов нет.")
+        return
+    lines = ["📋 <b>Последние заказы</b>:"]
+    for r in rows:
+        (oid, uid, name, phone, city, item, status, pcode, pdisc, created_at) = r
+        promo = f" • {pcode}(-{pdisc}%)" if pcode and pdisc else ""
+        lines.append(f"#{oid} • {esc(name)} • {esc(phone)} • {esc(city)} • {esc(status)}{promo} • {esc(created_at)}")
+    await safe_answer(message, "\n".join(lines))
+
+async def cmd_status(message: Message, state: FSMContext):
+    if not is_admin(message.from_user.id):
+        return
+    parts = (message.text or "").split()
+    if len(parts) != 3:
+        await safe_answer(message, "Формат: /status <id> <new|processing|done>")
+        return
+    _, sid, st = parts
+    if not sid.isdigit():
+        await safe_answer(message, "ID должен быть числом.")
+        return
+    st = st.lower().strip()
+    if st not in ("new", "processing", "done"):
+        await safe_answer(message, "Статус только: new / processing / done")
+        return
+    order_set_status(int(sid), st)
+    await safe_answer(message, f"✅ Статус заказа #{sid} обновлён: <b>{st}</b>")
+
+# ✅ add post templates into queue: /addpost
+async def cmd_addpost(message: Message, state: FSMContext):
+    if not is_admin(message.from_user.id):
+        return
+
+    txt = (message.text or "")
+    payload = ""
+    if txt.startswith("/addpost"):
+        payload = txt.replace("/addpost", "", 1).strip()
+
+    if payload:
+        post_add("text", None, payload)
+        await safe_answer(message, "✅ Заготовка (текст) добавлена в очередь.")
+        return
+
+    if message.photo:
+        file_id = message.photo[-1].file_id
+        cap = (message.caption or "").replace("/addpost", "", 1).strip()
+        post_add("photo", file_id, cap)
+        await safe_answer(message, "✅ Заготовка (фото) добавлена в очередь.")
+        return
+
+    if message.video:
+        file_id = message.video.file_id
+        cap = (message.caption or "").replace("/addpost", "", 1).strip()
+        post_add("video", file_id, cap)
+        await safe_answer(message, "✅ Заготовка (видео) добавлена в очередь.")
+        return
+
+    await safe_answer(
+        message,
+        "Формат:\n"
+        "1) /addpost ТЕКСТ\n"
+        "2) Отправь фото/видео с подписью, где в первой строке /addpost\n\n"
+        "Пример:\n"
+        "/addpost Новинка! Школьная форма 🔥\n"
+        "Размеры 122–164"
+    )
+
+# =========================
+# AUTOPOSTING (18:00 daily)
+# =========================
+async def post_to_channel(bot: Bot):
+    if CHANNEL_ID == 0:
+        return
+
+    # posts in RU by default (you can change to "uz" if need)
+    lang = "ru"
+    cta = kb_post_cta(lang)
+
+    post = post_pick_next()
+    if not post:
+        await bot.send_message(CHANNEL_ID, "⚠️ Нет заготовок для автопоста. Добавь через /addpost", reply_markup=cta)
+        return
+
+    media_type = post["media_type"]
+    file_id = (post["file_id"] or "").strip()
+    text = (post["text"] or "").strip()
+
+    try:
+        if media_type == "photo" and file_id:
+            await bot.send_photo(chat_id=CHANNEL_ID, photo=file_id, caption=text[:1024] if text else None, reply_markup=cta)
+        elif media_type == "video" and file_id:
+            await bot.send_video(chat_id=CHANNEL_ID, video=file_id, caption=text[:1024] if text else None, reply_markup=cta)
+        else:
+            await bot.send_message(chat_id=CHANNEL_ID, text=text or "✨ ZARY & CO", reply_markup=cta)
+    except Exception as e:
+        print("post_to_channel error:", e)
+
+async def autopost_scheduler(bot: Bot):
+    last_date = None
+    while True:
+        dt = now_local()
+        if dt.hour == POST_TIME.hour and dt.minute == POST_TIME.minute:
+            d = dt.strftime("%Y-%m-%d")
+            if last_date != d:
+                await post_to_channel(bot)
+                last_date = d
+        await asyncio.sleep(20)
+
+# =========================
+# DAILY REPORT (manager)
 # =========================
 async def send_daily_report(bot: Bot):
     d = now_local().strftime("%Y-%m-%d")
@@ -1295,53 +1548,10 @@ async def send_daily_report(bot: Bot):
     )
     await bot.send_message(MANAGER_CHAT_ID, text)
 
-async def reminder_tick(bot: Bot):
-    # remind about "new" orders older than 30 minutes, not reminded recently
-    con = db_conn()
-    cur = con.cursor()
-    cur.execute("""
-        SELECT id, name, phone, item, created_at, created_ts, reminded_ts
-        FROM orders
-        WHERE status='new'
-        ORDER BY id DESC
-        LIMIT 50
-    """)
-    rows = cur.fetchall()
-
-    now_ = now_ts()
-    remind_after = 30 * 60     # 30 min
-    repeat_every = 60 * 60     # repeat each 60 min if still new
-
-    to_remind = []
-    for r in rows:
-        order_id, name, phone, item, created_at, created_ts, reminded_ts = r
-        if now_ - int(created_ts) >= remind_after:
-            if int(reminded_ts) == 0 or (now_ - int(reminded_ts) >= repeat_every):
-                to_remind.append((order_id, name, phone, item, created_at))
-
-    if to_remind:
-        lines = []
-        for (order_id, name, phone, item, created_at) in to_remind[:10]:
-            lines.append(f"#{order_id} • {esc(name)} • {esc(phone)} • {esc(item)} • {esc(created_at)}")
-        text = "🔔 <b>Напоминание менеджеру</b>\nНеобработанные заказы:\n" + "\n".join(lines)
-        try:
-            await bot.send_message(MANAGER_CHAT_ID, text)
-            # update reminded_ts
-            cur2 = con.cursor()
-            for (order_id, *_rest) in to_remind:
-                cur2.execute("UPDATE orders SET reminded_ts=? WHERE id=?", (now_, order_id))
-            con.commit()
-        except Exception as e:
-            print("reminder send error:", e)
-
-    con.close()
-
-async def scheduler_loop(bot: Bot):
+async def daily_report_scheduler(bot: Bot):
     last_report_date = None
     while True:
         dt = now_local()
-
-        # daily report at 21:05
         if dt.hour == 21 and dt.minute == 5:
             d = dt.strftime("%Y-%m-%d")
             if last_report_date != d:
@@ -1350,17 +1560,10 @@ async def scheduler_loop(bot: Bot):
                     last_report_date = d
                 except Exception as e:
                     print("daily report error:", e)
-
-        # manager reminder every 2 minutes
-        try:
-            await reminder_tick(bot)
-        except Exception as e:
-            print("reminder tick error:", e)
-
-        await asyncio.sleep(120)
+        await asyncio.sleep(30)
 
 # =========================
-# RENDER HEALTH SERVER (HEAD OK)
+# RENDER HEALTH SERVER
 # =========================
 class _HealthHandler(BaseHTTPRequestHandler):
     def _ok(self):
@@ -1386,6 +1589,21 @@ def start_health_server():
     print(f"✅ Health server listening on port {port}.")
 
 # =========================
+# CALLBACKS & HANDLERS
+# =========================
+async def admin_noop(call: CallbackQuery):
+    await call.answer("OK")
+
+async def size_mode_cb(call: CallbackQuery, state: FSMContext):
+    await size_mode(call, state)
+
+async def cart_clear_cb_wrap(call: CallbackQuery, state: FSMContext):
+    await cart_clear_cb(call, state)
+
+async def cart_checkout_cb_wrap(call: CallbackQuery, state: FSMContext):
+    await cart_checkout_cb(call, state)
+
+# =========================
 # DISPATCHER
 # =========================
 def build_dp() -> Dispatcher:
@@ -1397,40 +1615,35 @@ def build_dp() -> Dispatcher:
     dp.callback_query.register(pick_lang, F.data.startswith("lang:"))
     dp.callback_query.register(back_menu, F.data == "back:menu")
 
-    dp.callback_query.register(price_section, F.data.startswith("price:"))
-    dp.callback_query.register(go_order, F.data == "go:order")
-
     dp.callback_query.register(photo_section, F.data.startswith("photo:"))
 
-    dp.callback_query.register(size_mode, F.data.startswith("size:"))
+    dp.callback_query.register(size_mode_cb, F.data.startswith("size:"))
     dp.message.register(size_age, Flow.size_age)
     dp.message.register(size_height, Flow.size_height)
 
-    # contact flow
     dp.callback_query.register(contact_leave, F.data == "contact:leave")
     dp.message.register(contact_phone, Flow.contact_phone)
 
-    # cart flow
     dp.callback_query.register(cart_add_manual, F.data == "cart:add_manual")
     dp.message.register(cart_add_item, Flow.cart_add_item)
     dp.callback_query.register(cart_clear_cb_wrap, F.data == "cart:clear")
     dp.callback_query.register(cart_checkout_cb_wrap, F.data == "cart:checkout")
 
-    # order states
     dp.message.register(order_name, Flow.order_name)
     dp.message.register(order_phone, Flow.order_phone)
     dp.message.register(order_city, Flow.order_city)
     dp.message.register(order_item, Flow.order_item)
     dp.message.register(order_size, Flow.order_size)
+    dp.message.register(order_promo, Flow.order_promo)
     dp.message.register(order_comment, Flow.order_comment)
 
-    dp.callback_query.register(order_cancel, F.data == "order:cancel")
-    dp.callback_query.register(order_confirm, F.data == "order:confirm")
-    dp.callback_query.register(order_edit, F.data == "order:edit")
-    dp.callback_query.register(order_back_confirm, F.data == "order:back_confirm")
+    # admin
+    dp.message.register(cmd_addpost, Command("addpost"))
+    dp.message.register(cmd_orders, Command("orders"))
+    dp.message.register(cmd_status, Command("status"))
 
-    dp.callback_query.register(edit_pick, F.data.startswith("edit:"))
-    dp.message.register(edit_field_value, Flow.edit_field)
+    dp.callback_query.register(admin_set_status, F.data.startswith("adm:status:"))
+    dp.callback_query.register(admin_noop, F.data == "adm:noop")
 
     dp.message.register(menu_by_text, F.text)
 
@@ -1443,8 +1656,8 @@ async def main():
     bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
     dp = build_dp()
 
-    # background scheduler (daily report + reminders)
-    asyncio.create_task(scheduler_loop(bot))
+    asyncio.create_task(autopost_scheduler(bot))
+    asyncio.create_task(daily_report_scheduler(bot))
 
     print("✅ ZARY & CO assistant started (polling).")
     await dp.start_polling(bot)
