@@ -1,34 +1,45 @@
 """
-ZARY & CO OPT Bot — Production Version
-Особенности: асинхронная БД, автоотчеты в конце месяца, полная статистика
+ZARY & CO — РОЗНИЧНЫЙ БОТ (Retail Bot)
+Версия: 2.0 Production Ready
+- Исправлены баги с напоминаниями
+- Множественные админы (до 3)
+- Автоотчеты Excel в конце месяца
+- Улучшенная корзина и избранное
+- Доставка: Б2Б/Яндекс/ПВЗ
 """
 
 import os
 import re
+import html
 import asyncio
-import logging
+import threading
 import sqlite3
 import aiosqlite
-from datetime import datetime, timedelta
-from pathlib import Path
-from typing import Optional, Dict, Any, List
+from datetime import datetime, timedelta, time as dtime
 from calendar import monthrange
+from zoneinfo import ZoneInfo
+from http.server import BaseHTTPRequestHandler, HTTPServer
+from typing import Optional, Dict, Any, List, Set
+from pathlib import Path
 
 from aiohttp import web
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
 from aiogram import Bot, Dispatcher, F
+from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
 from aiogram.filters import CommandStart, Command
+from aiogram.fsm.context import FSMContext
+from aiogram.fsm.state import State, StatesGroup
+from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.types import (
     Message,
+    CallbackQuery,
+    InlineKeyboardMarkup,
+    InlineKeyboardButton,
     ReplyKeyboardMarkup,
     KeyboardButton,
 )
-from aiogram.client.default import DefaultBotProperties
-from aiogram.fsm.context import FSMContext
-from aiogram.fsm.state import StatesGroup, State
-from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.types.input_file import FSInputFile
 from aiogram.exceptions import TelegramAPIError
 
@@ -39,49 +50,66 @@ from openpyxl.styles import Font, PatternFill, Alignment
 # CONFIGURATION
 # =========================
 class Config:
-    BOT_TOKEN = (os.getenv("BOT_TOKEN") or "").strip()
-    MANAGER_ID_RAW = (os.getenv("MANAGER_ID") or "").strip()
-    CHANNEL = (os.getenv("CHANNEL") or "zaryco_official").strip().lstrip("@")
-    PHONE = (os.getenv("PHONE") or "+998771202255").strip()
-    PORT = int((os.getenv("PORT") or "10000").strip())
-    
-    DB_PATH = "leads.sqlite3"
-    EXPORTS_DIR = Path("exports")
-    BACKUP_DIR = Path("backups")
-    REPORTS_DIR = Path("reports")  # Для месячных отчетов
-    
-    # Настройки отчетов
-    MAX_EXPORT_AGE_DAYS = 7
-    BACKUP_KEEP_COUNT = 5
-    
-    # Валидация
+    BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
     if not BOT_TOKEN:
-        raise RuntimeError("BOT_TOKEN не указан!")
-    if not MANAGER_ID_RAW.isdigit():
-        raise RuntimeError("MANAGER_ID должен быть числом!")
+        raise RuntimeError("BOT_TOKEN env is empty!")
     
-    MANAGER_ID = int(MANAGER_ID_RAW)
+    # Множественные админы (до 3)
+    ADMIN_IDS = []
+    for i in range(1, 4):
+        admin_id = os.getenv(f"ADMIN_ID_{i}", "").strip()
+        if admin_id and admin_id.isdigit():
+            ADMIN_IDS.append(int(admin_id))
+    
+    # Если старый формат (один админ)
+    if not ADMIN_IDS:
+        old_admin = os.getenv("MANAGER_CHAT_ID", "").strip()
+        if old_admin and old_admin.isdigit():
+            ADMIN_IDS.append(int(old_admin))
+    
+    if not ADMIN_IDS:
+        raise RuntimeError("At least one ADMIN_ID required!")
+    
+    PRIMARY_ADMIN = ADMIN_IDS[0]  # Главный админ для отчетов
+    
+    CHANNEL_ID = int(os.getenv("CHANNEL_ID", "0").strip()) or 0
+    CHANNEL_USERNAME = os.getenv("CHANNEL_USERNAME", "zaryco_official").strip().lstrip("@")
+    
+    PHONE = os.getenv("MANAGER_PHONE", "+998771202255").strip()
+    MANAGER_USERNAME = os.getenv("MANAGER_USERNAME", "").strip().lstrip("@")
+    
+    PORT = int(os.getenv("PORT", "10000"))
+    DB_PATH = os.getenv("DB_PATH", "bot.db")
+    
+    # Директории
+    REPORTS_DIR = Path("reports")
+    EXPORTS_DIR = Path("exports")
+    
+    # Время
+    TZ = ZoneInfo("Asia/Tashkent")
+    WORK_START = dtime(9, 0)
+    WORK_END = dtime(21, 0)
+    
+    # Автопостинг
+    AUTOPOST_HOUR = int(os.getenv("AUTOPOST_HOUR", "18"))
+    AUTOPOST_MINUTE = int(os.getenv("AUTOPOST_MINUTE", "0"))
+    
+    # Напоминания
+    REMINDER_FIRST = 30 * 60  # 30 минут
+    REMINDER_REPEAT = 60 * 60  # каждый час
+    
+    # Ссылки
+    INSTAGRAM_URL = "https://www.instagram.com/zary.co/"
+    YOUTUBE_URL = "https://www.youtube.com/@ZARYCOOFFICIAL"
+    TELEGRAM_CHANNEL_URL = f"https://t.me/{CHANNEL_USERNAME}"
 
 # =========================
-# LOGGING
-# =========================
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    handlers=[
-        logging.FileHandler('bot.log', encoding='utf-8'),
-        logging.StreamHandler()
-    ]
-)
-logger = logging.getLogger(__name__)
-
-# =========================
-# ASYNC DATABASE
+# DATABASE (Async)
 # =========================
 class Database:
-    def __init__(self, db_path: str):
-        self.db_path = db_path
-        self._pool: Optional[aiosqlite.Connection] = None
+    def __init__(self):
+        self.db_path = Config.DB_PATH
+        self._pool = None
     
     async def connect(self):
         self._pool = await aiosqlite.connect(self.db_path)
@@ -89,550 +117,693 @@ class Database:
         await self._pool.execute("PRAGMA foreign_keys = ON")
         await self._pool.execute("PRAGMA journal_mode = WAL")
         await self.init_tables()
-        logger.info("Database connected")
     
     async def close(self):
         if self._pool:
             await self._pool.close()
     
     async def init_tables(self):
-        await self._pool.executescript("""
+        await self._pool.executescript(f"""
             CREATE TABLE IF NOT EXISTS users (
                 user_id INTEGER PRIMARY KEY,
-                lang TEXT NOT NULL,
-                created_at TEXT DEFAULT CURRENT_TIMESTAMP,
-                last_activity TEXT DEFAULT CURRENT_TIMESTAMP
+                username TEXT,
+                lang TEXT NOT NULL DEFAULT 'ru',
+                created_at TEXT NOT NULL,
+                phone TEXT,
+                city TEXT,
+                is_blocked INTEGER DEFAULT 0
             );
             
-            CREATE TABLE IF NOT EXISTS leads (
+            CREATE TABLE IF NOT EXISTS products (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
-                created_at TEXT NOT NULL,
+                name_ru TEXT NOT NULL,
+                name_uz TEXT NOT NULL,
+                category TEXT,
+                price INTEGER,
+                sizes TEXT,
+                photo_id TEXT,
+                is_active INTEGER DEFAULT 1,
+                created_at TEXT DEFAULT CURRENT_TIMESTAMP
+            );
+            
+            CREATE TABLE IF NOT EXISTS carts (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL,
+                product_id INTEGER,
+                product_name TEXT,
+                qty INTEGER DEFAULT 1,
+                size TEXT,
+                added_at TEXT DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (user_id) REFERENCES users(user_id)
+            );
+            
+            CREATE TABLE IF NOT EXISTS favorites (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL,
+                product_id INTEGER,
+                added_at TEXT DEFAULT CURRENT_TIMESTAMP,
+                UNIQUE(user_id, product_id)
+            );
+            
+            CREATE TABLE IF NOT EXISTS orders (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
                 user_id INTEGER NOT NULL,
                 username TEXT,
-                full_name TEXT,
-                lang TEXT NOT NULL,
-                role TEXT NOT NULL,
-                product TEXT NOT NULL,
-                qty TEXT NOT NULL,
-                city TEXT NOT NULL,
-                phone TEXT NOT NULL,
-                status TEXT NOT NULL DEFAULT 'new',
-                manager_notified INTEGER DEFAULT 0,
-                notes TEXT
-            );
-            
-            CREATE INDEX IF NOT EXISTS idx_leads_user_id ON leads(user_id);
-            CREATE INDEX IF NOT EXISTS idx_leads_status ON leads(status);
-            CREATE INDEX IF NOT EXISTS idx_leads_created ON leads(created_at);
-            
-            CREATE TABLE IF NOT EXISTS activity_log (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                timestamp TEXT DEFAULT CURRENT_TIMESTAMP,
-                user_id INTEGER,
-                action TEXT,
-                details TEXT
+                name TEXT,
+                phone TEXT,
+                city TEXT,
+                items TEXT,  -- JSON: [{"name": "...", "qty": 1, "size": "..."}]
+                total_amount INTEGER DEFAULT 0,
+                delivery_type TEXT,  -- b2b, yandex_courier, yandex_pvz
+                delivery_address TEXT,
+                comment TEXT,
+                promo_code TEXT,
+                discount_percent INTEGER DEFAULT 0,
+                status TEXT DEFAULT 'new',  -- new, processing, shipped, delivered, cancelled
+                manager_seen INTEGER DEFAULT 0,  -- 0 = не просмотрено
+                manager_id INTEGER,
+                created_at TEXT NOT NULL,
+                reminded_at TEXT,
+                FOREIGN KEY (user_id) REFERENCES users(user_id)
             );
             
             CREATE TABLE IF NOT EXISTS monthly_reports (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 year INTEGER NOT NULL,
                 month INTEGER NOT NULL,
-                sent_at TEXT NOT NULL,
-                filename TEXT NOT NULL,
-                total_leads INTEGER NOT NULL,
-                status TEXT DEFAULT 'sent'
+                sent_at TEXT,
+                filename TEXT,
+                total_orders INTEGER,
+                total_amount INTEGER,
+                status TEXT DEFAULT 'pending'
             );
+            
+            CREATE TABLE IF NOT EXISTS posts_queue (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                media_type TEXT,
+                file_id TEXT,
+                text TEXT,
+                status TEXT DEFAULT 'queued',
+                created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+                posted_at TEXT
+            );
+            
+            CREATE INDEX IF NOT EXISTS idx_orders_user ON orders(user_id);
+            CREATE INDEX IF NOT EXISTS idx_orders_status ON orders(status);
+            CREATE INDEX IF NOT EXISTS idx_orders_created ON orders(created_at);
+            CREATE INDEX IF NOT EXISTS idx_carts_user ON carts(user_id);
         """)
         await self._pool.commit()
     
-    async def get_lang(self, user_id: int) -> Optional[str]:
+    # Users
+    async def user_get(self, user_id: int) -> Optional[Dict]:
         async with self._pool.execute(
-            "SELECT lang FROM users WHERE user_id = ?", (user_id,)
+            "SELECT * FROM users WHERE user_id = ?", (user_id,)
         ) as cursor:
             row = await cursor.fetchone()
-            return row[0] if row else None
+            return dict(row) if row else None
     
-    async def set_lang(self, user_id: int, lang: str):
-        await self._pool.execute("""
-            INSERT INTO users(user_id, lang, last_activity) 
-            VALUES(?, ?, CURRENT_TIMESTAMP)
-            ON CONFLICT(user_id) DO UPDATE 
-            SET lang = excluded.lang, last_activity = CURRENT_TIMESTAMP
-        """, (user_id, lang))
+    async def user_upsert(self, user_id: int, username: str, lang: str, phone: str = None):
+        now = datetime.now(Config.TZ).strftime("%Y-%m-%d %H:%M:%S")
+        existing = await self.user_get(user_id)
+        if existing:
+            await self._pool.execute(
+                "UPDATE users SET username = ?, lang = ?, phone = COALESCE(?, phone) WHERE user_id = ?",
+                (username, lang, phone, user_id)
+            )
+        else:
+            await self._pool.execute(
+                "INSERT INTO users (user_id, username, lang, created_at, phone) VALUES (?, ?, ?, ?, ?)",
+                (user_id, username, lang, now, phone)
+            )
         await self._pool.commit()
     
-    async def add_lead(self, lead: Dict[str, Any]) -> int:
-        cursor = await self._pool.execute("""
-            INSERT INTO leads (
-                created_at, user_id, username, full_name, lang, 
-                role, product, qty, city, phone, status
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """, (
-            lead["created_at"], lead["user_id"], lead.get("username"),
-            lead.get("full_name"), lead["lang"], lead["role"],
-            lead["product"], lead["qty"], lead["city"], lead["phone"], "new"
-        ))
+    # Carts
+    async def cart_add(self, user_id: int, product_name: str, qty: int = 1, size: str = ""):
+        await self._pool.execute(
+            "INSERT INTO carts (user_id, product_name, qty, size) VALUES (?, ?, ?, ?)",
+            (user_id, product_name, qty, size)
+        )
+        await self._pool.commit()
+    
+    async def cart_get(self, user_id: int) -> List[Dict]:
+        async with self._pool.execute(
+            "SELECT * FROM carts WHERE user_id = ? ORDER BY id DESC", (user_id,)
+        ) as cursor:
+            rows = await cursor.fetchall()
+            return [dict(r) for r in rows]
+    
+    async def cart_clear(self, user_id: int):
+        await self._pool.execute("DELETE FROM carts WHERE user_id = ?", (user_id,))
+        await self._pool.commit()
+    
+    async def cart_remove_item(self, cart_id: int):
+        await self._pool.execute("DELETE FROM carts WHERE id = ?", (cart_id,))
+        await self._pool.commit()
+    
+    # Favorites
+    async def favorite_toggle(self, user_id: int, product_id: int) -> bool:
+        # True = added, False = removed
+        async with self._pool.execute(
+            "SELECT 1 FROM favorites WHERE user_id = ? AND product_id = ?",
+            (user_id, product_id)
+        ) as cursor:
+            exists = await cursor.fetchone()
+        
+        if exists:
+            await self._pool.execute(
+                "DELETE FROM favorites WHERE user_id = ? AND product_id = ?",
+                (user_id, product_id)
+            )
+            await self._pool.commit()
+            return False
+        else:
+            await self._pool.execute(
+                "INSERT INTO favorites (user_id, product_id) VALUES (?, ?)",
+                (user_id, product_id)
+            )
+            await self._pool.commit()
+            return True
+    
+    async def favorites_get(self, user_id: int) -> List[Dict]:
+        async with self._pool.execute(
+            "SELECT f.*, p.name_ru, p.name_uz, p.price, p.photo_id "
+            "FROM favorites f JOIN products p ON f.product_id = p.id "
+            "WHERE f.user_id = ?", (user_id,)
+        ) as cursor:
+            rows = await cursor.fetchall()
+            return [dict(r) for r in rows]
+    
+    # Orders
+    async def order_create(self, data: Dict) -> int:
+        now = datetime.now(Config.TZ).strftime("%Y-%m-%d %H:%M:%S")
+        cursor = await self._pool.execute(
+            """INSERT INTO orders (
+                user_id, username, name, phone, city, items, total_amount,
+                delivery_type, delivery_address, comment, promo_code, discount_percent,
+                status, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (
+                data['user_id'], data.get('username', ''), data['name'], data['phone'],
+                data['city'], data['items'], data.get('total_amount', 0),
+                data.get('delivery_type', ''), data.get('delivery_address', ''),
+                data.get('comment', ''), data.get('promo_code', ''),
+                data.get('discount_percent', 0), 'new', now
+            )
+        )
         await self._pool.commit()
         return cursor.lastrowid
     
-    async def get_last_leads(self, limit: int = 20) -> List[aiosqlite.Row]:
-        async with self._pool.execute("""
-            SELECT * FROM leads 
-            ORDER BY id DESC 
-            LIMIT ?
-        """, (limit,)) as cursor:
-            return await cursor.fetchall()
-    
-    async def get_all_leads(self) -> List[aiosqlite.Row]:
-        async with self._pool.execute("""
-            SELECT * FROM leads ORDER BY id DESC
-        """,) as cursor:
-            return await cursor.fetchall()
-    
-    async def get_leads_by_date_range(self, start_date: str, end_date: str) -> List[aiosqlite.Row]:
-        """Получить заказы за период (YYYY-MM-DD)"""
-        async with self._pool.execute("""
-            SELECT * FROM leads 
-            WHERE created_at >= ? AND created_at <= ?
-            ORDER BY id DESC
-        """, (start_date, end_date)) as cursor:
-            return await cursor.fetchall()
-    
-    async def update_status(self, lead_id: int, status: str) -> bool:
-        cursor = await self._pool.execute("""
-            UPDATE leads SET status = ? WHERE id = ?
-        """, (status, lead_id))
-        await self._pool.commit()
-        return cursor.rowcount > 0
-    
-    async def update_notification_status(self, lead_id: int, notified: bool):
-        await self._pool.execute("""
-            UPDATE leads SET manager_notified = ? WHERE id = ?
-        """, (1 if notified else 0, lead_id))
-        await self._pool.commit()
-    
-    async def log_activity(self, user_id: int, action: str, details: str = ""):
-        await self._pool.execute("""
-            INSERT INTO activity_log (user_id, action, details) 
-            VALUES (?, ?, ?)
-        """, (user_id, action, details))
-        await self._pool.commit()
-    
-    async def get_stats(self) -> Dict[str, int]:
-        async with self._pool.execute("""
-            SELECT 
-                COUNT(*) as total_leads,
-                SUM(CASE WHEN status = 'new' THEN 1 ELSE 0 END) as new_leads,
-                COUNT(DISTINCT user_id) as unique_users
-            FROM leads
-        """) as cursor:
+    async def order_get(self, order_id: int) -> Optional[Dict]:
+        async with self._pool.execute(
+            "SELECT * FROM orders WHERE id = ?", (order_id,)
+        ) as cursor:
             row = await cursor.fetchone()
-            return dict(row) if row else {}
+            return dict(row) if row else None
     
-    async def get_monthly_stats(self, year: int, month: int) -> Dict[str, Any]:
-        """Статистика за месяц"""
+    async def order_update_status(self, order_id: int, status: str, manager_id: int = None):
+        params = [status]
+        query = "UPDATE orders SET status = ?"
+        if manager_id:
+            query += ", manager_id = ?, manager_seen = 1"
+            params.append(manager_id)
+        query += " WHERE id = ?"
+        params.append(order_id)
+        
+        await self._pool.execute(query, params)
+        await self._pool.commit()
+    
+    async def order_mark_seen(self, order_id: int, manager_id: int):
+        await self._pool.execute(
+            "UPDATE orders SET manager_seen = 1, manager_id = ? WHERE id = ?",
+            (manager_id, order_id)
+        )
+        await self._pool.commit()
+    
+    async def orders_get_by_status(self, status: str, limit: int = 50) -> List[Dict]:
+        async with self._pool.execute(
+            "SELECT * FROM orders WHERE status = ? ORDER BY created_at DESC LIMIT ?",
+            (status, limit)
+        ) as cursor:
+            rows = await cursor.fetchall()
+            return [dict(r) for r in rows]
+    
+    async def orders_get_for_reminder(self) -> List[Dict]:
+        """Только new + не просмотренные менеджером + старше 30 мин"""
+        cutoff = (datetime.now(Config.TZ) - timedelta(minutes=30)).strftime("%Y-%m-%d %H:%M:%S")
+        async with self._pool.execute(
+            "SELECT * FROM orders WHERE status = 'new' AND manager_seen = 0 "
+            "AND created_at < ? AND (reminded_at IS NULL OR reminded_at < ?)",
+            (cutoff, cutoff)
+        ) as cursor:
+            rows = await cursor.fetchall()
+            return [dict(r) for r in rows]
+    
+    async def order_update_reminded(self, order_id: int):
+        now = datetime.now(Config.TZ).strftime("%Y-%m-%d %H:%M:%S")
+        await self._pool.execute(
+            "UPDATE orders SET reminded_at = ? WHERE id = ?",
+            (now, order_id)
+        )
+        await self._pool.commit()
+    
+    async def orders_get_monthly(self, year: int, month: int) -> List[Dict]:
         start = f"{year}-{month:02d}-01"
         last_day = monthrange(year, month)[1]
         end = f"{year}-{month:02d}-{last_day} 23:59:59"
         
-        async with self._pool.execute("""
-            SELECT 
-                COUNT(*) as total,
-                SUM(CASE WHEN status = 'new' THEN 1 ELSE 0 END) as new_count,
-                SUM(CASE WHEN status = 'work' THEN 1 ELSE 0 END) as work_count,
-                SUM(CASE WHEN status = 'paid' THEN 1 ELSE 0 END) as paid_count,
-                SUM(CASE WHEN status = 'shipped' THEN 1 ELSE 0 END) as shipped_count,
-                SUM(CASE WHEN status = 'closed' THEN 1 ELSE 0 END) as closed_count,
-                COUNT(DISTINCT user_id) as unique_clients
-            FROM leads 
-            WHERE created_at >= ? AND created_at <= ?
-        """, (start, end)) as cursor:
-            row = await cursor.fetchone()
-            return {
-                "period": f"{month:02d}.{year}",
-                "start": start,
-                "end": end[:10],
-                **dict(row)
-            }
+        async with self._pool.execute(
+            "SELECT * FROM orders WHERE created_at BETWEEN ? AND ? ORDER BY id",
+            (start, end)
+        ) as cursor:
+            rows = await cursor.fetchall()
+            return [dict(r) for r in rows]
     
-    async def mark_report_sent(self, year: int, month: int, filename: str, total_leads: int):
-        """Отметить что отчет отправлен"""
-        await self._pool.execute("""
-            INSERT INTO monthly_reports (year, month, sent_at, filename, total_leads)
-            VALUES (?, ?, CURRENT_TIMESTAMP, ?, ?)
-        """, (year, month, filename, total_leads))
+    async def report_mark_sent(self, year: int, month: int, filename: str, total_orders: int, total_amount: int):
+        now = datetime.now(Config.TZ).strftime("%Y-%m-%d %H:%M:%S")
+        await self._pool.execute(
+            "INSERT INTO monthly_reports (year, month, sent_at, filename, total_orders, total_amount, status) "
+            "VALUES (?, ?, ?, ?, ?, ?, 'sent')",
+            (year, month, now, filename, total_orders, total_amount)
+        )
         await self._pool.commit()
     
-    async def is_report_sent(self, year: int, month: int) -> bool:
-        """Проверить отправлен ли отчет за месяц"""
-        async with self._pool.execute("""
-            SELECT 1 FROM monthly_reports 
-            WHERE year = ? AND month = ? AND status = 'sent'
-        """, (year, month)) as cursor:
+    async def report_is_sent(self, year: int, month: int) -> bool:
+        async with self._pool.execute(
+            "SELECT 1 FROM monthly_reports WHERE year = ? AND month = ? AND status = 'sent'",
+            (year, month)
+        ) as cursor:
             return await cursor.fetchone() is not None
+    
+    # Stats
+    async def get_stats(self) -> Dict:
+        async with self._pool.execute(
+            "SELECT COUNT(*) as total, "
+            "SUM(CASE WHEN status = 'new' THEN 1 ELSE 0 END) as new, "
+            "SUM(CASE WHEN status = 'processing' THEN 1 ELSE 0 END) as processing, "
+            "SUM(CASE WHEN status = 'delivered' THEN 1 ELSE 0 END) as delivered, "
+            "COUNT(DISTINCT user_id) as unique_users "
+            "FROM orders"
+        ) as cursor:
+            row = await cursor.fetchone()
+            return dict(row) if row else {}
 
-db = Database(Config.DB_PATH)
-
-# =========================
-# BOT SETUP
-# =========================
-bot = Bot(
-    Config.BOT_TOKEN,
-    default=DefaultBotProperties(parse_mode=ParseMode.HTML)
-)
-dp = Dispatcher(storage=MemoryStorage())
+db = Database()
 
 # =========================
 # TEXTS
 # =========================
-def t(key: str, lang: str = "ru", **kwargs) -> str:
-    texts = {
-        "ru": {
-            "welcome": "🤝 <b>ZARY & CO — ОПТОВЫЙ ОТДЕЛ</b>\n\n"
-                      "Работаем с магазинами, бутиками и маркетплейсами.\n"
-                      "• Национальный бренд\n"
-                      "• Стабильные поставки\n"
-                      "• Высокая маржинальность\n\n"
-                      "👇 Выберите действие:",
-            
-            "menu_hint": "📍 Главное меню",
-            
-            "manager": f"📞 <b>Менеджер оптового отдела</b>\n\n"
-                      f"Телефон: <code>{Config.PHONE}</code>\n"
-                      f"Режим работы: Пн-Пт 9:00-18:00",
-            
-            "channel": f"📣 <b>Наш канал с коллекциями</b>\n\n"
-                      f"👉 https://t.me/{Config.CHANNEL}",
-            
-            "catalog": f"📸 <b>Актуальный каталог</b>\n\n"
-                      f"Смотрите в нашем канале:\n"
-                      f"👉 https://t.me/{Config.CHANNEL}",
-            
-            "terms": "🧾 <b>Условия сотрудничества</b>\n\n"
-                    "✅ Форма работы: предзаказ / наличие\n"
-                    "✅ Минимальный заказ: от 20 единиц\n"
-                    "✅ Доставка: по всему Узбекистану\n"
-                    "✅ Оплата: перечисление / наличные",
-            
-            "why": "⭐ <b>Почему выбирают нас</b>\n\n"
-                  "🏆 Опыт: 5+ лет на рынке\n"
-                  "🏭 Производство: собственное в Ташкенте\n"
-                  "📦 Ассортимент: 500+ моделей\n"
-                  "🚚 Логистика: 2-3 дня по всей стране",
-            
-            "min_order": "📦 <b>Минимальный заказ</b>\n\n"
-                        "• Опт: от 20 единиц\n"
-                        "• Крупный опт: от 100 единиц\n"
-                        "• Дропшиппинг: индивидуально\n\n"
-                        "Хотите персональный расчёт?",
-            
-            "min_cta": "✅ Оставить заявку",
-            
-            "form_role": "👤 <b>Кто вы?</b>\n\nВыберите тип бизнеса:",
-            "form_product": "👕 <b>Что хотите заказать?</b>\n\n"
-                           "Выберите или напишите свой вариант:",
-            "form_qty": "📊 <b>Объём заказа?</b>",
-            "form_city": "📍 <b>Город доставки?</b>",
-            "form_phone": "📱 <b>Контактный телефон</b>\n\n"
-                         "Нажмите кнопку «📲 Отправить контакт» или введите вручную:",
-            
-            "bad_phone": "❌ <b>Некорректный номер</b>\n\n"
-                        "Пример: +998901234567",
-            
-            "thanks": lambda lead_id: 
-                     f"✅ <b>Заявка #{lead_id} принята!</b>\n\n"
-                     f"Менеджер свяжется с вами в течение 15 минут.\n\n"
-                     f"📣 https://t.me/{Config.CHANNEL}\n"
-                     f"📞 {Config.PHONE}",
-            
-            "cancelled": "❌ Отменено. Возвращаюсь в меню...",
-            
-            "admin_only": "⛔ Только для администратора.",
-            "admin_menu": "🛠 <b>Панель управления</b>",
-            "admin_last": "📋 <b>Последние заявки</b>\n\n",
-            "admin_empty": "📝 Пока нет заявок.",
-            "admin_export_ok": "✅ Excel сформирован.",
-            "admin_export_fail": "❌ Ошибка при создании файла.",
-            "admin_status_updated": "✅ Статус обновлён.",
-            "admin_status_bad": "❌ Неверная команда.\n\n"
-                               "Используйте: /status ID статус\n\n"
-                               "Статусы: new, work, paid, shipped, closed",
-            
-            "monthly_report_subject": lambda p: f"📊 Отчет за {p}",
-            "monthly_report_intro": lambda s: 
-                f"<b>📊 МЕСЯЧНЫЙ ОТЧЕТ — {s['period']}</b>\n\n"
-                f"📅 Период: {s['start']} — {s['end']}\n"
-                f"📋 Всего заявок: <b>{s['total']}</b>\n"
-                f"👥 Уникальных клиентов: <b>{s['unique_clients']}</b>\n\n"
-                f"<b>Статусы:</b>\n"
-                f"🆕 Новые: {s['new_count']}\n"
-                f"🔧 В работе: {s['work_count']}\n"
-                f"💰 Оплачено: {s['paid_count']}\n"
-                f"🚚 Отправлено: {s['shipped_count']}\n"
-                f"✅ Закрыто: {s['closed_count']}",
-            
-            "error": "⚠️ Ошибка. Попробуйте позже.",
-            "unknown": "🤔 Используйте меню ниже или /start",
-        },
-        
-        "uz": {
-            "welcome": "🤝 <b>ZARY & CO — ULGURJI BO'LIMI</b>\n\n"
-                      "Do'konlar, butiklar va marketplace bilan ishlaymiz.\n"
-                      "• Milliy brend\n"
-                      "• Barqaror yetkazib berish\n"
-                      "• Yuqori marja",
-            
-            "menu_hint": "📍 Asosiy menyu",
-            
-            "manager": f"📞 <b>Ulgurji bo'lim menejeri</b>\n\n"
-                      f"Telefon: <code>{Config.PHONE}</code>\n"
-                      f"Ish vaqti: Du-Ju 9:00-18:00",
-            
-            "channel": f"📣 <b>Bizning kanal</b>\n\n"
-                      f"👉 https://t.me/{Config.CHANNEL}",
-            
-            "catalog": f"📸 <b>Dolzarb katalog</b>\n\n"
-                      f"👉 https://t.me/{Config.CHANNEL}",
-            
-            "terms": "🧾 <b>Hamkorlik shartlari</b>\n\n"
-                    "✅ Ish shakli: oldindan buyurtma / mavjud\n"
-                    "✅ Minimal buyurtma: 20 donadan\n"
-                    "✅ Yetkazib berish: O'zbekiston bo'ylab\n"
-                    "✅ To'lov: o'tkazma / naqd",
-            
-            "why": "⭐ <b>Nega bizni tanlashadi</b>\n\n"
-                  "🏆 Tajriba: 5+ yil\n"
-                  "🏭 Ishlab chiqarish: Toshkentdagi o'zimizniki\n"
-                  "📦 Assortiment: 500+ model\n"
-                  "🚚 Logistika: butun mamlakat bo'ylab 2-3 kun",
-            
-            "min_order": "📦 <b>Minimal buyurtma</b>\n\n"
-                        "• Ulgurji: 20 donadan\n"
-                        "• Katta ulgurji: 100 donadan\n"
-                        "• Dropshipping: alohida\n\n"
-                        "Shaxsiy hisob-kitob xohlaysizmi?",
-            
-            "min_cta": "✅ Ariza qoldirish",
-            
-            "form_role": "👤 <b>Siz kimsiz?</b>",
-            "form_product": "👕 <b>Nima buyurtma qilmoqchisiz?</b>",
-            "form_qty": "📊 <b>Buyurtma hajmi?</b>",
-            "form_city": "📍 <b>Yetkazib berish shahri?</b>",
-            "form_phone": "📱 <b>Aloqa telefoni</b>\n\n"
-                         "«📲 Kontakt yuborish» tugmasini bosing:",
-            
-            "bad_phone": "❌ <b>Noto'g'ri raqam</b>\n\n"
-                        "Misol: +998901234567",
-            
-            "thanks": lambda lead_id: 
-                     f"✅ <b>Ariza #{lead_id} qabul qilindi!</b>\n\n"
-                     f"Menejer 15 daqiqa ichida bog'lanadi.\n\n"
-                     f"📣 https://t.me/{Config.CHANNEL}\n"
-                     f"📞 {Config.PHONE}",
-            
-            "cancelled": "❌ Bekor qilindi. Menyuga qaytish...",
-            
-            "admin_only": "⛔ Faqat admin uchun.",
-            "admin_menu": "🛠 <b>Boshqaruv paneli</b>",
-            "admin_last": "📋 <b>Oxirgi arizalar</b>\n\n",
-            "admin_empty": "📝 Hozircha arizalar yo'q.",
-            "admin_export_ok": "✅ Excel tayyor.",
-            "admin_export_fail": "❌ Fayl yaratishda xatolik.",
-            "admin_status_updated": "✅ Status yangilandi.",
-            "admin_status_bad": "❌ Noto'g'ri buyruq.\n\n"
-                               "Foydalanish: /status ID status\n\n"
-                               "Statuslar: new, work, paid, shipped, closed",
-            
-            "monthly_report_subject": lambda p: f"📊 Hisobot: {p}",
-            "monthly_report_intro": lambda s: 
-                f"<b>📊 OYLIK HISOBOT — {s['period']}</b>\n\n"
-                f"📅 Davr: {s['start']} — {s['end']}\n"
-                f"📋 Jami arizalar: <b>{s['total']}</b>\n"
-                f"👥 Unikal mijozlar: <b>{s['unique_clients']}</b>\n\n"
-                f"<b>Statuslar:</b>\n"
-                f"🆕 Yangi: {s['new_count']}\n"
-                f"🔧 Ishlanmoqda: {s['work_count']}\n"
-                f"💰 To'langan: {s['paid_count']}\n"
-                f"🚚 Yuborilgan: {s['shipped_count']}\n"
-                f"✅ Yopilgan: {s['closed_count']}",
-            
-            "error": "⚠️ Xatolik. Keyinroq urinib ko'ring.",
-            "unknown": "🤔 Quyidagi menyudan foydalaning yoki /start",
-        }
-    }
-    
-    text = texts.get(lang, texts["ru"]).get(key, key)
-    if callable(text):
-        return text(**kwargs)
-    return text
-
-# =========================
-# KEYBOARDS
-# =========================
-class Keyboards:
-    @staticmethod
-    def lang() -> ReplyKeyboardMarkup:
-        return ReplyKeyboardMarkup(
-            keyboard=[
-                [KeyboardButton(text="🇷🇺 Русский"), KeyboardButton(text="🇺🇿 O'zbekcha")]
-            ],
-            resize_keyboard=True,
-            one_time_keyboard=True
-        )
-    
-    @staticmethod
-    def main(lang: str, is_admin: bool) -> ReplyKeyboardMarkup:
-        btn = lambda k: BTN[lang].get(k, k)
-        rows = [
-            [KeyboardButton(text=btn("catalog")), KeyboardButton(text=btn("terms"))],
-            [KeyboardButton(text=btn("why")), KeyboardButton(text=btn("min"))],
-            [KeyboardButton(text=btn("leave"))],
-            [KeyboardButton(text=btn("manager")), KeyboardButton(text=btn("channel"))],
-            [KeyboardButton(text=btn("lang"))],
-        ]
-        if is_admin:
-            rows.append([KeyboardButton(text=btn("admin"))])
-        return ReplyKeyboardMarkup(keyboard=rows, resize_keyboard=True)
-    
-    @staticmethod
-    def form_role(lang: str) -> ReplyKeyboardMarkup:
-        roles = {
-            "uz": [["🏬 Butik", "🏪 Do'kon"], ["📱 Marketplace", "🌐 Boshqa"]],
-            "ru": [["🏬 Бутик", "🏪 Магазин"], ["📱 Маркетплейс", "🌐 Другое"]]
-        }
-        r = roles.get(lang, roles["ru"])
-        return ReplyKeyboardMarkup(
-            keyboard=[
-                [KeyboardButton(text=r[0][0]), KeyboardButton(text=r[0][1])],
-                [KeyboardButton(text=r[1][0]), KeyboardButton(text=r[1][1])],
-                [KeyboardButton(text=BTN[lang]["cancel"])]
-            ],
-            resize_keyboard=True
-        )
-    
-    @staticmethod
-    def form_product(lang: str) -> ReplyKeyboardMarkup:
-        products = {
-            "uz": [["👕 Kiyim", "👖 Shim"], ["🎒 Aksessuar", "👔 Boshqa"]],
-            "ru": [["👕 Одежда", "👖 Брюки"], ["🎒 Аксессуары", "👔 Другое"]]
-        }
-        p = products.get(lang, products["ru"])
-        return ReplyKeyboardMarkup(
-            keyboard=[
-                [KeyboardButton(text=p[0][0]), KeyboardButton(text=p[0][1])],
-                [KeyboardButton(text=p[1][0]), KeyboardButton(text=p[1][1])],
-                [KeyboardButton(text=BTN[lang]["cancel"])]
-            ],
-            resize_keyboard=True
-        )
-    
-    @staticmethod
-    def form_qty(lang: str) -> ReplyKeyboardMarkup:
-        return ReplyKeyboardMarkup(
-            keyboard=[
-                [KeyboardButton(text="20–50"), KeyboardButton(text="50–100")],
-                [KeyboardButton(text="100–300"), KeyboardButton(text="300+")],
-                [KeyboardButton(text=BTN[lang]["cancel"])]
-            ],
-            resize_keyboard=True
-        )
-    
-    @staticmethod
-    def form_phone(lang: str) -> ReplyKeyboardMarkup:
-        return ReplyKeyboardMarkup(
-            keyboard=[
-                [KeyboardButton(text=BTN[lang]["contact"], request_contact=True)],
-                [KeyboardButton(text=BTN[lang]["cancel"])]
-            ],
-            resize_keyboard=True,
-            one_time_keyboard=True
-        )
-    
-    @staticmethod
-    def min_cta(lang: str) -> ReplyKeyboardMarkup:
-        return ReplyKeyboardMarkup(
-            keyboard=[
-                [KeyboardButton(text=t("min_cta", lang))],
-                [KeyboardButton(text=BTN[lang]["cancel"])]
-            ],
-            resize_keyboard=True
-        )
-    
-    @staticmethod
-    def admin(lang: str) -> ReplyKeyboardMarkup:
-        btn = lambda k: BTN[lang].get(k, k)
-        return ReplyKeyboardMarkup(
-            keyboard=[
-                [KeyboardButton(text="📋 " + ("Последние" if lang == "ru" else "Oxirgi")), 
-                 KeyboardButton(text="📊 " + ("Статистика" if lang == "ru" else "Statistika"))],
-                [KeyboardButton(text="📤 Excel"), KeyboardButton(text="ℹ️ Status")],
-                [KeyboardButton(text="⬅️ " + ("Назад" if lang == "ru" else "Orqaga"))]
-            ],
-            resize_keyboard=True
-        )
-
-BTN = {
+TEXT = {
     "ru": {
-        "catalog": "📦 Каталог", "terms": "🧾 Условия", "why": "⭐ Почему мы",
-        "min": "📦 Мин. заказ", "leave": "🤝 Заявка",
-        "manager": "📞 Менеджер", "channel": "📣 Канал", "lang": "🌐 Язык",
-        "admin": "🛠 Админ", "cancel": "❌ Отмена", "contact": "📲 Отправить контакт",
-        "back": "Назад"
+        "welcome": "👋 Добро пожаловать в <b>ZARY & CO</b>!\n\n"
+                  "🧸 Детская одежда премиум качества\n"
+                  "📦 Доставка по всему Узбекистану 1-5 дней\n\n"
+                  "Выберите действие 👇",
+        
+        "menu": "📍 Главное меню",
+        
+        "catalog": "📸 <b>Каталог</b>\n\nВыберите категорию:",
+        "price": "🧾 <b>Прайс-лист</b>\n\nВыберите категорию:",
+        
+        "size": "📏 <b>Подбор размера</b>\n\nВыберите способ:",
+        "size_age": "Введите возраст ребенка (1-15 лет):\nПример: <code>7</code>",
+        "size_height": "Введите рост в см:\nПример: <code>125</code>",
+        "size_result": "📏 Рекомендуемый размер: <b>{size}</b>",
+        
+        "cart": "🛒 <b>Корзина</b>\n\n{items}\n\n💰 Итого: <b>{total} сум</b>",
+        "cart_empty": "🛒 Корзина пуста\n\nДобавьте товары из каталога",
+        "cart_added": "✅ Товар добавлен в корзину",
+        "cart_removed": "❌ Товар удален",
+        
+        "favorites": "❤️ <b>Избранное</b>\n\n{items}",
+        "fav_empty": "❤️ Избранное пусто",
+        "fav_added": "❤️ Добавлено в избранное",
+        "fav_removed": "💔 Удалено из избранного",
+        
+        "delivery": "🚚 <b>Доставка</b>\n\n"
+                   "1. <b>B2B Почта</b> — 2-5 дней, по всему Узбекистану\n"
+                   "2. <b>Яндекс Курьер</b> — 1-3 дня, крупные города\n"
+                   "3. <b>Яндекс ПВЗ</b> — 1-3 дня, пункты выдачи\n\n"
+                   "Стоимость зависит от города и веса",
+        
+        "order_start": "📝 <b>Оформление заказа</b>\n\nВведите ваше имя:",
+        "order_phone": "📱 Отправьте номер телефона:",
+        "order_city": "🏙 Введите город:",
+        "order_delivery": "🚚 Выберите способ доставки:",
+        "order_address": "📍 Введите адрес доставки:",
+        "order_comment": "💬 Комментарий (необязательно):",
+        "order_confirm": "📝 <b>Проверьте заказ:</b>\n\n"
+                        "👤 {name}\n📱 {phone}\n🏙 {city}\n"
+                        "🚚 {delivery}\n📍 {address}\n"
+                        "💬 {comment}\n\n"
+                        "Товары:\n{items}\n\n"
+                        "💰 Итого: {total} сум",
+        "order_success": "✅ Заказ #{order_id} принят!\n\n"
+                        "Менеджер свяжется с вами в течение 15 минут\n"
+                        "Рабочее время: 09:00-21:00",
+        
+        "history": "📜 <b>История заказов</b>\n\n{orders}",
+        "history_empty": "📜 У вас пока нет заказов",
+        
+        "contact": "📞 <b>Контакты</b>\n\n"
+                  "☎️ {phone}\n"
+                  "⏰ Пн-Пт: 09:00-21:00\n"
+                  "📱 @{username}\n\n"
+                  "Или оставьте номер — мы перезвоним",
+        
+        "faq": "❓ <b>Частые вопросы</b>\n\nВыберите тему:",
+        "faq_delivery": "🚚 <b>Доставка</b>\nДоставляем по всему Узбекистану 1-5 дней",
+        "faq_payment": "💳 <b>Оплата</b>\nНаличными курьеру или переводом",
+        "faq_return": "🔄 <b>Возврат</b>\n14 дней при сохранении товарного вида",
+        "faq_size": "📏 <b>Размеры</b>\nИспользуйте подбор размера в боте",
+        
+        "admin_menu": "🛠 <b>Панель администратора</b>\n\nВыберите действие:",
+        "admin_orders": "📋 <b>Заказы</b>\n\n{orders}",
+        "admin_stats": "📊 <b>Статистика</b>\n\n"
+                      "📦 Всего заказов: {total}\n"
+                      "🆕 Новых: {new}\n"
+                      "⚙️ В обработке: {processing}\n"
+                      "✅ Доставлено: {delivered}\n"
+                      "👥 Уникальных клиентов: {unique_users}",
+        
+        "status_new": "🆕 Новый",
+        "status_processing": "⚙️ В обработке",
+        "status_shipped": "🚚 Отправлен",
+        "status_delivered": "✅ Доставлен",
+        "status_cancelled": "❌ Отменен",
+        
+        "error": "⚠️ Произошла ошибка. Попробуйте позже.",
+        "cancelled": "❌ Отменено",
+        "unknown": "🤔 Я не понял. Используйте меню 👇",
     },
+    
     "uz": {
-        "catalog": "📦 Katalog", "terms": "🧾 Shartlar", "why": "⭐ Nega biz",
-        "min": "📦 Min. buyurtma", "leave": "🤝 Ariza",
-        "manager": "📞 Menejer", "channel": "📣 Kanal", "lang": "🌐 Til",
-        "admin": "🛠 Admin", "cancel": "❌ Bekor qilish", "contact": "📲 Kontakt yuborish",
-        "back": "Orqaga"
+        "welcome": "👋 <b>ZARY & CO</b> ga xush kelibsiz!\n\n"
+                  "🧸 Bolalar kiyimi premium sifat\n"
+                  "📦 O'zbekiston bo'ylab yetkazib berish 1-5 kun\n\n"
+                  "Amalni tanlang 👇",
+        
+        "menu": "📍 Asosiy menyu",
+        
+        "catalog": "📸 <b>Katalog</b>\n\nKategoriyani tanlang:",
+        "price": "🧾 <b>Narxlar</b>\n\nKategoriyani tanlang:",
+        
+        "size": "📏 <b>O'lcham tanlash</b>\n\nUsulni tanlang:",
+        "size_age": "Yoshini kiriting (1-15 yosh):\nMisol: <code>7</code>",
+        "size_height": "Bo'yni sm da kiriting:\nMisol: <code>125</code>",
+        "size_result": "📏 Tavsiya etilgan o'lcham: <b>{size}</b>",
+        
+        "cart": "🛒 <b>Savat</b>\n\n{items}\n\n💰 Jami: <b>{total} so'm</b>",
+        "cart_empty": "🛒 Savat bo'sh\n\nKatalogdan mahsulot qo'shing",
+        "cart_added": "✅ Savatga qo'shildi",
+        "cart_removed": "❌ O'chirildi",
+        
+        "favorites": "❤️ <b>Sevimlilar</b>\n\n{items}",
+        "fav_empty": "❤️ Sevimlilar bo'sh",
+        "fav_added": "❤️ Sevimlilarga qo'shildi",
+        "fav_removed": "💔 Sevimlilardan o'chirildi",
+        
+        "delivery": "🚚 <b>Yetkazib berish</b>\n\n"
+                   "1. <b>B2B Pochta</b> — 2-5 kun, O'zbekiston bo'ylab\n"
+                   "2. <b>Yandex Kuryer</b> — 1-3 kun, yirik shaharlarga\n"
+                   "3. <b>Yandex PVZ</b> — 1-3 kun, topshirish punktlari\n\n"
+                   "Narxi shahar va vaznga qarab",
+        
+        "order_start": "📝 <b>Buyurtma berish</b>\n\nIsmingizni kiriting:",
+        "order_phone": "📱 Telefon raqamingizni yuboring:",
+        "order_city": "🏙 Shaharni kiriting:",
+        "order_delivery": "🚚 Yetkazib berish usulini tanlang:",
+        "order_address": "📍 Yetkazib berish manzilini kiriting:",
+        "order_comment": "💬 Izoh (ixtiyoriy):",
+        "order_confirm": "📝 <b>Buyurtmani tekshiring:</b>\n\n"
+                        "👤 {name}\n📱 {phone}\n🏙 {city}\n"
+                        "🚚 {delivery}\n📍 {address}\n"
+                        "💬 {comment}\n\n"
+                        "Tovarlar:\n{items}\n\n"
+                        "💰 Jami: {total} so'm",
+        "order_success": "✅ Buyurtma #{order_id} qabul qilindi!\n\n"
+                        "Menejer 15 daqiqa ichida bog'lanadi\n"
+                        "Ish vaqti: 09:00-21:00",
+        
+        "history": "📜 <b>Buyurtmalar tarixi</b>\n\n{orders}",
+        "history_empty": "📜 Hozircha buyurtmalar yo'q",
+        
+        "contact": "📞 <b>Aloqa</b>\n\n"
+                  "☎️ {phone}\n"
+                  "⏰ Du-Sha: 09:00-21:00\n"
+                  "📱 @{username}\n\n"
+                  "Yoki raqam qoldiring — qo'ng'iroq qilamiz",
+        
+        "faq": "❓ <b>Ko'p so'raladigan savollar</b>\n\nMavzuni tanlang:",
+        "faq_delivery": "🚚 <b>Yetkazib berish</b>\nO'zbekiston bo'ylab 1-5 kun",
+        "faq_payment": "💳 <b>To'lov</b>\nNaqd yoki o'tkazma orqali",
+        "faq_return": "🔄 <b>Qaytarish</b>\n14 kun ichida tovar ko'rinishi saqlangan bo'lsa",
+        "faq_size": "📏 <b>O'lchamlar</b>\nBotdagi o'lcham tanlashdan foydalaning",
+        
+        "admin_menu": "🛠 <b>Admin paneli</b>\n\nAmalni tanlang:",
+        "admin_orders": "📋 <b>Buyurtmalar</b>\n\n{orders}",
+        "admin_stats": "📊 <b>Statistika</b>\n\n"
+                      "📦 Jami buyurtmalar: {total}\n"
+                      "🆕 Yangi: {new}\n"
+                      "⚙️ Ishlanmoqda: {processing}\n"
+                      "✅ Yetkazildi: {delivered}\n"
+                      "👥 Unikal mijozlar: {unique_users}",
+        
+        "status_new": "🆕 Yangi",
+        "status_processing": "⚙️ Ishlanmoqda",
+        "status_shipped": "🚚 Yuborildi",
+        "status_delivered": "✅ Yetkazildi",
+        "status_cancelled": "❌ Bekor qilindi",
+        
+        "error": "⚠️ Xatolik yuz berdi. Keyinroq urinib ko'ring.",
+        "cancelled": "❌ Bekor qilindi",
+        "unknown": "🤔 Tushunmadim. Menyudan foydalaning 👇",
     }
 }
 
 # =========================
+# KEYBOARDS
+# =========================
+def kb_main(lang: str, is_admin: bool = False) -> ReplyKeyboardMarkup:
+    if lang == "uz":
+        rows = [
+            [KeyboardButton(text="📸 Katalog"), KeyboardButton(text="🧾 Narxlar")],
+            [KeyboardButton(text="📏 O'lcham"), KeyboardButton(text="🛒 Savat")],
+            [KeyboardButton(text="❤️ Sevimlilar"), KeyboardButton(text="📜 Buyurtmalar")],
+            [KeyboardButton(text="🚚 Yetkazib berish"), KeyboardButton(text="❓ FAQ")],
+            [KeyboardButton(text="📞 Aloqa"), KeyboardButton(text="✅ Buyurtma")],
+        ]
+        if is_admin:
+            rows.append([KeyboardButton(text="🛠 Admin")])
+    else:
+        rows = [
+            [KeyboardButton(text="📸 Каталог"), KeyboardButton(text="🧾 Прайс")],
+            [KeyboardButton(text="📏 Размер"), KeyboardButton(text="🛒 Корзина")],
+            [KeyboardButton(text="❤️ Избранное"), KeyboardButton(text="📜 История")],
+            [KeyboardButton(text="🚚 Доставка"), KeyboardButton(text="❓ FAQ")],
+            [KeyboardButton(text="📞 Связаться"), KeyboardButton(text="✅ Заказ")],
+        ]
+        if is_admin:
+            rows.append([KeyboardButton(text="🛠 Админ")])
+    
+    return ReplyKeyboardMarkup(keyboard=rows, resize_keyboard=True)
+
+def kb_catalog(lang: str) -> InlineKeyboardMarkup:
+    cats = [
+        [("👶 Мальчики / O'g'il bolalar", "cat:boys"), ("👧 Девочки / Qiz bolalar", "cat:girls")],
+        [("🧒 Унисекс", "cat:unisex"), ("🎒 Школа / Maktab", "cat:school")],
+        [("🔥 Новинки / Yangi", "cat:new"), ("💰 Акции / Aksiya", "cat:sale")],
+    ]
+    buttons = []
+    for row in cats:
+        buttons.append([
+            InlineKeyboardButton(text=row[0][0], callback_data=row[0][1]),
+            InlineKeyboardButton(text=row[1][0], callback_data=row[1][1])
+        ])
+    buttons.append([InlineKeyboardButton(
+        text="⬅️ Назад / Orqaga", callback_data="back:menu"
+    )])
+    return InlineKeyboardMarkup(inline_keyboard=buttons)
+
+def kb_size(lang: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(
+            text="👶 По возрасту / Yosh bo'yicha", callback_data="size:age"
+        )],
+        [InlineKeyboardButton(
+            text="📏 По росту / Bo'y bo'yicha", callback_data="size:height"
+        )],
+        [InlineKeyboardButton(
+            text="⬅️ Назад / Orqaga", callback_data="back:menu"
+        )],
+    ])
+
+def kb_delivery(lang: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(
+            text="📦 B2B Почта", callback_data="delivery:b2b"
+        )],
+        [InlineKeyboardButton(
+            text="🚚 Яндекс Курьер", callback_data="delivery:yandex_courier"
+        )],
+        [InlineKeyboardButton(
+            text="🏪 Яндекс ПВЗ", callback_data="delivery:yandex_pvz"
+        )],
+        [InlineKeyboardButton(
+            text="⬅️ Назад / Orqaga", callback_data="back:menu"
+        )],
+    ])
+
+def kb_cart_items(items: List[Dict], lang: str) -> InlineKeyboardMarkup:
+    buttons = []
+    for item in items:
+        name = item['product_name'][:20]
+        btn_text = f"❌ {name} ({item['qty']}x)" if lang == "ru" else f"❌ {name} ({item['qty']}x)"
+        buttons.append([InlineKeyboardButton(
+            text=btn_text, callback_data=f"cart_remove:{item['id']}"
+        )])
+    
+    buttons.append([InlineKeyboardButton(
+        text="✅ Оформить / Rasmiylashtirish", callback_data="cart:checkout"
+    )])
+    buttons.append([InlineKeyboardButton(
+        text="🧹 Очистить / Tozalash", callback_data="cart:clear"
+    )])
+    buttons.append([InlineKeyboardButton(
+        text="⬅️ Назад / Orqaga", callback_data="back:menu"
+    )])
+    
+    return InlineKeyboardMarkup(inline_keyboard=buttons)
+
+def kb_order_confirm(lang: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(
+            text="✅ Подтвердить / Tasdiqlash", callback_data="order:confirm"
+        )],
+        [InlineKeyboardButton(
+            text="✏️ Изменить / O'zgartirish", callback_data="order:edit"
+        )],
+        [InlineKeyboardButton(
+            text="❌ Отмена / Bekor", callback_data="order:cancel"
+        )],
+    ])
+
+def kb_admin(lang: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(
+            text="📋 Новые заказы / Yangi buyurtmalar", callback_data="admin:new_orders"
+        )],
+        [InlineKeyboardButton(
+            text="⚙️ В обработке / Ishlanmoqda", callback_data="admin:processing"
+        )],
+        [InlineKeyboardButton(
+            text="📊 Статистика / Statistika", callback_data="admin:stats"
+        )],
+        [InlineKeyboardButton(
+            text="📤 Excel отчет / Hisobot", callback_data="admin:export"
+        )],
+        [InlineKeyboardButton(
+            text="⬅️ Назад / Orqaga", callback_data="back:menu"
+        )],
+    ])
+
+def kb_admin_order(order_id: int, lang: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(text="👁 К просмотру", callback_data=f"order_seen:{order_id}"),
+            InlineKeyboardButton(text="⚙️ В работу", callback_data=f"order_process:{order_id}")
+        ],
+        [
+            InlineKeyboardButton(text="🚚 Отправлен", callback_data=f"order_ship:{order_id}"),
+            InlineKeyboardButton(text="✅ Доставлен", callback_data=f"order_deliver:{order_id}")
+        ],
+        [
+            InlineKeyboardButton(text="❌ Отмена", callback_data=f"order_cancel:{order_id}")
+        ],
+    ])
+
+def kb_faq(lang: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(
+            text="🚚 Доставка / Yetkazib berish", callback_data="faq:delivery"
+        )],
+        [InlineKeyboardButton(
+            text="💳 Оплата / To'lov", callback_data="faq:payment"
+        )],
+        [InlineKeyboardButton(
+            text="🔄 Возврат / Qaytarish", callback_data="faq:return"
+        )],
+        [InlineKeyboardButton(
+            text="📏 Размеры / O'lchamlar", callback_data="faq:size"
+        )],
+        [InlineKeyboardButton(
+            text="⬅️ Назад / Orqaga", callback_data="back:menu"
+        )],
+    ])
+
+def kb_contact(lang: str) -> ReplyKeyboardMarkup:
+    if lang == "uz":
+        btn = KeyboardButton(text="📱 Raqamni yuborish", request_contact=True)
+        cancel = KeyboardButton(text="❌ Bekor qilish")
+    else:
+        btn = KeyboardButton(text="📱 Отправить номер", request_contact=True)
+        cancel = KeyboardButton(text="❌ Отмена")
+    return ReplyKeyboardMarkup(keyboard=[[btn], [cancel]], resize_keyboard=True, one_time_keyboard=True)
+
+def kb_channel() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="📣 Канал / Kanal", url=Config.TELEGRAM_CHANNEL_URL)],
+        [InlineKeyboardButton(text="⬅️ Меню / Menyu", callback_data="back:menu")],
+    ])
+
+# =========================
 # HELPERS
 # =========================
-def auto_lang(code: Optional[str]) -> str:
-    return "uz" if (code or "").lower().startswith("uz") else "ru"
-
-async def get_user_lang(message: Message) -> str:
-    stored = await db.get_lang(message.from_user.id)
-    if stored:
-        return stored
-    lang = auto_lang(message.from_user.language_code)
-    await db.set_lang(message.from_user.id, lang)
-    return lang
+def esc(s: str) -> str:
+    return html.escape(str(s) if s else "")
 
 def is_admin(user_id: int) -> bool:
-    return user_id == Config.MANAGER_ID
+    return user_id in Config.ADMIN_IDS
 
-def normalize_phone(raw: str) -> str:
-    if not raw:
-        return ""
-    s = re.sub(r"[^\d+]", "", raw.strip())
-    if s.startswith("998") and not s.startswith("+998"):
-        s = "+" + s
-    elif s.startswith("9") and len(s) == 9:
-        s = "+998" + s
-    elif s.startswith("9") and len(s) == 12:
-        s = "+998" + s[3:]
-    return s
+def format_price(price: int) -> str:
+    return f"{price:,}".replace(",", " ")
 
-def is_valid_phone(phone: str) -> bool:
-    p = normalize_phone(phone)
-    if not p.startswith("+998"):
-        return False
-    digits = re.sub(r"\D", "", p)
-    return len(digits) == 12 and digits[3:4] in "913"
+def size_by_age(age: int) -> str:
+    mapping = {
+        1: "86", 2: "92", 3: "98", 4: "104", 5: "110",
+        6: "116", 7: "122", 8: "128", 9: "134", 10: "140",
+        11: "146", 12: "152", 13: "158", 14: "164", 15: "164"
+    }
+    return mapping.get(age, "122-128")
+
+def size_by_height(height: int) -> str:
+    sizes = [86, 92, 98, 104, 110, 116, 122, 128, 134, 140, 146, 152, 158, 164]
+    closest = min(sizes, key=lambda x: abs(x - height))
+    return str(closest)
+
+def now_str() -> str:
+    return datetime.now(Config.TZ).strftime("%Y-%m-%d %H:%M:%S")
 
 # =========================
 # FSM STATES
 # =========================
-class Form(StatesGroup):
-    role = State()
-    product = State()
-    qty = State()
-    city = State()
-    phone = State()
+class States(StatesGroup):
+    size_age = State()
+    size_height = State()
+    
+    order_name = State()
+    order_phone = State()
+    order_city = State()
+    order_delivery = State()
+    order_address = State()
+    order_comment = State()
+    order_confirm = State()
+
+# =========================
+# BOT INIT
+# =========================
+bot = Bot(token=Config.BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
+dp = Dispatcher(storage=MemoryStorage())
 
 # =========================
 # HANDLERS
@@ -641,495 +812,657 @@ class Form(StatesGroup):
 @dp.message(CommandStart())
 async def cmd_start(message: Message, state: FSMContext):
     await state.clear()
-    lang = await get_user_lang(message)
-    await db.log_activity(message.from_user.id, "start", f"lang: {lang}")
-    await message.answer(t("welcome", lang))
-    await message.answer(t("menu_hint", lang), reply_markup=Keyboards.main(lang, is_admin(message.from_user.id)))
+    
+    user_id = message.from_user.id
+    username = message.from_user.username or ""
+    lang = "uz" if message.from_user.language_code == "uz" else "ru"
+    
+    await db.user_upsert(user_id, username, lang)
+    
+    await message.answer(TEXT[lang]["welcome"], reply_markup=kb_main(lang, is_admin(user_id)))
+    await message.answer(TEXT[lang]["menu"], reply_markup=kb_main(lang, is_admin(user_id)))
 
-@dp.message(F.text.in_(["🇷🇺 Русский", "🇺🇿 O'zbekcha"]))
-async def set_lang(message: Message, state: FSMContext):
+@dp.message(F.text.in_(["🌐 Til", "🌐 Язык"]))
+async def cmd_lang(message: Message, state: FSMContext):
+    user = await db.user_get(message.from_user.id)
+    lang = "uz" if user and user['lang'] == "ru" else "ru"
+    await db.user_upsert(message.from_user.id, message.from_user.username or "", lang)
+    await message.answer(TEXT[lang]["welcome"], reply_markup=kb_main(lang, is_admin(message.from_user.id)))
+
+@dp.callback_query(F.data == "back:menu")
+async def back_menu(call: CallbackQuery, state: FSMContext):
     await state.clear()
-    lang = "ru" if "Русский" in message.text else "uz"
-    await db.set_lang(message.from_user.id, lang)
-    await db.log_activity(message.from_user.id, "set_lang", lang)
-    await message.answer(t("welcome", lang))
-    await message.answer(t("menu_hint", lang), reply_markup=Keyboards.main(lang, is_admin(message.from_user.id)))
+    user = await db.user_get(call.from_user.id)
+    lang = user['lang'] if user else "ru"
+    await call.message.answer(TEXT[lang]["menu"], reply_markup=kb_main(lang, is_admin(call.from_user.id)))
+    await call.answer()
 
-@dp.message(lambda m: m.text in {BTN["ru"]["lang"], BTN["uz"]["lang"]})
-async def change_lang(message: Message, state: FSMContext):
-    await state.clear()
-    lang = await get_user_lang(message)
-    await message.answer(t("choose_lang", lang), reply_markup=Keyboards.lang())
+# Catalog
+@dp.message(F.text.in_(["📸 Каталог", "📸 Katalog"]))
+async def cmd_catalog(message: Message, state: FSMContext):
+    user = await db.user_get(message.from_user.id)
+    lang = user['lang'] if user else "ru"
+    await message.answer(TEXT[lang]["catalog"], reply_markup=kb_catalog(lang))
 
-# Menu handlers
-@dp.message(lambda m: m.text in {BTN["ru"]["manager"], BTN["uz"]["manager"]})
-async def menu_manager(message: Message, state: FSMContext):
-    await state.clear()
-    lang = await get_user_lang(message)
-    await db.log_activity(message.from_user.id, "view_manager")
-    await message.answer(t("manager", lang), reply_markup=Keyboards.main(lang, is_admin(message.from_user.id)))
+@dp.callback_query(F.data.startswith("cat:"))
+async def cat_select(call: CallbackQuery, state: FSMContext):
+    user = await db.user_get(call.from_user.id)
+    lang = user['lang'] if user else "ru"
+    cat = call.data.split(":")[1]
+    # Здесь должна быть логика показа товаров
+    await call.answer(f"Категория: {cat}")
 
-@dp.message(lambda m: m.text in {BTN["ru"]["channel"], BTN["uz"]["channel"]})
-async def menu_channel(message: Message, state: FSMContext):
-    await state.clear()
-    lang = await get_user_lang(message)
-    await db.log_activity(message.from_user.id, "view_channel")
-    await message.answer(t("channel", lang), reply_markup=Keyboards.main(lang, is_admin(message.from_user.id)))
+# Price
+@dp.message(F.text.in_(["🧾 Прайс", "🧾 Narxlar"]))
+async def cmd_price(message: Message, state: FSMContext):
+    user = await db.user_get(message.from_user.id)
+    lang = user['lang'] if user else "ru"
+    await message.answer(TEXT[lang]["price"], reply_markup=kb_catalog(lang))
 
-@dp.message(lambda m: m.text in {BTN["ru"]["catalog"], BTN["uz"]["catalog"]})
-async def menu_catalog(message: Message, state: FSMContext):
-    await state.clear()
-    lang = await get_user_lang(message)
-    await db.log_activity(message.from_user.id, "view_catalog")
-    await message.answer(t("catalog", lang), reply_markup=Keyboards.main(lang, is_admin(message.from_user.id)))
+# Size
+@dp.message(F.text.in_(["📏 Размер", "📏 O'lcham"]))
+async def cmd_size(message: Message, state: FSMContext):
+    user = await db.user_get(message.from_user.id)
+    lang = user['lang'] if user else "ru"
+    await message.answer(TEXT[lang]["size"], reply_markup=kb_size(lang))
 
-@dp.message(lambda m: m.text in {BTN["ru"]["terms"], BTN["uz"]["terms"]})
-async def menu_terms(message: Message, state: FSMContext):
-    await state.clear()
-    lang = await get_user_lang(message)
-    await db.log_activity(message.from_user.id, "view_terms")
-    await message.answer(t("terms", lang), reply_markup=Keyboards.main(lang, is_admin(message.from_user.id)))
+@dp.callback_query(F.data.startswith("size:"))
+async def size_select(call: CallbackQuery, state: FSMContext):
+    user = await db.user_get(call.from_user.id)
+    lang = user['lang'] if user else "ru"
+    mode = call.data.split(":")[1]
+    
+    if mode == "age":
+        await state.set_state(States.size_age)
+        await call.message.answer(TEXT[lang]["size_age"])
+    else:
+        await state.set_state(States.size_height)
+        await call.message.answer(TEXT[lang]["size_height"])
+    await call.answer()
 
-@dp.message(lambda m: m.text in {BTN["ru"]["why"], BTN["uz"]["why"]})
-async def menu_why(message: Message, state: FSMContext):
-    await state.clear()
-    lang = await get_user_lang(message)
-    await db.log_activity(message.from_user.id, "view_why")
-    await message.answer(t("why", lang), reply_markup=Keyboards.main(lang, is_admin(message.from_user.id)))
-
-@dp.message(lambda m: m.text in {BTN["ru"]["min"], BTN["uz"]["min"]})
-async def menu_min(message: Message, state: FSMContext):
-    await state.clear()
-    lang = await get_user_lang(message)
-    await db.log_activity(message.from_user.id, "view_min_order")
-    await message.answer(t("min_order", lang), reply_markup=Keyboards.min_cta(lang))
-
-# Form handlers
-@dp.message(lambda m: m.text in {BTN["ru"]["leave"], BTN["uz"]["leave"], t("min_cta", "ru"), t("min_cta", "uz")})
-async def form_start(message: Message, state: FSMContext):
-    lang = await get_user_lang(message)
-    await state.set_state(Form.role)
-    await db.log_activity(message.from_user.id, "start_form")
-    await message.answer(t("form_role", lang), reply_markup=Keyboards.form_role(lang))
-
-@dp.message(Form.role)
-async def form_role(message: Message, state: FSMContext):
-    lang = await get_user_lang(message)
-    text = (message.text or "").strip()
-    if text in {BTN["ru"]["cancel"], BTN["uz"]["cancel"]}:
-        await cancel_handler(message, state)
+@dp.message(States.size_age)
+async def size_age_input(message: Message, state: FSMContext):
+    user = await db.user_get(message.from_user.id)
+    lang = user['lang'] if user else "ru"
+    
+    if not message.text or not message.text.isdigit():
+        await message.answer(TEXT[lang]["size_age"])
         return
-    await state.update_data(role=text)
-    await state.set_state(Form.product)
-    await message.answer(t("form_product", lang), reply_markup=Keyboards.form_product(lang))
-
-@dp.message(Form.product)
-async def form_product(message: Message, state: FSMContext):
-    lang = await get_user_lang(message)
-    text = (message.text or "").strip()
-    if text in {BTN["ru"]["cancel"], BTN["uz"]["cancel"]}:
-        await cancel_handler(message, state)
+    
+    age = int(message.text)
+    if not 1 <= age <= 15:
+        await message.answer(TEXT[lang]["size_age"])
         return
-    await state.update_data(product=text)
-    await state.set_state(Form.qty)
-    await message.answer(t("form_qty", lang), reply_markup=Keyboards.form_qty(lang))
+    
+    size = size_by_age(age)
+    await message.answer(TEXT[lang]["size_result"].format(size=size), reply_markup=kb_main(lang))
+    await state.clear()
 
-@dp.message(Form.qty)
-async def form_qty(message: Message, state: FSMContext):
-    lang = await get_user_lang(message)
-    text = (message.text or "").strip()
-    if text in {BTN["ru"]["cancel"], BTN["uz"]["cancel"]}:
-        await cancel_handler(message, state)
+@dp.message(States.size_height)
+async def size_height_input(message: Message, state: FSMContext):
+    user = await db.user_get(message.from_user.id)
+    lang = user['lang'] if user else "ru"
+    
+    if not message.text or not message.text.isdigit():
+        await message.answer(TEXT[lang]["size_height"])
         return
-    await state.update_data(qty=text)
-    await state.set_state(Form.city)
-    await message.answer(t("form_city", lang), reply_markup=ReplyKeyboardMarkup(
-        keyboard=[[KeyboardButton(text=BTN[lang]["cancel"])]],
+    
+    height = int(message.text)
+    if not 50 <= height <= 180:
+        await message.answer(TEXT[lang]["size_height"])
+        return
+    
+    size = size_by_height(height)
+    await message.answer(TEXT[lang]["size_result"].format(size=size), reply_markup=kb_main(lang))
+    await state.clear()
+
+# Cart
+@dp.message(F.text.in_(["🛒 Корзина", "🛒 Savat"]))
+async def cmd_cart(message: Message, state: FSMContext):
+    user = await db.user_get(message.from_user.id)
+    lang = user['lang'] if user else "ru"
+    
+    items = await db.cart_get(message.from_user.id)
+    
+    if not items:
+        await message.answer(TEXT[lang]["cart_empty"], reply_markup=kb_main(lang))
+        return
+    
+    items_text = "\n".join([f"• {esc(it['product_name'])} x{it['qty']}" for it in items])
+    total = sum(it['qty'] * 100000 for it in items)  # Заглушка для цены
+    
+    text = TEXT[lang]["cart"].format(items=items_text, total=format_price(total))
+    await message.answer(text, reply_markup=kb_cart_items(items, lang))
+
+@dp.callback_query(F.data.startswith("cart_remove:"))
+async def cart_remove(call: CallbackQuery, state: FSMContext):
+    cart_id = int(call.data.split(":")[1])
+    await db.cart_remove_item(cart_id)
+    
+    user = await db.user_get(call.from_user.id)
+    lang = user['lang'] if user else "ru"
+    
+    items = await db.cart_get(call.from_user.id)
+    if not items:
+        await call.message.edit_text(TEXT[lang]["cart_empty"])
+    else:
+        items_text = "\n".join([f"• {esc(it['product_name'])} x{it['qty']}" for it in items])
+        total = sum(it['qty'] * 100000 for it in items)
+        text = TEXT[lang]["cart"].format(items=items_text, total=format_price(total))
+        await call.message.edit_text(text, reply_markup=kb_cart_items(items, lang))
+    
+    await call.answer(TEXT[lang]["cart_removed"])
+
+@dp.callback_query(F.data == "cart:clear")
+async def cart_clear(call: CallbackQuery, state: FSMContext):
+    await db.cart_clear(call.from_user.id)
+    user = await db.user_get(call.from_user.id)
+    lang = user['lang'] if user else "ru"
+    await call.message.edit_text(TEXT[lang]["cart_empty"])
+    await call.answer()
+
+# Favorites
+@dp.message(F.text.in_(["❤️ Избранное", "❤️ Sevimlilar"]))
+async def cmd_favorites(message: Message, state: FSMContext):
+    user = await db.user_get(message.from_user.id)
+    lang = user['lang'] if user else "ru"
+    
+    favs = await db.favorites_get(message.from_user.id)
+    if not favs:
+        await message.answer(TEXT[lang]["fav_empty"], reply_markup=kb_main(lang))
+        return
+    
+    # Показать избранное
+    await message.answer(TEXT[lang]["favorites"].format(items="..."))
+
+# Delivery
+@dp.message(F.text.in_(["🚚 Доставка", "🚚 Yetkazib berish"]))
+async def cmd_delivery(message: Message, state: FSMContext):
+    user = await db.user_get(message.from_user.id)
+    lang = user['lang'] if user else "ru"
+    await message.answer(TEXT[lang]["delivery"], reply_markup=kb_delivery(lang))
+
+# FAQ
+@dp.message(F.text.in_(["❓ FAQ"]))
+async def cmd_faq(message: Message, state: FSMContext):
+    user = await db.user_get(message.from_user.id)
+    lang = user['lang'] if user else "ru"
+    await message.answer(TEXT[lang]["faq"], reply_markup=kb_faq(lang))
+
+@dp.callback_query(F.data.startswith("faq:"))
+async def faq_answer(call: CallbackQuery, state: FSMContext):
+    user = await db.user_get(call.from_user.id)
+    lang = user['lang'] if user else "ru"
+    topic = call.data.split(":")[1]
+    
+    answers = {
+        "delivery": TEXT[lang]["faq_delivery"],
+        "payment": TEXT[lang]["faq_payment"],
+        "return": TEXT[lang]["faq_return"],
+        "size": TEXT[lang]["faq_size"],
+    }
+    
+    await call.message.answer(answers.get(topic, TEXT[lang]["unknown"]), reply_markup=kb_faq(lang))
+    await call.answer()
+
+# Contact
+@dp.message(F.text.in_(["📞 Связаться", "📞 Aloqa"]))
+async def cmd_contact(message: Message, state: FSMContext):
+    user = await db.user_get(message.from_user.id)
+    lang = user['lang'] if user else "ru"
+    
+    text = TEXT[lang]["contact"].format(
+        phone=Config.PHONE,
+        username=Config.MANAGER_USERNAME or "zaryco_official"
+    )
+    await message.answer(text, reply_markup=kb_contact(lang))
+
+# Order flow
+@dp.message(F.text.in_(["✅ Заказ", "✅ Buyurtma"]))
+async def cmd_order(message: Message, state: FSMContext):
+    user = await db.user_get(message.from_user.id)
+    lang = user['lang'] if user else "ru"
+    
+    # Проверить корзину
+    cart = await db.cart_get(message.from_user.id)
+    if not cart:
+        await message.answer("Сначала добавьте товары в корзину!" if lang == "ru" else "Avval savatga qo'shing!")
+        return
+    
+    await state.set_state(States.order_name)
+    await message.answer(TEXT[lang]["order_start"])
+
+@dp.message(States.order_name)
+async def order_name(message: Message, state: FSMContext):
+    user = await db.user_get(message.from_user.id)
+    lang = user['lang'] if user else "ru"
+    
+    if not message.text:
+        await message.answer(TEXT[lang]["order_start"])
+        return
+    
+    await state.update_data(name=message.text)
+    await state.set_state(States.order_phone)
+    await message.answer(TEXT[lang]["order_phone"], reply_markup=kb_contact(lang))
+
+@dp.message(States.order_phone)
+async def order_phone(message: Message, state: FSMContext):
+    user = await db.user_get(message.from_user.id)
+    lang = user['lang'] if user else "ru"
+    
+    phone = message.contact.phone_number if message.contact else message.text
+    if not phone:
+        await message.answer(TEXT[lang]["order_phone"], reply_markup=kb_contact(lang))
+        return
+    
+    await state.update_data(phone=phone)
+    await state.set_state(States.order_city)
+    await message.answer(TEXT[lang]["order_city"], reply_markup=ReplyKeyboardMarkup(
+        keyboard=[[KeyboardButton(text="❌ Отмена" if lang == "ru" else "❌ Bekor qilish")]],
         resize_keyboard=True
     ))
 
-@dp.message(Form.city)
-async def form_city(message: Message, state: FSMContext):
-    lang = await get_user_lang(message)
-    text = (message.text or "").strip()
-    if text in {BTN["ru"]["cancel"], BTN["uz"]["cancel"]}:
-        await cancel_handler(message, state)
+@dp.message(States.order_city)
+async def order_city(message: Message, state: FSMContext):
+    user = await db.user_get(message.from_user.id)
+    lang = user['lang'] if user else "ru"
+    
+    if not message.text:
+        await message.answer(TEXT[lang]["order_city"])
         return
-    await state.update_data(city=text)
-    await state.set_state(Form.phone)
-    await message.answer(t("form_phone", lang), reply_markup=Keyboards.form_phone(lang))
+    
+    await state.update_data(city=message.text)
+    await state.set_state(States.order_delivery)
+    await message.answer(TEXT[lang]["order_delivery"], reply_markup=kb_delivery(lang))
 
-@dp.message(Form.phone)
-async def form_phone(message: Message, state: FSMContext):
-    lang = await get_user_lang(message)
+@dp.callback_query(F.data.startswith("delivery:"))
+async def order_delivery(call: CallbackQuery, state: FSMContext):
+    delivery_type = call.data.split(":")[1]
+    await state.update_data(delivery=delivery_type)
     
-    if (message.text or "").strip() in {BTN["ru"]["cancel"], BTN["uz"]["cancel"]}:
-        await cancel_handler(message, state)
+    user = await db.user_get(call.from_user.id)
+    lang = user['lang'] if user else "ru"
+    
+    await state.set_state(States.order_address)
+    await call.message.answer(TEXT[lang]["order_address"])
+    await call.answer()
+
+@dp.message(States.order_address)
+async def order_address(message: Message, state: FSMContext):
+    user = await db.user_get(message.from_user.id)
+    lang = user['lang'] if user else "ru"
+    
+    if not message.text:
+        await message.answer(TEXT[lang]["order_address"])
         return
     
-    raw_phone = ""
-    if message.contact:
-        raw_phone = message.contact.phone_number
-    else:
-        raw_phone = (message.text or "").strip()
+    await state.update_data(address=message.text)
+    await state.set_state(States.order_comment)
+    await message.answer(TEXT[lang]["order_comment"], reply_markup=ReplyKeyboardMarkup(
+        keyboard=[
+            [KeyboardButton(text="Пропустить" if lang == "ru" else "O'tkazib yuborish")],
+            [KeyboardButton(text="❌ Отмена" if lang == "ru" else "❌ Bekor qilish")]
+        ],
+        resize_keyboard=True
+    ))
+
+@dp.message(States.order_comment)
+async def order_comment(message: Message, state: FSMContext):
+    user = await db.user_get(message.from_user.id)
+    lang = user['lang'] if user else "ru"
     
-    phone = normalize_phone(raw_phone)
-    if not is_valid_phone(phone):
-        await message.answer(t("bad_phone", lang))
-        return
+    comment = message.text if message.text not in ["Пропустить", "O'tkazib yuborish"] else ""
+    await state.update_data(comment=comment)
     
     data = await state.get_data()
-    user = message.from_user
+    cart = await db.cart_get(message.from_user.id)
     
-    lead = {
-        "created_at": datetime.now().isoformat(timespec="seconds"),
-        "user_id": user.id,
-        "username": user.username,
-        "full_name": user.full_name,
-        "lang": lang,
-        "role": data.get("role", "-"),
-        "product": data.get("product", "-"),
-        "qty": data.get("qty", "-"),
-        "city": data.get("city", "-"),
-        "phone": phone,
+    items_text = "\n".join([f"• {esc(it['product_name'])} x{it['qty']}" for it in cart])
+    total = sum(it['qty'] * 100000 for it in cart)  # Заглушка
+    
+    delivery_names = {
+        "b2b": "B2B Почта",
+        "yandex_courier": "Яндекс Курьер",
+        "yandex_pvz": "Яндекс ПВЗ"
     }
     
-    try:
-        lead_id = await db.add_lead(lead)
-        await db.log_activity(user.id, "lead_created", f"lead_id: {lead_id}")
-        await notify_manager(lead, lead_id, lang)
-        await message.answer(t("thanks", lang, lead_id=lead_id), 
-                           reply_markup=Keyboards.main(lang, is_admin(user.id)))
-    except Exception as e:
-        logger.exception("Failed to save lead")
-        await message.answer(t("error", lang))
-    
-    await state.clear()
-
-async def notify_manager(lead: dict, lead_id: int, client_lang: str):
-    lang_label = "🇷🇺 RU" if client_lang == "ru" else "🇺🇿 UZ"
-    msg = (
-        f"🔔 <b>Новая заявка #{lead_id}</b> {lang_label}\n\n"
-        f"👤 {lead['full_name']}\n"
-        f"📱 <code>{lead['phone']}</code>\n"
-        f"🏢 {lead['role']} | {lead['product']} | {lead['qty']}\n"
-        f"📍 {lead['city']}\n"
-        f"⏰ {lead['created_at']}\n\n"
-        f"👤 @{lead['username'] or 'нет'}\n"
-        f"🆔 <code>{lead['user_id']}</code>\n"
-        f"📋 /status {lead_id} work"
+    text = TEXT[lang]["order_confirm"].format(
+        name=esc(data['name']),
+        phone=esc(data['phone']),
+        city=esc(data['city']),
+        delivery=delivery_names.get(data['delivery'], data['delivery']),
+        address=esc(data['address']),
+        comment=esc(data.get('comment', '—')),
+        items=items_text,
+        total=format_price(total)
     )
-    try:
-        await bot.send_message(Config.MANAGER_ID, msg)
-        await db.update_notification_status(lead_id, True)
-    except TelegramAPIError as e:
-        logger.error(f"Failed to notify manager: {e}")
-        await db.log_activity(lead['user_id'], "notify_failed", str(e))
+    
+    await state.set_state(States.order_confirm)
+    await message.answer(text, reply_markup=kb_order_confirm(lang))
 
-async def cancel_handler(message: Message, state: FSMContext):
+@dp.callback_query(F.data == "order:confirm", States.order_confirm)
+async def order_confirm(call: CallbackQuery, state: FSMContext):
+    user = await db.user_get(call.from_user.id)
+    lang = user['lang'] if user else "ru"
+    data = await state.get_data()
+    
+    cart = await db.cart_get(call.from_user.id)
+    items_json = str([{"name": it['product_name'], "qty": it['qty']} for it in cart])
+    total = sum(it['qty'] * 100000 for it in cart)
+    
+    order_data = {
+        'user_id': call.from_user.id,
+        'username': call.from_user.username or "",
+        'name': data['name'],
+        'phone': data['phone'],
+        'city': data['city'],
+        'items': items_json,
+        'total_amount': total,
+        'delivery_type': data['delivery'],
+        'delivery_address': data['address'],
+        'comment': data.get('comment', ''),
+        'promo_code': '',
+        'discount_percent': 0
+    }
+    
+    order_id = await db.order_create(order_data)
+    
+    # Уведомить админов
+    for admin_id in Config.ADMIN_IDS:
+        try:
+            await bot.send_message(
+                admin_id,
+                f"🆕 Новый заказ #{order_id}\n\n"
+                f"👤 {esc(data['name'])}\n"
+                f"📱 {esc(data['phone'])}\n"
+                f"🏙 {esc(data['city'])}\n"
+                f"💰 {format_price(total)} сум",
+                reply_markup=kb_admin_order(order_id, "ru")
+            )
+        except Exception as e:
+            print(f"Failed to notify admin {admin_id}: {e}")
+    
+    await db.cart_clear(call.from_user.id)
     await state.clear()
-    lang = await get_user_lang(message)
-    await message.answer(t("cancelled", lang), 
-                       reply_markup=Keyboards.main(lang, is_admin(message.from_user.id)))
+    
+    await call.message.answer(TEXT[lang]["order_success"].format(order_id=order_id), reply_markup=kb_main(lang))
+    await call.answer()
 
-@dp.message(lambda m: m.text in {BTN["ru"]["cancel"], BTN["uz"]["cancel"]})
-async def cmd_cancel(message: Message, state: FSMContext):
-    await cancel_handler(message, state)
+# History
+@dp.message(F.text.in_(["📜 История", "📜 Buyurtmalar"]))
+async def cmd_history(message: Message, state: FSMContext):
+    user = await db.user_get(message.from_user.id)
+    lang = user['lang'] if user else "ru"
+    
+    # Получить заказы пользователя
+    orders = []  # Заглушка - нужно добавить метод в БД
+    
+    if not orders:
+        await message.answer(TEXT[lang]["history_empty"], reply_markup=kb_main(lang))
+        return
+
+# Admin panel
+@dp.message(F.text.in_(["🛠 Админ", "🛠 Admin"]))
+async def cmd_admin(message: Message, state: FSMContext):
+    if not is_admin(message.from_user.id):
+        return
+    
+    user = await db.user_get(message.from_user.id)
+    lang = user['lang'] if user else "ru"
+    
+    await message.answer(TEXT[lang]["admin_menu"], reply_markup=kb_admin(lang))
+
+@dp.callback_query(F.data.startswith("admin:"))
+async def admin_action(call: CallbackQuery, state: FSMContext):
+    if not is_admin(call.from_user.id):
+        await call.answer("Access denied")
+        return
+    
+    action = call.data.split(":")[1]
+    user = await db.user_get(call.from_user.id)
+    lang = user['lang'] if user else "ru"
+    
+    if action == "stats":
+        stats = await db.get_stats()
+        text = TEXT[lang]["admin_stats"].format(**stats)
+        await call.message.answer(text, reply_markup=kb_admin(lang))
+    
+    elif action == "new_orders":
+        orders = await db.orders_get_by_status("new")
+        if not orders:
+            await call.message.answer("Нет новых заказов")
+        else:
+            for order in orders[:5]:
+                text = f"🆕 Заказ #{order['id']}\n👤 {esc(order['name'])}\n📱 {esc(order['phone'])}"
+                await call.message.answer(text, reply_markup=kb_admin_order(order['id'], lang))
+    
+    await call.answer()
+
+# Order status management
+@dp.callback_query(F.data.startswith("order_seen:"))
+async def order_seen(call: CallbackQuery, state: FSMContext):
+    if not is_admin(call.from_user.id):
+        return
+    
+    order_id = int(call.data.split(":")[1])
+    await db.order_mark_seen(order_id, call.from_user.id)
+    await call.answer("Отмечено как просмотренное")
+
+@dp.callback_query(F.data.startswith("order_process:"))
+async def order_process(call: CallbackQuery, state: FSMContext):
+    if not is_admin(call.from_user.id):
+        return
+    
+    order_id = int(call.data.split(":")[1])
+    await db.order_update_status(order_id, "processing", call.from_user.id)
+    
+    # Уведомить клиента
+    order = await db.order_get(order_id)
+    if order:
+        user = await db.user_get(order['user_id'])
+        lang = user['lang'] if user else "ru"
+        try:
+            await bot.send_message(
+                order['user_id'],
+                f"⚙️ Заказ #{order_id} в обработке!\n\n"
+                f"Менеджер скоро свяжется с вами.",
+                reply_markup=kb_main(lang)
+            )
+        except Exception as e:
+            print(f"Failed to notify user: {e}")
+    
+    await call.answer("Статус обновлен")
+
+@dp.callback_query(F.data.startswith("order_ship:"))
+async def order_ship(call: CallbackQuery, state: FSMContext):
+    if not is_admin(call.from_user.id):
+        return
+    
+    order_id = int(call.data.split(":")[1])
+    await db.order_update_status(order_id, "shipped", call.from_user.id)
+    await call.answer("Отмечено как отправлено")
+
+@dp.callback_query(F.data.startswith("order_deliver:"))
+async def order_deliver(call: CallbackQuery, state: FSMContext):
+    if not is_admin(call.from_user.id):
+        return
+    
+    order_id = int(call.data.split(":")[1])
+    await db.order_update_status(order_id, "delivered", call.from_user.id)
+    await call.answer("Отмечено как доставлено")
+
+@dp.callback_query(F.data.startswith("order_cancel:"))
+async def order_cancel(call: CallbackQuery, state: FSMContext):
+    if not is_admin(call.from_user.id):
+        return
+    
+    order_id = int(call.data.split(":")[1])
+    await db.order_update_status(order_id, "cancelled", call.from_user.id)
+    await call.answer("Заказ отменен")
 
 # =========================
-# ADMIN HANDLERS
+# MONTHLY REPORT
 # =========================
-@dp.message(lambda m: m.text in {BTN["ru"]["admin"], BTN["uz"]["admin"]})
-async def admin_menu(message: Message, state: FSMContext):
-    await state.clear()
-    if not is_admin(message.from_user.id):
-        lang = await get_user_lang(message)
-        await message.answer(t("admin_only", lang))
-        return
-    lang = await get_user_lang(message)
-    await message.answer(t("admin_menu", lang), reply_markup=Keyboards.admin(lang))
-
-@dp.message(lambda m: m.text.startswith("📋"))
-async def admin_last(message: Message, state: FSMContext):
-    await state.clear()
-    if not is_admin(message.from_user.id):
-        return
-    lang = await get_user_lang(message)
-    rows = await db.get_last_leads(20)
-    if not rows:
-        await message.answer(t("admin_empty", lang), reply_markup=Keyboards.admin(lang))
+async def send_monthly_report():
+    """Отправить отчет за прошедший месяц"""
+    now = datetime.now(Config.TZ)
+    year, month = now.year, now.month
+    
+    # Проверить не отправляли ли уже
+    if await db.report_is_sent(year, month):
         return
     
-    lines = [t("admin_last", lang)]
-    for r in rows:
-        status_emoji = {"new": "🆕", "work": "🔧", "paid": "💰", "shipped": "🚚", "closed": "✅"}.get(r["status"], "❓")
-        lines.append(
-            f"\n<b>#{r['id']}</b> {status_emoji} <code>{r['status']}</code>\n"
-            f"📅 {r['created_at'][:16]} | {r['role']} | {r['product']}\n"
-            f"📍 {r['city']} | ☎️ {r['phone']}\n"
-            f"{'✓' if r['manager_notified'] else '✗'} | {r['user_id']}\n"
-            f"──────────────"
-        )
-    await message.answer("\n".join(lines), reply_markup=Keyboards.admin(lang))
-
-@dp.message(lambda m: m.text.startswith("📊"))
-async def admin_stats(message: Message, state: FSMContext):
-    await state.clear()
-    if not is_admin(message.from_user.id):
-        return
-    lang = await get_user_lang(message)
-    stats = await db.get_stats()
-    await message.answer(t("stats", lang, s=stats) if "stats" in str(t("stats", lang, s=stats)) else f"📊 Статистика:\n\n• Всего: {stats['total_leads']}\n• Новых: {stats['new_leads']}\n• Клиентов: {stats['unique_users']}", 
-                       reply_markup=Keyboards.admin(lang))
-
-@dp.message(Command("status"))
-async def admin_set_status(message: Message, state: FSMContext):
-    await state.clear()
-    if not is_admin(message.from_user.id):
-        lang = await get_user_lang(message)
-        await message.answer(t("admin_only", lang))
+    # Получить заказы за месяц
+    orders = await db.orders_get_monthly(year, month)
+    if not orders:
         return
     
-    lang = await get_user_lang(message)
-    parts = (message.text or "").split()
-    if len(parts) != 3 or not parts[1].isdigit():
-        await message.answer(t("admin_status_bad", lang), reply_markup=Keyboards.admin(lang))
-        return
+    # Создать Excel
+    Config.REPORTS_DIR.mkdir(exist_ok=True)
+    filename = Config.REPORTS_DIR / f"report_{year}_{month:02d}.xlsx"
     
-    lead_id = int(parts[1])
-    status = parts[2].lower()
-    if status not in {"new", "work", "paid", "shipped", "closed"}:
-        await message.answer(t("admin_status_bad", lang), reply_markup=Keyboards.admin(lang))
-        return
-    
-    success = await db.update_status(lead_id, status)
-    if success:
-        await message.answer(t("admin_status_updated", lang), reply_markup=Keyboards.admin(lang))
-        await db.log_activity(message.from_user.id, "status_update", f"lead {lead_id} -> {status}")
-    else:
-        await message.answer(f"❌ Заявка #{lead_id} не найдена", reply_markup=Keyboards.admin(lang))
-
-@dp.message(lambda m: m.text == "📤 Excel")
-async def admin_export(message: Message, state: FSMContext):
-    await state.clear()
-    if not is_admin(message.from_user.id):
-        return
-    
-    lang = await get_user_lang(message)
-    try:
-        rows = await db.get_all_leads()
-        if not rows:
-            await message.answer(t("admin_empty", lang), reply_markup=Keyboards.admin(lang))
-            return
-        
-        Config.EXPORTS_DIR.mkdir(exist_ok=True)
-        filename = await create_excel(rows, Config.EXPORTS_DIR / f"leads_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx")
-        
-        await message.answer(t("admin_export_ok", lang), reply_markup=Keyboards.admin(lang))
-        await bot.send_document(
-            message.from_user.id,
-            FSInputFile(str(filename)),
-            caption=f"📤 Экспорт от {datetime.now().strftime('%d.%m.%Y %H:%M')}"
-        )
-        await db.log_activity(message.from_user.id, "export_excel", str(filename))
-    except Exception as e:
-        logger.exception("Excel export failed")
-        await message.answer(t("admin_export_fail", lang), reply_markup=Keyboards.admin(lang))
-
-@dp.message(lambda m: m.text.startswith("⬅️"))
-async def admin_back(message: Message, state: FSMContext):
-    await state.clear()
-    lang = await get_user_lang(message)
-    await message.answer(t("menu_hint", lang), reply_markup=Keyboards.main(lang, is_admin(message.from_user.id)))
-
-# =========================
-# EXCEL CREATION (универсальная функция)
-# =========================
-async def create_excel(rows: List[aiosqlite.Row], filepath: Path, title: str = "Leads") -> Path:
-    """Создать красивый Excel файл"""
     wb = Workbook()
     ws = wb.active
-    ws.title = title
+    ws.title = f"Report {month}.{year}"
     
-    # Заголовки с стилем
-    headers = ["ID", "Дата", "Клиент", "Username", "Язык", "Тип", "Товар", 
-              "Кол-во", "Город", "Телефон", "Статус", "Уведомлен"]
-    
+    # Заголовки
+    headers = ["ID", "Дата", "Клиент", "Телефон", "Город", "Товары", "Сумма", "Статус"]
     ws.append(headers)
     
-    # Стили для заголовка
+    # Стили заголовка
     for cell in ws[1]:
         cell.font = Font(bold=True, color="FFFFFF")
         cell.fill = PatternFill(start_color="366092", end_color="366092", fill_type="solid")
-        cell.alignment = Alignment(horizontal="center")
     
     # Данные
-    for r in rows:
+    total_amount = 0
+    for order in orders:
         ws.append([
-            r["id"], r["created_at"], r["full_name"], r["username"], r["lang"],
-            r["role"], r["product"], r["qty"], r["city"], r["phone"],
-            r["status"], "Да" if r["manager_notified"] else "Нет"
+            order['id'],
+            order['created_at'],
+            order['name'],
+            order['phone'],
+            order['city'],
+            order['items'][:50] + "..." if len(order['items']) > 50 else order['items'],
+            order['total_amount'],
+            order['status']
         ])
+        total_amount += order['total_amount'] or 0
     
     # Автоширина
     for col in ws.columns:
-        max_length = 0
-        column = col[0].column_letter
+        max_len = 0
+        col_letter = col[0].column_letter
         for cell in col:
             try:
-                if cell.value and len(str(cell.value)) > max_length:
-                    max_length = len(str(cell.value))
+                if cell.value:
+                    max_len = max(max_len, len(str(cell.value)))
             except:
                 pass
-        ws.column_dimensions[column].width = min(max_length + 2, 50)
+        ws.column_dimensions[col_letter].width = min(max_len + 2, 50)
     
-    wb.save(filepath)
-    return filepath
+    wb.save(filename)
+    
+    # Отправить админам
+    stats = {
+        "period": f"{month:02d}.{year}",
+        "total_orders": len(orders),
+        "total_amount": total_amount
+    }
+    
+    text = (
+        f"📊 <b>Месячный отчет — {stats['period']}</b>\n\n"
+        f"📦 Всего заказов: {stats['total_orders']}\n"
+        f"💰 Общая сумма: {format_price(stats['total_amount'])} сум\n\n"
+        f"Файл во вложении."
+    )
+    
+    for admin_id in Config.ADMIN_IDS:
+        try:
+            await bot.send_message(admin_id, text)
+            await bot.send_document(admin_id, FSInputFile(str(filename)))
+        except Exception as e:
+            print(f"Failed to send report to {admin_id}: {e}")
+    
+    # Сохранить в БД
+    await db.report_mark_sent(year, month, str(filename), stats['total_orders'], stats['total_amount'])
 
 # =========================
-# MONTHLY REPORT (автоотчет в конце месяца)
+# REMINDERS (исправлено!)
 # =========================
-async def send_monthly_report():
-    """Отправить месячный отчет админу"""
-    now = datetime.now()
-    year, month = now.year, now.month
+async def check_reminders():
+    """Проверить напоминания - только непросмотренные заказы"""
+    orders = await db.orders_get_for_reminder()
     
-    # Проверяем не отправляли ли уже
-    if await db.is_report_sent(year, month):
-        logger.info(f"Report for {month}.{year} already sent")
+    if not orders:
         return
     
-    # Получаем статистику
-    stats = await db.get_monthly_stats(year, month)
+    # Группировать по админам для рассылки
+    for admin_id in Config.ADMIN_IDS:
+        try:
+            lines = []
+            for order in orders[:10]:  # Максимум 10
+                lines.append(
+                    f"🆕 #{order['id']} | {esc(order['name'])} | "
+                    f"{esc(order['phone'])} | {esc(order['city'])}"
+                )
+            
+            text = "🔔 <b>Напоминание: новые заказы требуют внимания!</b>\n\n" + "\n".join(lines)
+            await bot.send_message(admin_id, text)
+        except Exception as e:
+            print(f"Reminder failed for {admin_id}: {e}")
     
-    if stats['total'] == 0:
-        logger.info(f"No leads for {month}.{year}, skipping report")
-        return
-    
-    # Создаем Excel
-    start_date = f"{year}-{month:02d}-01"
-    last_day = monthrange(year, month)[1]
-    end_date = f"{year}-{month:02d}-{last_day} 23:59:59"
-    
-    rows = await db.get_leads_by_date_range(start_date, end_date)
-    
-    Config.REPORTS_DIR.mkdir(exist_ok=True)
-    filename = Config.REPORTS_DIR / f"monthly_report_{year}_{month:02d}.xlsx"
-    
-    await create_excel(rows, filename, f"Report_{month:02d}_{year}")
-    
-    # Отправляем админу
-    try:
-        # Текстовая сводка
-        intro = t("monthly_report_intro", "ru", s=stats)
-        await bot.send_message(Config.MANAGER_ID, intro)
-        
-        # Excel файл
-        await bot.send_document(
-            Config.MANAGER_ID,
-            FSInputFile(str(filename)),
-            caption=f"📊 Полный отчет за {stats['period']}\n\n"
-                   f"Всего заявок: {stats['total']}\n"
-                   f"Файл: {filename.name}"
-        )
-        
-        # Отмечаем как отправленный
-        await db.mark_report_sent(year, month, str(filename), stats['total'])
-        logger.info(f"Monthly report for {month}.{year} sent successfully")
-        
-    except TelegramAPIError as e:
-        logger.error(f"Failed to send monthly report: {e}")
+    # Обновить reminded_at
+    for order in orders:
+        await db.order_update_reminded(order['id'])
 
 # =========================
-# CLEANUP & BACKUP
+# SCHEDULER
 # =========================
-async def cleanup_old_files():
-    """Очистка старых файлов"""
-    try:
-        cutoff = datetime.now() - timedelta(days=Config.MAX_EXPORT_AGE_DAYS)
-        count = 0
-        for file in Config.EXPORTS_DIR.glob("*.xlsx"):
-            if datetime.fromtimestamp(file.stat().st_mtime) < cutoff:
-                file.unlink()
-                count += 1
-        if count > 0:
-            logger.info(f"Cleaned up {count} old export files")
-    except Exception as e:
-        logger.error(f"Cleanup error: {e}")
-
-async def backup_database():
-    """Резервное копирование"""
-    try:
-        Config.BACKUP_DIR.mkdir(exist_ok=True)
-        backup_path = Config.BACKUP_DIR / f"backup_{datetime.now().strftime('%Y%m%d_%H%M%S')}.db"
-        import shutil
-        shutil.copy(Config.DB_PATH, backup_path)
-        
-        # Удаляем старые бэкапы
-        backups = sorted(Config.BACKUP_DIR.glob("*.db"), key=lambda p: p.stat().st_mtime)
-        for old in backups[:-Config.BACKUP_KEEP_COUNT]:
-            old.unlink()
-        
-        logger.info(f"Database backed up to {backup_path}")
-    except Exception as e:
-        logger.error(f"Backup error: {e}")
+async def start_scheduler():
+    scheduler = AsyncIOScheduler()
+    
+    # Напоминания каждые 30 минут
+    scheduler.add_job(check_reminders, "interval", minutes=30)
+    
+    # Отчет в последний день месяца в 23:00
+    scheduler.add_job(send_monthly_report, "cron", day="last", hour=23, minute=0)
+    
+    # Также проверить при старте (если пропустили)
+    scheduler.add_job(send_monthly_report, "date", run_date=datetime.now() + timedelta(seconds=60))
+    
+    scheduler.start()
 
 # =========================
-# WEB SERVER
+# WEB SERVER (Render)
 # =========================
-async def health_check(request):
-    return web.Response(text="OK", status=200)
-
-async def start_web_server():
+async def health_server():
     app = web.Application()
-    app.router.add_get("/", health_check)
-    app.router.add_get("/health", health_check)
+    
+    async def health(request):
+        return web.Response(text="OK", status=200)
+    
+    app.router.add_get("/", health)
+    app.router.add_get("/health", health)
     
     runner = web.AppRunner(app)
     await runner.setup()
     site = web.TCPSite(runner, "0.0.0.0", Config.PORT)
     await site.start()
-    logger.info(f"Web server started on port {Config.PORT}")
+    print(f"Health server on port {Config.PORT}")
 
 # =========================
 # MAIN
 # =========================
 async def main():
-    # Подключаем БД
     await db.connect()
+    await start_scheduler()
+    await health_server()
     
-    # Очищаем при старте
-    await cleanup_old_files()
+    print(f"✅ Bot started with {len(Config.ADMIN_IDS)} admins")
+    print(f"Admins: {Config.ADMIN_IDS}")
     
-    # Настраиваем планировщик
-    scheduler = AsyncIOScheduler()
-    
-    # Ежедневные задачи
-    scheduler.add_job(cleanup_old_files, "cron", hour=3, minute=0)
-    scheduler.add_job(backup_database, "cron", hour=2, minute=0)
-    
-    # ⭐ ВАЖНО: Автоотчет в последний день месяца в 23:00
-    scheduler.add_job(send_monthly_report, "cron", day="last", hour=23, minute=0)
-    
-    # Также проверяем при старте (если бот был выключен в последний день)
-    scheduler.add_job(send_monthly_report, "date", run_date=datetime.now() + timedelta(seconds=30))
-    
-    scheduler.start()
-    
-    # Удаляем webhook
-    await bot.delete_webhook(drop_pending_updates=True)
-    
-    # Запускаем
-    await asyncio.gather(
-        start_web_server(),
-        dp.start_polling(bot, skip_updates=True)
-    )
+    await dp.start_polling(bot)
 
 if __name__ == "__main__":
-    try:
-        asyncio.run(main())
-    except (KeyboardInterrupt, SystemExit):
-        logger.info("Bot stopped")
-    except Exception as e:
-        logger.critical(f"Fatal error: {e}")
-        raise
+    asyncio.run(main())
