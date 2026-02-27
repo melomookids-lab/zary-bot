@@ -1,5 +1,5 @@
 """
-ZARY & CO — Retail Bot v3.0 (FULL)
+ZARY & CO — Retail Bot v3.1 (FULL, fixed UX)
 ✅ aiogram 3.x
 ✅ SQLite (bot.db)
 ✅ Admins only (ADMIN_ID_1..3)
@@ -12,6 +12,14 @@ ZARY & CO — Retail Bot v3.0 (FULL)
 ✅ Weekly scheduled posts (Mon–Sat 18:00 Tashkent):
    Admin uploads photo/video+caption into bot → stored by Telegram file_id → bot posts to channel by schedule
 ✅ Sunday: reminder to admin to upload new weekly posts
+
+UX FIXES:
+1) Size result → guidance + main menu CTA
+2) Catalog goes to channel, but "Quick order" exists inside bot → cart usable
+3) FAQ ends with menu + channel buttons
+4) Order: product list keyboard (12–15 items) + manual input
+5) Cart: no "fixed total"; price "по договоренности"; always shows checkout
+6) Removed confusing "comment" step; after address → confirm immediately
 """
 
 import os
@@ -57,14 +65,26 @@ TG_CHANNEL_URL = f"https://t.me/{CHANNEL_USERNAME}"
 PHONE = os.getenv("MANAGER_PHONE", "+998771202255").strip()
 MANAGER_USERNAME = os.getenv("MANAGER_USERNAME", "zaryco_official").strip().lstrip("@")
 
-INSTAGRAM_URL = "https://www.instagram.com/zary.co/"
-YOUTUBE_URL = "https://www.youtube.com/@ZARYCOOFFICIAL"
-
 PORT = int(os.getenv("PORT", "10000"))
 DB_PATH = os.getenv("DB_PATH", "bot.db")
 
-# Cron secret for /cron/*
 CRON_SECRET = os.getenv("CRON_SECRET", "").strip()
+
+# =========================
+# PRODUCTS (Quick order list)
+# =========================
+PRODUCTS_RU = [
+    "Худи детское", "Свитшот", "Футболка", "Рубашка", "Джинсы",
+    "Брюки классические", "Юбка", "Платье", "Куртка демисезонная",
+    "Костюм спортивный", "Школьная форма (комплект)", "Жилет школьный",
+    "Кардиган", "Пижама", "Комплект (кофта+брюки)"
+]
+PRODUCTS_UZ = [
+    "Bolalar hudi", "Sviter", "Futbolka", "Ko'ylak", "Jinsi",
+    "Klassik shim", "Yubka", "Ko'ylak (dress)", "Demisezon kurtka",
+    "Sport kostyum", "Maktab formasi (komplekt)", "Maktab jileti",
+    "Kardigan", "Pijama", "Komplekt (kofta+shim)"
+]
 
 # =========================
 # DB
@@ -133,11 +153,11 @@ class Database:
 
             CREATE TABLE IF NOT EXISTS scheduled_posts (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
-                dow INTEGER,                 -- 1=Mon ... 6=Sat, 7=Sun
-                media_type TEXT,             -- photo|video|none
-                file_id TEXT,                -- Telegram file_id
+                dow INTEGER,
+                media_type TEXT,
+                file_id TEXT,
                 caption TEXT,
-                week_key TEXT,               -- e.g. 2026-W09
+                week_key TEXT,
                 created_at TEXT DEFAULT CURRENT_TIMESTAMP,
                 posted_at TEXT
             );
@@ -214,7 +234,7 @@ class Database:
             data.get("total_amount", 0),
             data.get("delivery_type", ""),
             data.get("delivery_address", ""),
-            data.get("comment", ""),
+            data.get("comment", "—"),
             "new",
             now
         ))
@@ -323,7 +343,7 @@ class Database:
 
     # --- weekly scheduled posts
     def week_key_now(self, dt: datetime) -> str:
-        iso = dt.isocalendar()  # year, week, weekday
+        iso = dt.isocalendar()
         return f"{iso[0]}-W{iso[1]:02d}"
 
     def sched_add(self, dow: int, media_type: str, file_id: str, caption: str, week_key: str):
@@ -391,25 +411,26 @@ TEXT = {
         "welcome": "👋 Добро пожаловать в <b>ZARY & CO</b>!\n\n🧸 Детская одежда премиум качества\n📦 Доставка по Узбекистану 1-5 дней\n\nВыберите действие 👇",
         "menu": "📍 Главное меню",
         "catalog": "📸 <b>Каталог</b>\n\nВыберите категорию:",
-        "price": "🧾 <b>Прайс-лист</b>\n\n👶 Мальчики — от 150 000 сум\n👧 Девочки — от 140 000 сум\n🧒 Унисекс — от 130 000 сум\n🎒 Школьная форма — от 200 000 сум\n\n✅ Нажмите «Заказ» для оформления",
+        "catalog_hint": "Чтобы быстро оформить — нажмите <b>✅ Заказ</b> (выбор товаров внутри бота).",
+        "price": "🧾 <b>Прайс-лист</b>\n\n💬 Цена — по договоренности (зависит от модели/размера).\n\n✅ Нажмите «Заказ» для оформления",
         "size": "📏 <b>Подбор размера</b>\n\nВыберите способ:",
         "size_age": "Введите возраст (1-15 лет):\nПример: 7",
         "size_height": "Введите рост в см:\nПример: 125",
-        "size_result": "📏 Рекомендуемый размер: <b>{size}</b>",
-        "cart": "🛒 <b>Корзина</b>\n\n{items}\n\n💰 Итого: <b>{total} сум</b>",
-        "cart_empty": "🛒 Корзина пуста\n\nДобавьте товары из каталога",
+        "size_result": "📏 Рекомендуемый размер: <b>{size}</b>\n\n✅ Если определились — нажмите <b>✅ Заказ</b> или вернитесь в меню.",
+        "cart": "🛒 <b>Корзина</b>\n\n{items}\n\n💬 Цена: <b>по договоренности</b>\nНажмите <b>✅ Оформить</b>, чтобы продолжить.",
+        "cart_empty": "🛒 Корзина пуста\n\nПерейдите в <b>✅ Заказ</b> и выберите товар (или напишите свой).",
         "cart_added": "✅ Добавлено в корзину",
-        "delivery": "🚚 <b>Доставка</b>\n\n1️⃣ <b>B2B Почта</b> — 2-5 дней, весь Узбекистан\n2️⃣ <b>Яндекс Курьер</b> — 1-3 дня, крупные города\n3️⃣ <b>Яндекс ПВЗ</b> — 1-3 дня, пункты выдачи\n\n💰 Стоимость: от 15 000 сум (зависит от города)",
+        "delivery": "🚚 <b>Доставка</b>\n\n1️⃣ <b>B2B Почта</b> — 2-5 дней, весь Узбекистан\n2️⃣ <b>Яндекс Курьер</b> — 1-3 дня, крупные города\n3️⃣ <b>Яндекс ПВЗ</b> — 1-3 дня, пункты выдачи\n\n💬 Стоимость доставки зависит от города.",
         "faq": "❓ <b>FAQ</b>\n\n<b>Доставка?</b>\n— По всему Узбекистану, 1-5 дней\n\n<b>Оплата?</b>\n— Наличными или переводом\n\n<b>Возврат?</b>\n— 14 дней при сохранении вида\n\n<b>Размеры?</b>\n— Используйте подбор в боте",
-        "contact": "📞 <b>Связаться</b>\n\n☎️ {phone}\n⏰ Пн-Пт: 09:00-21:00\n📱 @{username}\n\nИли оставьте номер — мы перезвоним",
-        "order_start": "📝 <b>Оформление заказа</b>\n\nВведите ваше имя:",
+        "contact": "📞 <b>Связаться</b>\n\n☎️ {phone}\n⏰ Пн-Пт: 09:00-21:00\n📱 @{username}",
+        "order_start": "🛍 <b>Выберите товар</b>\n\nНажмите на кнопку товара ниже 👇\nЕсли вашего товара нет — нажмите <b>✍️ Ввести вручную</b>",
+        "order_manual": "📝 Введите название товара (например: худи, джинсы, школьная форма):",
         "order_phone": "📱 Отправьте номер телефона:",
         "order_city": "🏙 Введите город:",
-        "order_delivery": "🚚 Выберите способ доставки:",
+        "order_delivery": "🚚 Выберите способ доставки (нажмите кнопку):",
         "order_address": "📍 Введите адрес доставки:",
-        "order_comment": "💬 Комментарий (необязательно):",
-        "order_confirm": "📝 <b>Проверьте заказ:</b>\n\n👤 {name}\n📱 {phone}\n🏙 {city}\n🚚 {delivery}\n📍 {address}\n💬 {comment}\n\n🛒 Товары:\n{items}\n\n💰 Итого: {total} сум",
-        "order_success": "✅ Заказ #{order_id} принят!\n\nМенеджер свяжется в течение 15 минут\n⏰ Рабочее время: 09:00-21:00",
+        "order_confirm": "📝 <b>Проверьте заказ:</b>\n\n👤 {name}\n📱 {phone}\n🏙 {city}\n🚚 {delivery}\n📍 {address}\n\n🛒 Товары:\n{items}\n\n💬 Цена: <b>по договоренности</b>\nМенеджер уточнит размер и итоговую сумму.\n\nПодтвердить?",
+        "order_success": "✅ Заказ #{order_id} принят!\n\nУважаемый покупатель, вам поступят уведомления о статусе.\nМенеджер скоро свяжется и уточнит детали.\n⏰ 09:00-21:00",
         "history": "📜 <b>История заказов</b>\n\n{orders}",
         "history_empty": "📜 У вас пока нет заказов",
         "admin_menu": "🛠 <b>Админ панель</b>\n\nВыберите действие:",
@@ -420,25 +441,26 @@ TEXT = {
         "welcome": "👋 <b>ZARY & CO</b> ga xush kelibsiz!\n\n🧸 Bolalar kiyimi premium sifat\n📦 O'zbekiston bo'ylab yetkazib berish 1-5 kun\n\nAmalni tanlang 👇",
         "menu": "📍 Asosiy menyu",
         "catalog": "📸 <b>Katalog</b>\n\nKategoriyani tanlang:",
-        "price": "🧾 <b>Narxlar</b>\n\n👶 O'g'il bolalar — 150 000 so'mdan\n👧 Qiz bolalar — 140 000 so'mdan\n🧒 Uniseks — 130 000 so'mdan\n🎒 Maktab formasi — 200 000 so'mdan\n\n✅ «Buyurtma» ni bosing",
+        "catalog_hint": "Tez buyurtma uchun <b>✅ Buyurtma</b> ni bosing (bot ichida tanlash).",
+        "price": "🧾 <b>Narxlar</b>\n\n💬 Narx — kelishuv bo'yicha (model/o'lchamga qarab).\n\n✅ «Buyurtma» ni bosing",
         "size": "📏 <b>O'lcham tanlash</b>\n\nUsulni tanlang:",
         "size_age": "Yoshini kiriting (1-15 yosh):\nMisol: 7",
         "size_height": "Bo'yni sm da kiriting:\nMisol: 125",
-        "size_result": "📏 Tavsiya etilgan o'lcham: <b>{size}</b>",
-        "cart": "🛒 <b>Savat</b>\n\n{items}\n\n💰 Jami: <b>{total} so'm</b>",
-        "cart_empty": "🛒 Savat bo'sh\n\nKatalogdan mahsulot qo'shing",
+        "size_result": "📏 Tavsiya etilgan o'lcham: <b>{size}</b>\n\n✅ Tayyor bo'lsangiz <b>✅ Buyurtma</b> ni bosing yoki menyuga qayting.",
+        "cart": "🛒 <b>Savat</b>\n\n{items}\n\n💬 Narx: <b>kelishuv bo'yicha</b>\n<b>✅ Rasmiylashtirish</b> ni bosing.",
+        "cart_empty": "🛒 Savat bo'sh\n\n<b>✅ Buyurtma</b> ga kiring va tovar tanlang (yoki o'zingiz yozing).",
         "cart_added": "✅ Savatga qo'shildi",
-        "delivery": "🚚 <b>Yetkazib berish</b>\n\n1️⃣ <b>B2B Pochta</b> — 2-5 kun, butun O'zbekiston\n2️⃣ <b>Yandex Kuryer</b> — 1-3 kun, yirik shaharlarga\n3️⃣ <b>Yandex PVZ</b> — 1-3 kun, topshirish punktlari\n\n💰 Narxi: 15 000 so'mdan (shahar qarab)",
-        "faq": "❓ <b>FAQ</b>\n\n<b>Yetkazib berish?</b>\n— Butun O'zbekiston, 1-5 kun\n\n<b>To'lov?</b>\n— Naqd yoki o'tkazma\n\n<b>Qaytarish?</b>\n— 14 kun ichida tovar ko'rinishi saqlangan bo'lsa\n\n<b>O'lchamlar?</b>\n— Botdagi o'lcham tanlashdan foydalaning",
-        "contact": "📞 <b>Aloqa</b>\n\n☎️ {phone}\n⏰ Du-Sha: 09:00-21:00\n📱 @{username}\n\nYoki raqam qoldiring — qo'ng'iroq qilamiz",
-        "order_start": "📝 <b>Buyurtma berish</b>\n\nIsmingizni kiriting:",
+        "delivery": "🚚 <b>Yetkazib berish</b>\n\n1️⃣ <b>B2B Pochta</b> — 2-5 kun\n2️⃣ <b>Yandex Kuryer</b> — 1-3 kun\n3️⃣ <b>Yandex PVZ</b> — 1-3 kun\n\n💬 Yetkazib berish narxi shahar bo'yicha.",
+        "faq": "❓ <b>FAQ</b>\n\n<b>Yetkazib berish?</b>\n— Butun O'zbekiston, 1-5 kun\n\n<b>To'lov?</b>\n— Naqd yoki o'tkazma\n\n<b>Qaytarish?</b>\n— 14 kun ichida (tovar ko'rinishi saqlangan bo'lsa)\n\n<b>O'lchamlar?</b>\n— Botdagi o'lcham tanlashdan foydalaning",
+        "contact": "📞 <b>Aloqa</b>\n\n☎️ {phone}\n⏰ Du-Sha: 09:00-21:00\n📱 @{username}",
+        "order_start": "🛍 <b>Tovar tanlang</b>\n\nQuyidagi tugmalardan birini bosing 👇\nAgar kerakli tovar bo'lmasa — <b>✍️ Qo'lda kiritish</b> ni bosing",
+        "order_manual": "📝 Mahsulot nomini kiriting (masalan: hudi, jinsi, maktab formasi):",
         "order_phone": "📱 Telefon raqamingizni yuboring:",
         "order_city": "🏙 Shaharni kiriting:",
-        "order_delivery": "🚚 Yetkazib berish usulini tanlang:",
-        "order_address": "📍 Yetkazib berish manzilini kiriting:",
-        "order_comment": "💬 Izoh (ixtiyoriy):",
-        "order_confirm": "📝 <b>Buyurtmani tekshiring:</b>\n\n👤 {name}\n📱 {phone}\n🏙 {city}\n🚚 {delivery}\n📍 {address}\n💬 {comment}\n\n🛒 Tovarlar:\n{items}\n\n💰 Jami: {total} so'm",
-        "order_success": "✅ Buyurtma #{order_id} qabul qilindi!\n\nMenejer 15 daqiqa ichida bog'lanadi\n⏰ Ish vaqti: 09:00-21:00",
+        "order_delivery": "🚚 Yetkazib berish usulini tanlang (tugmani bosing):",
+        "order_address": "📍 Manzilni kiriting:",
+        "order_confirm": "📝 <b>Buyurtmani tekshiring:</b>\n\n👤 {name}\n📱 {phone}\n🏙 {city}\n🚚 {delivery}\n📍 {address}\n\n🛒 Tovarlar:\n{items}\n\n💬 Narx: <b>kelishuv bo'yicha</b>\nMenejer o'lcham va yakuniy summani aniqlaydi.\n\nTasdiqlaysizmi?",
+        "order_success": "✅ Buyurtma #{order_id} qabul qilindi!\n\nHurmatli mijoz, status bo'yicha xabarlar yuboriladi.\nMenejer tez orada bog'lanadi.\n⏰ 09:00-21:00",
         "history": "📜 <b>Buyurtmalar tarixi</b>\n\n{orders}",
         "history_empty": "📜 Hozircha buyurtmalar yo'q",
         "admin_menu": "🛠 <b>Admin paneli</b>\n\nAmalni tanlang:",
@@ -450,6 +472,11 @@ TEXT = {
 # =========================
 # KEYBOARDS
 # =========================
+from aiogram.types import (
+    InlineKeyboardMarkup, InlineKeyboardButton,
+    ReplyKeyboardMarkup, KeyboardButton,
+)
+
 def kb_main(lang: str, is_admin_flag: bool = False) -> ReplyKeyboardMarkup:
     if lang == "uz":
         rows = [
@@ -483,7 +510,8 @@ def kb_catalog(lang: str) -> InlineKeyboardMarkup:
             InlineKeyboardButton(text=row[0][0], callback_data=row[0][1]),
             InlineKeyboardButton(text=row[1][0], callback_data=row[1][1])
         ])
-    buttons.append([InlineKeyboardButton(text="⬅️ Назад" if lang == "ru" else "⬅️ Orqaga", callback_data="back:menu")])
+    buttons.append([InlineKeyboardButton(text="✅ Быстрый заказ" if lang=="ru" else "✅ Tez buyurtma", callback_data="quick_order")])
+    buttons.append([InlineKeyboardButton(text="⬅️ Назад" if lang=="ru" else "⬅️ Orqaga", callback_data="back:menu")])
     return InlineKeyboardMarkup(inline_keyboard=buttons)
 
 def kb_size(lang: str) -> InlineKeyboardMarkup:
@@ -495,17 +523,17 @@ def kb_size(lang: str) -> InlineKeyboardMarkup:
 
 def kb_delivery(lang: str) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="📦 B2B Почта", callback_data="delivery:b2b")],
-        [InlineKeyboardButton(text="🚚 Яндекс Курьер", callback_data="delivery:yandex_courier")],
-        [InlineKeyboardButton(text="🏪 Яндекс ПВЗ", callback_data="delivery:yandex_pvz")],
+        [InlineKeyboardButton(text="📦 B2B Почта" if lang=="ru" else "📦 B2B Pochta", callback_data="delivery:b2b")],
+        [InlineKeyboardButton(text="🚚 Яндекс Курьер" if lang=="ru" else "🚚 Yandex Kuryer", callback_data="delivery:yandex_courier")],
+        [InlineKeyboardButton(text="🏪 Яндекс ПВЗ" if lang=="ru" else "🏪 Yandex PVZ", callback_data="delivery:yandex_pvz")],
         [InlineKeyboardButton(text="⬅️ Назад" if lang == "ru" else "⬅️ Orqaga", callback_data="back:menu")],
     ])
 
 def kb_cart(items: List[Dict], lang: str) -> InlineKeyboardMarkup:
     buttons = []
     for item in items:
-        name = item["product_name"][:20]
-        btn_text = f"❌ {name} ({item['qty']}x)"
+        name = item["product_name"][:22]
+        btn_text = f"❌ {name} (x{item['qty']})"
         buttons.append([InlineKeyboardButton(text=btn_text, callback_data=f"cart_remove:{item['id']}")])
 
     buttons.extend([
@@ -517,8 +545,8 @@ def kb_cart(items: List[Dict], lang: str) -> InlineKeyboardMarkup:
 
 def kb_order_confirm(lang: str) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="✅ Подтвердить" if lang == "ru" else "✅ Tasdiqlash", callback_data="order:confirm")],
-        [InlineKeyboardButton(text="❌ Отмена" if lang == "ru" else "❌ Bekor", callback_data="order:cancel")],
+        [InlineKeyboardButton(text="✅ Подтвердить" if lang=="ru" else "✅ Tasdiqlash", callback_data="order:confirm")],
+        [InlineKeyboardButton(text="❌ Отмена" if lang=="ru" else "❌ Bekor", callback_data="order:cancel")],
     ])
 
 def kb_admin(lang: str) -> InlineKeyboardMarkup:
@@ -553,19 +581,33 @@ def kb_contact(lang: str) -> ReplyKeyboardMarkup:
         cancel = KeyboardButton(text="❌ Отмена")
     return ReplyKeyboardMarkup(keyboard=[[btn], [cancel]], resize_keyboard=True, one_time_keyboard=True)
 
-def kb_channel(lang: str) -> InlineKeyboardMarkup:
+def kb_channel_and_menu(lang: str) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="📣 Канал" if lang == "ru" else "📣 Kanal", url=TG_CHANNEL_URL)],
-        [InlineKeyboardButton(text="⬅️ Меню" if lang == "ru" else "⬅️ Menyu", callback_data="back:menu")],
+        [InlineKeyboardButton(text="📣 Канал" if lang=="ru" else "📣 Kanal", url=TG_CHANNEL_URL)],
+        [InlineKeyboardButton(text="⬅️ Меню" if lang=="ru" else "⬅️ Menyu", callback_data="back:menu")],
     ])
+
+def kb_quick_products(lang: str) -> InlineKeyboardMarkup:
+    items = PRODUCTS_RU if lang == "ru" else PRODUCTS_UZ
+    rows = []
+    for i in range(0, min(len(items), 12), 2):
+        a = items[i]
+        b = items[i + 1] if i + 1 < min(len(items), 12) else None
+        row = [InlineKeyboardButton(text=a, callback_data=f"prod:{i}")]
+        if b:
+            row.append(InlineKeyboardButton(text=b, callback_data=f"prod:{i+1}"))
+        rows.append(row)
+
+    rows.append([InlineKeyboardButton(text="✍️ Ввести вручную" if lang=="ru" else "✍️ Qo'lda kiritish", callback_data="prod_manual")])
+    rows.append([InlineKeyboardButton(text="🛒 Корзина" if lang=="ru" else "🛒 Savat", callback_data="go_cart")])
+    rows.append([InlineKeyboardButton(text="⬅️ Меню" if lang=="ru" else "⬅️ Menyu", callback_data="back:menu")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
 
 def kb_dow(lang: str) -> InlineKeyboardMarkup:
     if lang == "uz":
         names = [(1, "Dushanba"), (2, "Seshanba"), (3, "Chorshanba"), (4, "Payshanba"), (5, "Juma"), (6, "Shanba")]
-        title = "Kun tanlang (Du–Sha):"
     else:
         names = [(1, "Понедельник"), (2, "Вторник"), (3, "Среда"), (4, "Четверг"), (5, "Пятница"), (6, "Суббота")]
-        title = "Выберите день (Пн–Сб):"
 
     rows = []
     for i in range(0, 6, 2):
@@ -586,9 +628,6 @@ def esc(s: str) -> str:
 
 def is_admin(user_id: int) -> bool:
     return user_id in ADMIN_IDS
-
-def format_price(price: int) -> str:
-    return f"{int(price):,}".replace(",", " ")
 
 def size_by_age(age: int) -> str:
     mapping = {1: "86", 2: "92", 3: "98", 4: "104", 5: "110", 6: "116",
@@ -612,16 +651,21 @@ def cron_allowed(secret: str) -> bool:
 # =========================
 # FSM
 # =========================
+from aiogram.fsm.state import State, StatesGroup
+
 class States(StatesGroup):
     size_age = State()
     size_height = State()
+
+    # order flow
     order_name = State()
     order_phone = State()
     order_city = State()
     order_delivery = State()
     order_address = State()
-    order_comment = State()
-    cart_add = State()
+
+    # quick order
+    prod_manual = State()
 
     # weekly posts
     admin_post_dow = State()
@@ -630,12 +674,19 @@ class States(StatesGroup):
 # =========================
 # BOT INIT
 # =========================
+from aiogram import Bot, Dispatcher
+from aiogram.client.default import DefaultBotProperties
+from aiogram.enums import ParseMode
+from aiogram.fsm.storage.memory import MemoryStorage
+
 bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
 dp = Dispatcher(storage=MemoryStorage())
 
 # =========================
 # HANDLERS
 # =========================
+from aiogram.filters import CommandStart
+
 @dp.message(CommandStart())
 async def cmd_start(message: Message, state: FSMContext):
     await state.clear()
@@ -644,7 +695,6 @@ async def cmd_start(message: Message, state: FSMContext):
     lang = "uz" if (message.from_user.language_code == "uz") else "ru"
     db.user_upsert(user_id, username, lang)
     await message.answer(TEXT[lang]["welcome"], reply_markup=kb_main(lang, is_admin(user_id)))
-    await message.answer(TEXT[lang]["menu"], reply_markup=kb_main(lang, is_admin(user_id)))
 
 @dp.message(F.text.in_(["🌐 Язык", "🌐 Til"]))
 async def cmd_lang(message: Message, state: FSMContext):
@@ -667,6 +717,7 @@ async def cmd_catalog(message: Message, state: FSMContext):
     user = db.user_get(message.from_user.id)
     lang = user["lang"] if user else "ru"
     await message.answer(TEXT[lang]["catalog"], reply_markup=kb_catalog(lang))
+    await message.answer(TEXT[lang]["catalog_hint"], reply_markup=kb_main(lang, is_admin(message.from_user.id)))
 
 @dp.callback_query(F.data.startswith("cat:"))
 async def cat_select(call: CallbackQuery, state: FSMContext):
@@ -676,8 +727,16 @@ async def cat_select(call: CallbackQuery, state: FSMContext):
     await call.message.answer(
         f"📸 {cat.upper()}\n\nСмотрите полный каталог в канале 👇" if lang == "ru"
         else f"📸 {cat.upper()}\n\nTo'liq katalog kanalimizda 👇",
-        reply_markup=kb_channel(lang)
+        reply_markup=kb_channel_and_menu(lang)
     )
+    await call.answer()
+
+@dp.callback_query(F.data == "quick_order")
+async def quick_order(call: CallbackQuery, state: FSMContext):
+    user = db.user_get(call.from_user.id)
+    lang = user["lang"] if user else "ru"
+    await state.clear()
+    await call.message.answer(TEXT[lang]["order_start"], reply_markup=kb_quick_products(lang))
     await call.answer()
 
 # Price
@@ -737,6 +796,29 @@ async def size_height_input(message: Message, state: FSMContext):
     await message.answer(TEXT[lang]["size_result"].format(size=size), reply_markup=kb_main(lang, is_admin(message.from_user.id)))
     await state.clear()
 
+# FAQ
+@dp.message(F.text.in_(["❓ FAQ"]))
+async def cmd_faq(message: Message, state: FSMContext):
+    user = db.user_get(message.from_user.id)
+    lang = user["lang"] if user else "ru"
+    await message.answer(TEXT[lang]["faq"], reply_markup=kb_channel_and_menu(lang))
+    await message.answer(TEXT[lang]["menu"], reply_markup=kb_main(lang, is_admin(message.from_user.id)))
+
+# Delivery info
+@dp.message(F.text.in_(["🚚 Доставка", "🚚 Yetkazib berish"]))
+async def cmd_delivery(message: Message, state: FSMContext):
+    user = db.user_get(message.from_user.id)
+    lang = user["lang"] if user else "ru"
+    await message.answer(TEXT[lang]["delivery"], reply_markup=kb_delivery(lang))
+
+# Contact
+@dp.message(F.text.in_(["📞 Связаться", "📞 Aloqa"]))
+async def cmd_contact(message: Message, state: FSMContext):
+    user = db.user_get(message.from_user.id)
+    lang = user["lang"] if user else "ru"
+    text = TEXT[lang]["contact"].format(phone=PHONE, username=MANAGER_USERNAME or CHANNEL_USERNAME)
+    await message.answer(text, reply_markup=kb_main(lang, is_admin(message.from_user.id)))
+
 # Cart
 @dp.message(F.text.in_(["🛒 Корзина", "🛒 Savat"]))
 async def cmd_cart(message: Message, state: FSMContext):
@@ -749,10 +831,21 @@ async def cmd_cart(message: Message, state: FSMContext):
         return
 
     items_text = "\n".join([f"• {esc(it['product_name'])} x{it['qty']}" for it in items])
-    total = sum(it["qty"] * 150000 for it in items)  # заглушка цены
-
-    text = TEXT[lang]["cart"].format(items=items_text, total=format_price(total))
+    text = TEXT[lang]["cart"].format(items=items_text)
     await message.answer(text, reply_markup=kb_cart(items, lang))
+
+@dp.callback_query(F.data == "go_cart")
+async def go_cart(call: CallbackQuery, state: FSMContext):
+    user = db.user_get(call.from_user.id)
+    lang = user["lang"] if user else "ru"
+    items = db.cart_get(call.from_user.id)
+    if not items:
+        await call.message.answer(TEXT[lang]["cart_empty"], reply_markup=kb_main(lang, is_admin(call.from_user.id)))
+    else:
+        items_text = "\n".join([f"• {esc(it['product_name'])} x{it['qty']}" for it in items])
+        text = TEXT[lang]["cart"].format(items=items_text)
+        await call.message.answer(text, reply_markup=kb_cart(items, lang))
+    await call.answer()
 
 @dp.callback_query(F.data.startswith("cart_remove:"))
 async def cart_remove(call: CallbackQuery, state: FSMContext):
@@ -767,8 +860,7 @@ async def cart_remove(call: CallbackQuery, state: FSMContext):
         await call.message.edit_text(TEXT[lang]["cart_empty"])
     else:
         items_text = "\n".join([f"• {esc(it['product_name'])} x{it['qty']}" for it in items])
-        total = sum(it["qty"] * 150000 for it in items)
-        text = TEXT[lang]["cart"].format(items=items_text, total=format_price(total))
+        text = TEXT[lang]["cart"].format(items=items_text)
         await call.message.edit_text(text, reply_markup=kb_cart(items, lang))
 
     await call.answer("❌ Удалено" if lang == "ru" else "❌ O'chirildi")
@@ -792,63 +884,57 @@ async def cart_checkout(call: CallbackQuery, state: FSMContext):
         return
 
     await state.set_state(States.order_name)
-    await call.message.answer(TEXT[lang]["order_start"])
+    await call.message.answer("Введите ваше имя:" if lang == "ru" else "Ismingizni kiriting:")
     await call.answer()
 
-# Delivery + FAQ + Contact
-@dp.message(F.text.in_(["🚚 Доставка", "🚚 Yetkazib berish"]))
-async def cmd_delivery(message: Message, state: FSMContext):
+# Quick products select
+@dp.callback_query(F.data.startswith("prod:"))
+async def prod_select(call: CallbackQuery, state: FSMContext):
+    user = db.user_get(call.from_user.id)
+    lang = user["lang"] if user else "ru"
+    idx = int(call.data.split(":")[1])
+    items = PRODUCTS_RU if lang == "ru" else PRODUCTS_UZ
+    if 0 <= idx < len(items):
+        db.cart_add(call.from_user.id, items[idx], 1)
+        await call.message.answer(TEXT[lang]["cart_added"])
+    await call.answer()
+
+@dp.callback_query(F.data == "prod_manual")
+async def prod_manual_start(call: CallbackQuery, state: FSMContext):
+    user = db.user_get(call.from_user.id)
+    lang = user["lang"] if user else "ru"
+    await state.set_state(States.prod_manual)
+    await call.message.answer(TEXT[lang]["order_manual"])
+    await call.answer()
+
+@dp.message(States.prod_manual)
+async def prod_manual_input(message: Message, state: FSMContext):
     user = db.user_get(message.from_user.id)
     lang = user["lang"] if user else "ru"
-    await message.answer(TEXT[lang]["delivery"], reply_markup=kb_delivery(lang))
+    if not message.text or len(message.text.strip()) < 2:
+        await message.answer(TEXT[lang]["order_manual"])
+        return
+    db.cart_add(message.from_user.id, message.text.strip(), 1)
+    await message.answer(TEXT[lang]["cart_added"], reply_markup=kb_main(lang, is_admin(message.from_user.id)))
+    await state.clear()
 
-@dp.message(F.text.in_(["❓ FAQ"]))
-async def cmd_faq(message: Message, state: FSMContext):
-    user = db.user_get(message.from_user.id)
-    lang = user["lang"] if user else "ru"
-    await message.answer(TEXT[lang]["faq"], reply_markup=kb_main(lang, is_admin(message.from_user.id)))
-
-@dp.message(F.text.in_(["📞 Связаться", "📞 Aloqa"]))
-async def cmd_contact(message: Message, state: FSMContext):
-    user = db.user_get(message.from_user.id)
-    lang = user["lang"] if user else "ru"
-    text = TEXT[lang]["contact"].format(phone=PHONE, username=MANAGER_USERNAME or CHANNEL_USERNAME)
-    await message.answer(text, reply_markup=kb_contact(lang))
-
-# Order flow
+# Order flow (after checkout)
 @dp.message(F.text.in_(["✅ Заказ", "✅ Buyurtma"]))
 async def cmd_order(message: Message, state: FSMContext):
     user = db.user_get(message.from_user.id)
     lang = user["lang"] if user else "ru"
-
-    items = db.cart_get(message.from_user.id)
-    if not items:
-        await state.set_state(States.cart_add)
-        await message.answer("📝 Введите название товара:" if lang == "ru" else "📝 Mahsulot nomini kiriting:")
-        return
-
-    await state.set_state(States.order_name)
-    await message.answer(TEXT[lang]["order_start"])
-
-@dp.message(States.cart_add)
-async def cart_add_manual(message: Message, state: FSMContext):
-    user = db.user_get(message.from_user.id)
-    lang = user["lang"] if user else "ru"
-    if not message.text:
-        await message.answer("Введите название товара:" if lang == "ru" else "Mahsulot nomini kiriting:")
-        return
-    db.cart_add(message.from_user.id, message.text, 1)
-    await message.answer(TEXT[lang]["cart_added"], reply_markup=kb_main(lang, is_admin(message.from_user.id)))
     await state.clear()
+    # Show product list to help user (fix #4)
+    await message.answer(TEXT[lang]["order_start"], reply_markup=kb_quick_products(lang))
 
 @dp.message(States.order_name)
 async def order_name(message: Message, state: FSMContext):
     user = db.user_get(message.from_user.id)
     lang = user["lang"] if user else "ru"
-    if not message.text:
-        await message.answer(TEXT[lang]["order_start"])
+    if not message.text or len(message.text.strip()) < 2:
+        await message.answer("Введите ваше имя:" if lang == "ru" else "Ismingizni kiriting:")
         return
-    await state.update_data(name=message.text)
+    await state.update_data(name=message.text.strip())
     await state.set_state(States.order_phone)
     await message.answer(TEXT[lang]["order_phone"], reply_markup=kb_contact(lang))
 
@@ -856,7 +942,7 @@ async def order_name(message: Message, state: FSMContext):
 async def order_phone(message: Message, state: FSMContext):
     user = db.user_get(message.from_user.id)
     lang = user["lang"] if user else "ru"
-    phone = message.contact.phone_number if message.contact else message.text
+    phone = message.contact.phone_number if message.contact else (message.text or "").strip()
     if not phone:
         await message.answer(TEXT[lang]["order_phone"], reply_markup=kb_contact(lang))
         return
@@ -868,27 +954,33 @@ async def order_phone(message: Message, state: FSMContext):
 async def order_city(message: Message, state: FSMContext):
     user = db.user_get(message.from_user.id)
     lang = user["lang"] if user else "ru"
-    if not message.text:
+    if not message.text or len(message.text.strip()) < 2:
         await message.answer(TEXT[lang]["order_city"])
         return
-    await state.update_data(city=message.text)
+    await state.update_data(city=message.text.strip())
     await state.set_state(States.order_delivery)
     await message.answer(TEXT[lang]["order_delivery"], reply_markup=kb_delivery(lang))
 
-@dp.callback_query(F.data.startswith("delivery:"))
-async def order_delivery(call: CallbackQuery, state: FSMContext):
-    delivery_type = call.data.split(":")[1]
-    await state.update_data(delivery=delivery_type)
+@dp.message(States.order_delivery)
+async def order_delivery_text_guard(message: Message, state: FSMContext):
+    # Guard: user must click delivery button, not type text (fix #6 confusion)
+    user = db.user_get(message.from_user.id)
+    lang = user["lang"] if user else "ru"
+    await message.answer(TEXT[lang]["order_delivery"], reply_markup=kb_delivery(lang))
 
+@dp.callback_query(F.data.startswith("delivery:"))
+async def order_delivery_callback(call: CallbackQuery, state: FSMContext):
+    delivery_type = call.data.split(":")[1]
     user = db.user_get(call.from_user.id)
     lang = user["lang"] if user else "ru"
+
     delivery_names = {
         "b2b": "B2B Почта" if lang == "ru" else "B2B Pochta",
         "yandex_courier": "Яндекс Курьер" if lang == "ru" else "Yandex Kuryer",
         "yandex_pvz": "Яндекс ПВЗ" if lang == "ru" else "Yandex PVZ"
     }
-    await state.update_data(delivery_name=delivery_names.get(delivery_type, delivery_type))
 
+    await state.update_data(delivery=delivery_type, delivery_name=delivery_names.get(delivery_type, delivery_type))
     await state.set_state(States.order_address)
     await call.message.answer(TEXT[lang]["order_address"])
     await call.answer()
@@ -897,33 +989,21 @@ async def order_delivery(call: CallbackQuery, state: FSMContext):
 async def order_address(message: Message, state: FSMContext):
     user = db.user_get(message.from_user.id)
     lang = user["lang"] if user else "ru"
-    if not message.text:
+    if not message.text or len(message.text.strip()) < 3:
         await message.answer(TEXT[lang]["order_address"])
         return
-    await state.update_data(address=message.text)
-    await state.set_state(States.order_comment)
-    await message.answer(TEXT[lang]["order_comment"], reply_markup=kb_main(lang, is_admin(message.from_user.id)))
 
-@dp.message(States.order_comment)
-async def order_comment(message: Message, state: FSMContext):
-    user = db.user_get(message.from_user.id)
-    lang = user["lang"] if user else "ru"
+    await state.update_data(address=message.text.strip())
 
-    comment = message.text or ""
-    if comment in ["📜 История", "📜 Buyurtmalar", "🛠 Админ", "🛠 Admin"]:
-        comment = ""
-    await state.update_data(comment=(comment.strip() or "—"))
-
+    # Immediately show confirmation (fix #6)
     data = await state.get_data()
     items = db.cart_get(message.from_user.id)
+    if not items:
+        await state.clear()
+        await message.answer(TEXT[lang]["cart_empty"], reply_markup=kb_main(lang, is_admin(message.from_user.id)))
+        return
 
     items_text = "\n".join([f"• {esc(it['product_name'])} x{it['qty']}" for it in items])
-    total = sum(it["qty"] * 150000 for it in items)
-
-    await state.update_data(
-        total=total,
-        items_json=json.dumps([{"name": it["product_name"], "qty": it["qty"]} for it in items], ensure_ascii=False)
-    )
 
     text = TEXT[lang]["order_confirm"].format(
         name=esc(data["name"]),
@@ -931,56 +1011,69 @@ async def order_comment(message: Message, state: FSMContext):
         city=esc(data["city"]),
         delivery=esc(data.get("delivery_name", "—")),
         address=esc(data["address"]),
-        comment=esc(data["comment"]),
-        items=items_text,
-        total=format_price(total)
+        items=items_text
     )
     await message.answer(text, reply_markup=kb_order_confirm(lang))
 
 @dp.callback_query(F.data == "order:confirm")
 async def order_confirm(call: CallbackQuery, state: FSMContext):
-    user = db.user_get(call.from_user.id)
-    lang = user["lang"] if user else "ru"
+    user_row = db.user_get(call.from_user.id)
+    lang = user_row["lang"] if user_row else "ru"
     data = await state.get_data()
+
+    items = db.cart_get(call.from_user.id)
+    if not items:
+        await state.clear()
+        await call.message.answer(TEXT[lang]["cart_empty"], reply_markup=kb_main(lang, is_admin(call.from_user.id)))
+        await call.answer()
+        return
+
+    items_json = json.dumps([{"name": it["product_name"], "qty": it["qty"]} for it in items], ensure_ascii=False)
 
     order_data = {
         "user_id": call.from_user.id,
         "username": call.from_user.username or "",
-        "name": data["name"],
-        "phone": data["phone"],
-        "city": data["city"],
-        "items": data["items_json"],
-        "total_amount": data["total"],
+        "name": data.get("name", "—"),
+        "phone": data.get("phone", "—"),
+        "city": data.get("city", "—"),
+        "items": items_json,
+        "total_amount": 0,  # price by agreement
         "delivery_type": data.get("delivery", ""),
-        "delivery_address": data["address"],
-        "comment": data["comment"],
+        "delivery_address": data.get("address", ""),
+        "comment": "—",
     }
 
     order_id = db.order_create(order_data)
 
+    # Notify admins with buttons
     for admin_id in ADMIN_IDS:
         try:
             await bot.send_message(
                 admin_id,
                 f"🆕 Новый заказ #{order_id}\n\n"
-                f"👤 {esc(data['name'])}\n"
-                f"📱 {esc(data['phone'])}\n"
-                f"🏙 {esc(data['city'])}\n"
-                f"💰 {format_price(data['total'])} сум",
+                f"👤 {esc(order_data['name'])}\n"
+                f"📱 {esc(order_data['phone'])}\n"
+                f"🏙 {esc(order_data['city'])}\n"
+                f"🚚 {esc(data.get('delivery_name','—'))}\n"
+                f"📍 {esc(order_data['delivery_address'])}\n"
+                f"🛒 {', '.join([it['product_name'] for it in items])}\n"
+                f"💬 Цена: по договоренности",
                 reply_markup=kb_admin_order(order_id, "ru")
             )
         except Exception as e:
             print(f"Failed to notify admin {admin_id}: {e}")
 
+    # Duplicate to channel (without buttons)
     if CHANNEL_ID:
         try:
             await bot.send_message(
                 CHANNEL_ID,
                 f"🆕 Новый заказ #{order_id}\n"
-                f"👤 {esc(data['name'])}\n"
-                f"📱 {esc(data['phone'])}\n"
-                f"🏙 {esc(data['city'])}\n"
-                f"💰 {format_price(data['total'])} сум"
+                f"👤 {esc(order_data['name'])}\n"
+                f"📱 {esc(order_data['phone'])}\n"
+                f"🏙 {esc(order_data['city'])}\n"
+                f"🛒 {', '.join([esc(it['product_name']) for it in items])}\n"
+                f"💬 Цена: по договоренности"
             )
         except Exception as e:
             print(f"Failed to send to channel {CHANNEL_ID}: {e}")
@@ -1012,7 +1105,7 @@ async def cmd_history(message: Message, state: FSMContext):
     lines = []
     for o in orders[:5]:
         status_icon = {"new": "🆕", "processing": "⚙️", "shipped": "🚚", "delivered": "✅", "cancelled": "❌"}.get(o["status"], "❓")
-        lines.append(f"{status_icon} #{o['id']} • {format_price(o['total_amount'])} сум • {o['created_at'][:10]}")
+        lines.append(f"{status_icon} #{o['id']} • {o['created_at'][:10]}")
     await message.answer(TEXT[lang]["history"].format(orders="\n".join(lines)),
                          reply_markup=kb_main(lang, is_admin(message.from_user.id)))
 
@@ -1063,7 +1156,7 @@ async def admin_action(call: CallbackQuery, state: FSMContext):
                     f"📱 {esc(order['phone'])}\n"
                     f"🏙 {esc(order['city'])}\n"
                     f"🛒 {esc(items_text)}\n"
-                    f"💰 {format_price(order['total_amount'])} сум"
+                    f"💬 Цена: по договоренности"
                 )
                 await call.message.answer(text, reply_markup=kb_admin_order(order["id"], lang))
 
@@ -1077,21 +1170,20 @@ async def admin_action(call: CallbackQuery, state: FSMContext):
         await generate_monthly_report(call.message, lang)
 
     elif action == "posts":
-        # Start weekly posts flow
         await state.set_state(States.admin_post_dow)
         await call.message.answer("Выберите день публикации (Пн–Сб):" if lang == "ru" else "Kun tanlang (Du–Sha):",
                                   reply_markup=kb_dow(lang))
 
     await call.answer()
 
-# Admin: choose day-of-week
+# Admin weekly posts
 @dp.callback_query(F.data.startswith("dow:"))
 async def admin_choose_dow(call: CallbackQuery, state: FSMContext):
     if not is_admin(call.from_user.id):
         return
     user = db.user_get(call.from_user.id)
     lang = user["lang"] if user else "ru"
-    dow = int(call.data.split(":")[1])  # 1..6
+    dow = int(call.data.split(":")[1])
     await state.update_data(post_dow=dow)
     await state.set_state(States.admin_post_media)
     await call.message.answer(
@@ -1101,12 +1193,10 @@ async def admin_choose_dow(call: CallbackQuery, state: FSMContext):
     )
     await call.answer()
 
-# Admin: receive media+caption
 @dp.message(States.admin_post_media)
 async def admin_receive_week_post(message: Message, state: FSMContext):
     if not is_admin(message.from_user.id):
         return
-
     user = db.user_get(message.from_user.id)
     lang = user["lang"] if user else "ru"
 
@@ -1124,16 +1214,12 @@ async def admin_receive_week_post(message: Message, state: FSMContext):
 
     media_type = "none"
     file_id = ""
-
     if message.photo:
         media_type = "photo"
         file_id = message.photo[-1].file_id
     elif message.video:
         media_type = "video"
         file_id = message.video.file_id
-    else:
-        media_type = "none"
-        file_id = ""
 
     week_key = db.week_key_now(datetime.now())
     db.sched_add(dow=dow, media_type=media_type, file_id=file_id, caption=caption, week_key=week_key)
@@ -1142,13 +1228,13 @@ async def admin_receive_week_post(message: Message, state: FSMContext):
     await message.answer(
         (f"✅ Добавлено в план недели: <b>{week_key}</b>\n"
          f"📌 День: {dow} (1=Пн ... 6=Сб)\n"
-         f"🧾 Сейчас постов в этой неделе: <b>{cnt}</b>\n\n"
-         "Чтобы добавить ещё — снова нажми: 🛠 Админ → 📰 Посты недели.")
+         f"🧾 Постов в этой неделе: <b>{cnt}</b>\n\n"
+         "Чтобы добавить ещё — 🛠 Админ → 📰 Посты недели.")
         if lang == "ru" else
         (f"✅ Haftalik reja: <b>{week_key}</b>\n"
          f"📌 Kun: {dow} (1=Du ... 6=Sha)\n"
          f"🧾 Postlar soni: <b>{cnt}</b>\n\n"
-         "Yana qo‘shish uchun: 🛠 Admin → 📰 Haftalik postlar.")
+         "Yana qo‘shish: 🛠 Admin → 📰 Haftalik postlar.")
     )
     await state.clear()
 
@@ -1167,7 +1253,6 @@ async def order_process(call: CallbackQuery, state: FSMContext):
         return
     order_id = int(call.data.split(":")[1])
     db.order_update_status(order_id, "processing", call.from_user.id)
-
     order = db.order_get(order_id)
     if order:
         user_row = db.user_get(order["user_id"])
@@ -1176,13 +1261,12 @@ async def order_process(call: CallbackQuery, state: FSMContext):
             await bot.send_message(
                 order["user_id"],
                 ("⚙️ Заказ #{0} в обработке!\nМенеджер скоро свяжется.".format(order_id))
-                if lang == "ru"
-                else ("⚙️ Buyurtma #{0} ishlanmoqda!\nMenejer tez orada bog'lanadi.".format(order_id)),
+                if lang == "ru" else
+                ("⚙️ Buyurtma #{0} ishlanmoqda!\nMenejer tez orada bog'lanadi.".format(order_id)),
                 reply_markup=kb_main(lang, is_admin(order["user_id"]))
             )
         except Exception as e:
             print(f"Failed to notify user: {e}")
-
     await call.answer("✅ В работе!")
 
 @dp.callback_query(F.data.startswith("order_ship:"))
@@ -1213,7 +1297,6 @@ async def order_cancel_admin(call: CallbackQuery, state: FSMContext):
 # REPORTS
 # =========================
 async def generate_monthly_report(message: Message, lang: str):
-    """Manual export: current month"""
     now = datetime.now()
     year, month = now.year, now.month
 
@@ -1233,11 +1316,11 @@ async def generate_monthly_report(message: Message, lang: str):
     text = (
         f"📊 <b>Отчет за {month:02d}.{year}</b>\n\n"
         f"📦 Заказов: {len(orders)}\n"
-        f"💰 Сумма: {format_price(total_amount)} сум"
+        f"💰 Сумма (если есть): {total_amount}"
     ) if lang == "ru" else (
         f"📊 <b>Hisobot {month:02d}.{year}</b>\n\n"
         f"📦 Buyurtmalar: {len(orders)}\n"
-        f"💰 Summa: {format_price(total_amount)} so'm"
+        f"💰 Summa (bo'lsa): {total_amount}"
     )
 
     for admin_id in ADMIN_IDS:
@@ -1254,7 +1337,6 @@ def build_excel_report(filename: str, orders: List[Dict]) -> int:
     wb = Workbook()
     ws = wb.active
     ws.title = "Report"
-
     headers = ["ID", "Дата", "Клиент", "Телефон", "Город", "Товары", "Сумма", "Статус"]
     ws.append(headers)
 
@@ -1266,6 +1348,7 @@ def build_excel_report(filename: str, orders: List[Dict]) -> int:
     for order in orders:
         items = json.loads(order["items"]) if order.get("items") else []
         items_str = ", ".join([f"{it.get('name','')} x{it.get('qty',1)}" for it in items])
+        amt = int(order.get("total_amount") or 0)
 
         ws.append([
             order["id"],
@@ -1273,17 +1356,16 @@ def build_excel_report(filename: str, orders: List[Dict]) -> int:
             order["name"],
             order["phone"],
             order["city"],
-            items_str[:80],
-            int(order["total_amount"] or 0),
+            items_str[:120],
+            amt,
             order["status"]
         ])
-        total_amount += int(order["total_amount"] or 0)
+        total_amount += amt
 
     wb.save(filename)
     return total_amount
 
 async def cron_send_prev_month_report():
-    """Auto: previous month report (closed month)"""
     now = datetime.now()
     year, month = prev_month(now)
 
@@ -1301,7 +1383,7 @@ async def cron_send_prev_month_report():
     text = (
         f"📊 <b>Автоотчет за {month:02d}.{year}</b>\n\n"
         f"📦 Заказов: {len(orders)}\n"
-        f"💰 Сумма: {format_price(total_amount)} сум"
+        f"💰 Сумма (если есть): {total_amount}"
     )
 
     for admin_id in ADMIN_IDS:
@@ -1323,7 +1405,6 @@ async def cron_post_daily_to_channel():
     now = datetime.now()
     dow = now.isoweekday()  # 1..7
 
-    # Sunday: remind admin
     if dow == 7:
         for admin_id in ADMIN_IDS:
             try:
@@ -1338,7 +1419,7 @@ async def cron_post_daily_to_channel():
     if not post:
         for admin_id in ADMIN_IDS:
             try:
-                await bot.send_message(admin_id, f"⚠️ Нет поста на сегодня (день={dow}) для недели {week_key}. Загрузите: 🛠 Админ → 📰 Посты недели.")
+                await bot.send_message(admin_id, f"⚠️ Нет поста на сегодня (день={dow}) для недели {week_key}.")
             except Exception:
                 pass
         return
@@ -1356,7 +1437,6 @@ async def cron_post_daily_to_channel():
             await bot.send_message(CHANNEL_ID, caption)
 
         db.sched_mark_posted(post["id"])
-
     except Exception as e:
         for admin_id in ADMIN_IDS:
             try:
