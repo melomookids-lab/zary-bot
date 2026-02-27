@@ -1,5 +1,5 @@
 """
-ZARY & CO — Retail Bot v3.1 (FULL, fixed UX)
+ZARY & CO — Retail Bot v3.2 (FULL FILE, UX fixed)
 ✅ aiogram 3.x
 ✅ SQLite (bot.db)
 ✅ Admins only (ADMIN_ID_1..3)
@@ -9,6 +9,7 @@ ZARY & CO — Retail Bot v3.1 (FULL, fixed UX)
 ✅ Render HTTP endpoints for Cron:
    - /cron/monthly?secret=...
    - /cron/daily?secret=...
+
 ✅ Weekly scheduled posts (Mon–Sat 18:00 Tashkent):
    Admin uploads photo/video+caption into bot → stored by Telegram file_id → bot posts to channel by schedule
 ✅ Sunday: reminder to admin to upload new weekly posts
@@ -18,8 +19,9 @@ UX FIXES:
 2) Catalog goes to channel, but "Quick order" exists inside bot → cart usable
 3) FAQ ends with menu + channel buttons
 4) Order: product list keyboard (12–15 items) + manual input
-5) Cart: no "fixed total"; price "по договоренности"; always shows checkout
+5) Cart: no fake total; price "по договоренности"; always shows checkout
 6) Removed confusing "comment" step; after address → confirm immediately
+7) LAST FIX: after selecting product → bot shows next actions (add more / cart / checkout / menu)
 """
 
 import os
@@ -470,13 +472,54 @@ TEXT = {
 }
 
 # =========================
+# HELPERS
+# =========================
+def esc(s: str) -> str:
+    return html.escape(str(s) if s else "")
+
+def is_admin(user_id: int) -> bool:
+    return user_id in ADMIN_IDS
+
+def size_by_age(age: int) -> str:
+    mapping = {1: "86", 2: "92", 3: "98", 4: "104", 5: "110", 6: "116",
+               7: "122", 8: "128", 9: "134", 10: "140", 11: "146",
+               12: "152", 13: "158", 14: "164", 15: "164"}
+    return mapping.get(age, "122-128")
+
+def size_by_height(height: int) -> str:
+    sizes = [86, 92, 98, 104, 110, 116, 122, 128, 134, 140, 146, 152, 158, 164]
+    closest = min(sizes, key=lambda x: abs(x - height))
+    return str(closest)
+
+def prev_month(dt: datetime) -> tuple[int, int]:
+    first = dt.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+    prev_last = first - timedelta(days=1)
+    return prev_last.year, prev_last.month
+
+def cron_allowed(secret: str) -> bool:
+    return bool(CRON_SECRET) and secret == CRON_SECRET
+
+# =========================
+# FSM
+# =========================
+class States(StatesGroup):
+    size_age = State()
+    size_height = State()
+
+    order_name = State()
+    order_phone = State()
+    order_city = State()
+    order_delivery = State()
+    order_address = State()
+
+    prod_manual = State()
+
+    admin_post_dow = State()
+    admin_post_media = State()
+
+# =========================
 # KEYBOARDS
 # =========================
-from aiogram.types import (
-    InlineKeyboardMarkup, InlineKeyboardButton,
-    ReplyKeyboardMarkup, KeyboardButton,
-)
-
 def kb_main(lang: str, is_admin_flag: bool = False) -> ReplyKeyboardMarkup:
     if lang == "uz":
         rows = [
@@ -590,6 +633,7 @@ def kb_channel_and_menu(lang: str) -> InlineKeyboardMarkup:
 def kb_quick_products(lang: str) -> InlineKeyboardMarkup:
     items = PRODUCTS_RU if lang == "ru" else PRODUCTS_UZ
     rows = []
+    # show first 12 items as buttons (2 per row)
     for i in range(0, min(len(items), 12), 2):
         a = items[i]
         b = items[i + 1] if i + 1 < min(len(items), 12) else None
@@ -602,6 +646,14 @@ def kb_quick_products(lang: str) -> InlineKeyboardMarkup:
     rows.append([InlineKeyboardButton(text="🛒 Корзина" if lang=="ru" else "🛒 Savat", callback_data="go_cart")])
     rows.append([InlineKeyboardButton(text="⬅️ Меню" if lang=="ru" else "⬅️ Menyu", callback_data="back:menu")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
+
+def kb_after_add(lang: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="➕ Добавить ещё" if lang=="ru" else "➕ Yana qo‘shish", callback_data="quick_order")],
+        [InlineKeyboardButton(text="🛒 Перейти в корзину" if lang=="ru" else "🛒 Savatga o‘tish", callback_data="go_cart")],
+        [InlineKeyboardButton(text="✅ Оформить заказ" if lang=="ru" else "✅ Buyurtmani rasmiylashtirish", callback_data="cart:checkout")],
+        [InlineKeyboardButton(text="⬅️ Меню" if lang=="ru" else "⬅️ Menyu", callback_data="back:menu")],
+    ])
 
 def kb_dow(lang: str) -> InlineKeyboardMarkup:
     if lang == "uz":
@@ -621,72 +673,14 @@ def kb_dow(lang: str) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 # =========================
-# HELPERS
-# =========================
-def esc(s: str) -> str:
-    return html.escape(str(s) if s else "")
-
-def is_admin(user_id: int) -> bool:
-    return user_id in ADMIN_IDS
-
-def size_by_age(age: int) -> str:
-    mapping = {1: "86", 2: "92", 3: "98", 4: "104", 5: "110", 6: "116",
-               7: "122", 8: "128", 9: "134", 10: "140", 11: "146",
-               12: "152", 13: "158", 14: "164", 15: "164"}
-    return mapping.get(age, "122-128")
-
-def size_by_height(height: int) -> str:
-    sizes = [86, 92, 98, 104, 110, 116, 122, 128, 134, 140, 146, 152, 158, 164]
-    closest = min(sizes, key=lambda x: abs(x - height))
-    return str(closest)
-
-def prev_month(dt: datetime) -> tuple[int, int]:
-    first = dt.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
-    prev_last = first - timedelta(days=1)
-    return prev_last.year, prev_last.month
-
-def cron_allowed(secret: str) -> bool:
-    return bool(CRON_SECRET) and secret == CRON_SECRET
-
-# =========================
-# FSM
-# =========================
-from aiogram.fsm.state import State, StatesGroup
-
-class States(StatesGroup):
-    size_age = State()
-    size_height = State()
-
-    # order flow
-    order_name = State()
-    order_phone = State()
-    order_city = State()
-    order_delivery = State()
-    order_address = State()
-
-    # quick order
-    prod_manual = State()
-
-    # weekly posts
-    admin_post_dow = State()
-    admin_post_media = State()
-
-# =========================
 # BOT INIT
 # =========================
-from aiogram import Bot, Dispatcher
-from aiogram.client.default import DefaultBotProperties
-from aiogram.enums import ParseMode
-from aiogram.fsm.storage.memory import MemoryStorage
-
 bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
 dp = Dispatcher(storage=MemoryStorage())
 
 # =========================
 # HANDLERS
 # =========================
-from aiogram.filters import CommandStart
-
 @dp.message(CommandStart())
 async def cmd_start(message: Message, state: FSMContext):
     await state.clear()
@@ -887,16 +881,32 @@ async def cart_checkout(call: CallbackQuery, state: FSMContext):
     await call.message.answer("Введите ваше имя:" if lang == "ru" else "Ismingizni kiriting:")
     await call.answer()
 
-# Quick products select
+# Quick products select (LAST FIX included)
 @dp.callback_query(F.data.startswith("prod:"))
 async def prod_select(call: CallbackQuery, state: FSMContext):
     user = db.user_get(call.from_user.id)
     lang = user["lang"] if user else "ru"
     idx = int(call.data.split(":")[1])
+
     items = PRODUCTS_RU if lang == "ru" else PRODUCTS_UZ
     if 0 <= idx < len(items):
         db.cart_add(call.from_user.id, items[idx], 1)
+
+        # 1) confirm
         await call.message.answer(TEXT[lang]["cart_added"])
+
+        # 2) next steps (no silence)
+        await call.message.answer(
+            ("🛒 Товар добавлен!\n\n"
+             "Если хотите — добавьте ещё товары.\n"
+             "Если достаточно — перейдите в корзину и оформите заказ 👇")
+            if lang == "ru" else
+            ("🛒 Mahsulot savatga qo‘shildi!\n\n"
+             "Xohlasangiz yana qo‘shing.\n"
+             "Yetarli bo‘lsa savatga o‘ting va buyurtmani rasmiylashtiring 👇"),
+            reply_markup=kb_after_add(lang)
+        )
+
     await call.answer()
 
 @dp.callback_query(F.data == "prod_manual")
@@ -918,15 +928,15 @@ async def prod_manual_input(message: Message, state: FSMContext):
     await message.answer(TEXT[lang]["cart_added"], reply_markup=kb_main(lang, is_admin(message.from_user.id)))
     await state.clear()
 
-# Order flow (after checkout)
+# Order flow entry
 @dp.message(F.text.in_(["✅ Заказ", "✅ Buyurtma"]))
 async def cmd_order(message: Message, state: FSMContext):
     user = db.user_get(message.from_user.id)
     lang = user["lang"] if user else "ru"
     await state.clear()
-    # Show product list to help user (fix #4)
     await message.answer(TEXT[lang]["order_start"], reply_markup=kb_quick_products(lang))
 
+# Order steps
 @dp.message(States.order_name)
 async def order_name(message: Message, state: FSMContext):
     user = db.user_get(message.from_user.id)
@@ -963,7 +973,6 @@ async def order_city(message: Message, state: FSMContext):
 
 @dp.message(States.order_delivery)
 async def order_delivery_text_guard(message: Message, state: FSMContext):
-    # Guard: user must click delivery button, not type text (fix #6 confusion)
     user = db.user_get(message.from_user.id)
     lang = user["lang"] if user else "ru"
     await message.answer(TEXT[lang]["order_delivery"], reply_markup=kb_delivery(lang))
@@ -995,7 +1004,7 @@ async def order_address(message: Message, state: FSMContext):
 
     await state.update_data(address=message.text.strip())
 
-    # Immediately show confirmation (fix #6)
+    # confirm immediately
     data = await state.get_data()
     items = db.cart_get(message.from_user.id)
     if not items:
@@ -1045,7 +1054,6 @@ async def order_confirm(call: CallbackQuery, state: FSMContext):
 
     order_id = db.order_create(order_data)
 
-    # Notify admins with buttons
     for admin_id in ADMIN_IDS:
         try:
             await bot.send_message(
@@ -1056,14 +1064,13 @@ async def order_confirm(call: CallbackQuery, state: FSMContext):
                 f"🏙 {esc(order_data['city'])}\n"
                 f"🚚 {esc(data.get('delivery_name','—'))}\n"
                 f"📍 {esc(order_data['delivery_address'])}\n"
-                f"🛒 {', '.join([it['product_name'] for it in items])}\n"
+                f"🛒 {', '.join([esc(it['product_name']) for it in items])}\n"
                 f"💬 Цена: по договоренности",
                 reply_markup=kb_admin_order(order_id, "ru")
             )
         except Exception as e:
             print(f"Failed to notify admin {admin_id}: {e}")
 
-    # Duplicate to channel (without buttons)
     if CHANNEL_ID:
         try:
             await bot.send_message(
@@ -1313,19 +1320,9 @@ async def generate_monthly_report(message: Message, lang: str):
     filename = f"reports/report_{year}_{month:02d}.xlsx"
     total_amount = build_excel_report(filename, orders)
 
-    text = (
-        f"📊 <b>Отчет за {month:02d}.{year}</b>\n\n"
-        f"📦 Заказов: {len(orders)}\n"
-        f"💰 Сумма (если есть): {total_amount}"
-    ) if lang == "ru" else (
-        f"📊 <b>Hisobot {month:02d}.{year}</b>\n\n"
-        f"📦 Buyurtmalar: {len(orders)}\n"
-        f"💰 Summa (bo'lsa): {total_amount}"
-    )
-
     for admin_id in ADMIN_IDS:
         try:
-            await bot.send_message(admin_id, text)
+            await bot.send_message(admin_id, f"📊 Отчет {month:02d}.{year}\n📦 Заказов: {len(orders)}\n💰 Сумма: {total_amount}")
             await bot.send_document(admin_id, FSInputFile(filename))
         except Exception as e:
             print(f"Failed to send report to {admin_id}: {e}")
@@ -1380,15 +1377,9 @@ async def cron_send_prev_month_report():
     filename = f"reports/report_{year}_{month:02d}.xlsx"
     total_amount = build_excel_report(filename, orders)
 
-    text = (
-        f"📊 <b>Автоотчет за {month:02d}.{year}</b>\n\n"
-        f"📦 Заказов: {len(orders)}\n"
-        f"💰 Сумма (если есть): {total_amount}"
-    )
-
     for admin_id in ADMIN_IDS:
         try:
-            await bot.send_message(admin_id, text)
+            await bot.send_message(admin_id, f"📊 Автоотчет {month:02d}.{year}\n📦 Заказов: {len(orders)}\n💰 Сумма: {total_amount}")
             await bot.send_document(admin_id, FSInputFile(filename))
         except Exception as e:
             print(f"Auto report failed for {admin_id}: {e}")
@@ -1396,7 +1387,7 @@ async def cron_send_prev_month_report():
     db.report_mark_sent(year, month, filename, len(orders), total_amount)
 
 # =========================
-# DAILY WEEKLY POST (Mon–Sat)
+# DAILY CHANNEL POST (Mon–Sat), Sunday reminder
 # =========================
 async def cron_post_daily_to_channel():
     if not CHANNEL_ID:
