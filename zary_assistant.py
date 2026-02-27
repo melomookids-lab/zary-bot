@@ -1,15 +1,20 @@
 """
-ZARY & CO — РОЗНИЧНЫЙ БОТ (Retail Bot) v2.1
-✅ Render compatible
-✅ Admins = только люди (ADMIN_ID_1..3)
-✅ Канал = отдельно (CHANNEL_ID), дублируем туда новые заказы (без кнопок)
-✅ SQLite sync (sqlite3)
-✅ Health server для Render
-✅ APScheduler (напоминания + автоотчет)
+ZARY & CO — Retail Bot v3.0 (FULL)
+✅ aiogram 3.x
+✅ SQLite (bot.db)
+✅ Admins only (ADMIN_ID_1..3)
+✅ Channel notifications (CHANNEL_ID)
+✅ Orders + Cart + Admin panel
+✅ Excel export (manual)
+✅ Render HTTP endpoints for Cron:
+   - /cron/monthly?secret=...
+   - /cron/daily?secret=...
+✅ Weekly scheduled posts (Mon–Sat 18:00 Tashkent):
+   Admin uploads photo/video+caption into bot → stored by Telegram file_id → bot posts to channel by schedule
+✅ Sunday: reminder to admin to upload new weekly posts
 """
 
 import os
-import re
 import html
 import asyncio
 import json
@@ -17,22 +22,22 @@ from datetime import datetime, timedelta
 from calendar import monthrange
 from typing import Optional, Dict, List
 from pathlib import Path
+import sqlite3
+import threading
 
 # =========================
-# ENVIRONMENT CHECK (FIXED)
+# ENV
 # =========================
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 if not BOT_TOKEN:
-    raise RuntimeError("❌ BOT_TOKEN не установлен! Добавьте в Render Environment Variables")
+    raise RuntimeError("❌ BOT_TOKEN не установлен!")
 
-# === АДМИНЫ (только люди!) ===
 ADMIN_IDS: List[int] = []
 for i in range(1, 4):
     v = os.getenv(f"ADMIN_ID_{i}", "").strip()
     if v and v.lstrip("-").isdigit():
         ADMIN_IDS.append(int(v))
 
-# запасной вариант старого имени переменной (если вдруг используешь)
 if not ADMIN_IDS:
     old_admin = os.getenv("MANAGER_CHAT_ID", "").strip()
     if old_admin and old_admin.lstrip("-").isdigit():
@@ -43,27 +48,27 @@ if not ADMIN_IDS:
 
 PRIMARY_ADMIN = ADMIN_IDS[0]
 
-# === КАНАЛ (НЕ админ) ===
 _channel_id = os.getenv("CHANNEL_ID", "").strip()
 CHANNEL_ID = int(_channel_id) if _channel_id and _channel_id.lstrip("-").isdigit() else None
 
 CHANNEL_USERNAME = os.getenv("CHANNEL_USERNAME", "zaryco_official").strip().lstrip("@")
+TG_CHANNEL_URL = f"https://t.me/{CHANNEL_USERNAME}"
+
 PHONE = os.getenv("MANAGER_PHONE", "+998771202255").strip()
 MANAGER_USERNAME = os.getenv("MANAGER_USERNAME", "zaryco_official").strip().lstrip("@")
+
+INSTAGRAM_URL = "https://www.instagram.com/zary.co/"
+YOUTUBE_URL = "https://www.youtube.com/@ZARYCOOFFICIAL"
 
 PORT = int(os.getenv("PORT", "10000"))
 DB_PATH = os.getenv("DB_PATH", "bot.db")
 
-TG_CHANNEL_URL = f"https://t.me/{CHANNEL_USERNAME}"
-INSTAGRAM_URL = "https://www.instagram.com/zary.co/"
-YOUTUBE_URL = "https://www.youtube.com/@ZARYCOOFFICIAL"
+# Cron secret for /cron/*
+CRON_SECRET = os.getenv("CRON_SECRET", "").strip()
 
 # =========================
-# DATABASE (SQLite sync)
+# DB
 # =========================
-import sqlite3
-import threading
-
 class Database:
     def __init__(self):
         self.db_path = DB_PATH
@@ -79,14 +84,12 @@ class Database:
     def _init_db(self):
         conn = sqlite3.connect(self.db_path)
         cur = conn.cursor()
-
         cur.executescript("""
             CREATE TABLE IF NOT EXISTS users (
                 user_id INTEGER PRIMARY KEY,
                 username TEXT,
                 lang TEXT DEFAULT 'ru',
-                created_at TEXT,
-                phone TEXT
+                created_at TEXT
             );
 
             CREATE TABLE IF NOT EXISTS carts (
@@ -128,26 +131,36 @@ class Database:
                 status TEXT DEFAULT 'pending'
             );
 
+            CREATE TABLE IF NOT EXISTS scheduled_posts (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                dow INTEGER,                 -- 1=Mon ... 6=Sat, 7=Sun
+                media_type TEXT,             -- photo|video|none
+                file_id TEXT,                -- Telegram file_id
+                caption TEXT,
+                week_key TEXT,               -- e.g. 2026-W09
+                created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+                posted_at TEXT
+            );
+
             CREATE INDEX IF NOT EXISTS idx_orders_user ON orders(user_id);
             CREATE INDEX IF NOT EXISTS idx_orders_status ON orders(status);
             CREATE INDEX IF NOT EXISTS idx_carts_user ON carts(user_id);
+            CREATE INDEX IF NOT EXISTS idx_sched_week_dow ON scheduled_posts(week_key, dow);
         """)
         conn.commit()
         conn.close()
 
+    # --- users
     def user_upsert(self, user_id: int, username: str, lang: str):
         conn = self._get_conn()
         cur = conn.cursor()
         now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-
         cur.execute("SELECT 1 FROM users WHERE user_id=?", (user_id,))
         if cur.fetchone():
             cur.execute("UPDATE users SET username=?, lang=? WHERE user_id=?", (username, lang, user_id))
         else:
-            cur.execute(
-                "INSERT INTO users (user_id, username, lang, created_at) VALUES (?,?,?,?)",
-                (user_id, username, lang, now),
-            )
+            cur.execute("INSERT INTO users (user_id, username, lang, created_at) VALUES (?,?,?,?)",
+                        (user_id, username, lang, now))
         conn.commit()
 
     def user_get(self, user_id: int) -> Optional[Dict]:
@@ -157,6 +170,7 @@ class Database:
         row = cur.fetchone()
         return dict(row) if row else None
 
+    # --- cart
     def cart_add(self, user_id: int, product_name: str, qty: int = 1, size: str = ""):
         conn = self._get_conn()
         cur = conn.cursor()
@@ -182,11 +196,11 @@ class Database:
         cur.execute("DELETE FROM carts WHERE id=?", (cart_id,))
         conn.commit()
 
+    # --- orders
     def order_create(self, data: Dict) -> int:
         conn = self._get_conn()
         cur = conn.cursor()
         now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-
         cur.execute("""
             INSERT INTO orders (
                 user_id, username, name, phone, city, items,
@@ -246,11 +260,9 @@ class Database:
         conn.commit()
 
     def orders_get_for_reminder(self) -> List[Dict]:
-        """Только new + не просмотренные + старше 30 мин"""
         conn = self._get_conn()
         cur = conn.cursor()
         cutoff = (datetime.now() - timedelta(minutes=30)).strftime("%Y-%m-%d %H:%M:%S")
-
         cur.execute("""
             SELECT * FROM orders
             WHERE status='new' AND manager_seen=0
@@ -270,7 +282,7 @@ class Database:
     def orders_get_monthly(self, year: int, month: int) -> List[Dict]:
         conn = self._get_conn()
         cur = conn.cursor()
-        start = f"{year}-{month:02d}-01"
+        start = f"{year}-{month:02d}-01 00:00:00"
         last_day = monthrange(year, month)[1]
         end = f"{year}-{month:02d}-{last_day} 23:59:59"
         cur.execute("SELECT * FROM orders WHERE created_at BETWEEN ? AND ? ORDER BY id",
@@ -309,10 +321,50 @@ class Database:
         row = cur.fetchone()
         return dict(row) if row else {"total": 0, "new": 0, "processing": 0, "delivered": 0, "unique_users": 0}
 
+    # --- weekly scheduled posts
+    def week_key_now(self, dt: datetime) -> str:
+        iso = dt.isocalendar()  # year, week, weekday
+        return f"{iso[0]}-W{iso[1]:02d}"
+
+    def sched_add(self, dow: int, media_type: str, file_id: str, caption: str, week_key: str):
+        conn = self._get_conn()
+        cur = conn.cursor()
+        cur.execute("""
+            INSERT INTO scheduled_posts (dow, media_type, file_id, caption, week_key)
+            VALUES (?,?,?,?,?)
+        """, (dow, media_type, file_id, caption, week_key))
+        conn.commit()
+
+    def sched_get_for_day(self, dow: int, week_key: str) -> Optional[Dict]:
+        conn = self._get_conn()
+        cur = conn.cursor()
+        cur.execute("""
+            SELECT * FROM scheduled_posts
+            WHERE dow=? AND week_key=? AND posted_at IS NULL
+            ORDER BY id ASC
+            LIMIT 1
+        """, (dow, week_key))
+        row = cur.fetchone()
+        return dict(row) if row else None
+
+    def sched_mark_posted(self, post_id: int):
+        conn = self._get_conn()
+        cur = conn.cursor()
+        now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        cur.execute("UPDATE scheduled_posts SET posted_at=? WHERE id=?", (now, post_id))
+        conn.commit()
+
+    def sched_count_week(self, week_key: str) -> int:
+        conn = self._get_conn()
+        cur = conn.cursor()
+        cur.execute("SELECT COUNT(*) as c FROM scheduled_posts WHERE week_key=?", (week_key,))
+        r = cur.fetchone()
+        return int(r["c"]) if r else 0
+
 db = Database()
 
 # =========================
-# AIogram 3.x IMPORTS
+# aiogram
 # =========================
 from aiogram import Bot, Dispatcher, F
 from aiogram.client.default import DefaultBotProperties
@@ -363,7 +415,6 @@ TEXT = {
         "admin_menu": "🛠 <b>Админ панель</b>\n\nВыберите действие:",
         "admin_stats": "📊 <b>Статистика</b>\n\n📦 Всего: {total}\n🆕 Новых: {new}\n⚙️ В обработке: {processing}\n✅ Доставлено: {delivered}\n👥 Клиентов: {unique_users}",
         "cancelled": "❌ Отменено",
-        "unknown": "🤔 Используйте меню 👇",
     },
     "uz": {
         "welcome": "👋 <b>ZARY & CO</b> ga xush kelibsiz!\n\n🧸 Bolalar kiyimi premium sifat\n📦 O'zbekiston bo'ylab yetkazib berish 1-5 kun\n\nAmalni tanlang 👇",
@@ -393,7 +444,6 @@ TEXT = {
         "admin_menu": "🛠 <b>Admin paneli</b>\n\nAmalni tanlang:",
         "admin_stats": "📊 <b>Statistika</b>\n\n📦 Jami: {total}\n🆕 Yangi: {new}\n⚙️ Ishlanmoqda: {processing}\n✅ Yetkazildi: {delivered}\n👥 Mijozlar: {unique_users}",
         "cancelled": "❌ Bekor qilindi",
-        "unknown": "🤔 Menyudan foydalaning 👇",
     }
 }
 
@@ -433,10 +483,7 @@ def kb_catalog(lang: str) -> InlineKeyboardMarkup:
             InlineKeyboardButton(text=row[0][0], callback_data=row[0][1]),
             InlineKeyboardButton(text=row[1][0], callback_data=row[1][1])
         ])
-    buttons.append([InlineKeyboardButton(
-        text="⬅️ Назад" if lang == "ru" else "⬅️ Orqaga",
-        callback_data="back:menu"
-    )])
+    buttons.append([InlineKeyboardButton(text="⬅️ Назад" if lang == "ru" else "⬅️ Orqaga", callback_data="back:menu")])
     return InlineKeyboardMarkup(inline_keyboard=buttons)
 
 def kb_size(lang: str) -> InlineKeyboardMarkup:
@@ -480,6 +527,7 @@ def kb_admin(lang: str) -> InlineKeyboardMarkup:
         [InlineKeyboardButton(text="⚙️ В обработке" if lang == "ru" else "⚙️ Ishlanmoqda", callback_data="admin:processing")],
         [InlineKeyboardButton(text="📊 Статистика" if lang == "ru" else "📊 Statistika", callback_data="admin:stats")],
         [InlineKeyboardButton(text="📤 Excel отчет" if lang == "ru" else "📤 Excel hisobot", callback_data="admin:export")],
+        [InlineKeyboardButton(text="📰 Посты недели" if lang == "ru" else "📰 Haftalik postlar", callback_data="admin:posts")],
         [InlineKeyboardButton(text="⬅️ Назад" if lang == "ru" else "⬅️ Orqaga", callback_data="back:menu")],
     ])
 
@@ -511,6 +559,25 @@ def kb_channel(lang: str) -> InlineKeyboardMarkup:
         [InlineKeyboardButton(text="⬅️ Меню" if lang == "ru" else "⬅️ Menyu", callback_data="back:menu")],
     ])
 
+def kb_dow(lang: str) -> InlineKeyboardMarkup:
+    if lang == "uz":
+        names = [(1, "Dushanba"), (2, "Seshanba"), (3, "Chorshanba"), (4, "Payshanba"), (5, "Juma"), (6, "Shanba")]
+        title = "Kun tanlang (Du–Sha):"
+    else:
+        names = [(1, "Понедельник"), (2, "Вторник"), (3, "Среда"), (4, "Четверг"), (5, "Пятница"), (6, "Суббота")]
+        title = "Выберите день (Пн–Сб):"
+
+    rows = []
+    for i in range(0, 6, 2):
+        a = names[i]
+        b = names[i + 1]
+        rows.append([
+            InlineKeyboardButton(text=a[1], callback_data=f"dow:{a[0]}"),
+            InlineKeyboardButton(text=b[1], callback_data=f"dow:{b[0]}")
+        ])
+    rows.append([InlineKeyboardButton(text="⬅️ Назад" if lang == "ru" else "⬅️ Orqaga", callback_data="admin:back")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
 # =========================
 # HELPERS
 # =========================
@@ -534,6 +601,14 @@ def size_by_height(height: int) -> str:
     closest = min(sizes, key=lambda x: abs(x - height))
     return str(closest)
 
+def prev_month(dt: datetime) -> tuple[int, int]:
+    first = dt.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+    prev_last = first - timedelta(days=1)
+    return prev_last.year, prev_last.month
+
+def cron_allowed(secret: str) -> bool:
+    return bool(CRON_SECRET) and secret == CRON_SECRET
+
 # =========================
 # FSM
 # =========================
@@ -547,6 +622,10 @@ class States(StatesGroup):
     order_address = State()
     order_comment = State()
     cart_add = State()
+
+    # weekly posts
+    admin_post_dow = State()
+    admin_post_media = State()
 
 # =========================
 # BOT INIT
@@ -716,21 +795,19 @@ async def cart_checkout(call: CallbackQuery, state: FSMContext):
     await call.message.answer(TEXT[lang]["order_start"])
     await call.answer()
 
-# Delivery
+# Delivery + FAQ + Contact
 @dp.message(F.text.in_(["🚚 Доставка", "🚚 Yetkazib berish"]))
 async def cmd_delivery(message: Message, state: FSMContext):
     user = db.user_get(message.from_user.id)
     lang = user["lang"] if user else "ru"
     await message.answer(TEXT[lang]["delivery"], reply_markup=kb_delivery(lang))
 
-# FAQ
 @dp.message(F.text.in_(["❓ FAQ"]))
 async def cmd_faq(message: Message, state: FSMContext):
     user = db.user_get(message.from_user.id)
     lang = user["lang"] if user else "ru"
     await message.answer(TEXT[lang]["faq"], reply_markup=kb_main(lang, is_admin(message.from_user.id)))
 
-# Contact
 @dp.message(F.text.in_(["📞 Связаться", "📞 Aloqa"]))
 async def cmd_contact(message: Message, state: FSMContext):
     user = db.user_get(message.from_user.id)
@@ -757,11 +834,9 @@ async def cmd_order(message: Message, state: FSMContext):
 async def cart_add_manual(message: Message, state: FSMContext):
     user = db.user_get(message.from_user.id)
     lang = user["lang"] if user else "ru"
-
     if not message.text:
         await message.answer("Введите название товара:" if lang == "ru" else "Mahsulot nomini kiriting:")
         return
-
     db.cart_add(message.from_user.id, message.text, 1)
     await message.answer(TEXT[lang]["cart_added"], reply_markup=kb_main(lang, is_admin(message.from_user.id)))
     await state.clear()
@@ -770,11 +845,9 @@ async def cart_add_manual(message: Message, state: FSMContext):
 async def order_name(message: Message, state: FSMContext):
     user = db.user_get(message.from_user.id)
     lang = user["lang"] if user else "ru"
-
     if not message.text:
         await message.answer(TEXT[lang]["order_start"])
         return
-
     await state.update_data(name=message.text)
     await state.set_state(States.order_phone)
     await message.answer(TEXT[lang]["order_phone"], reply_markup=kb_contact(lang))
@@ -783,12 +856,10 @@ async def order_name(message: Message, state: FSMContext):
 async def order_phone(message: Message, state: FSMContext):
     user = db.user_get(message.from_user.id)
     lang = user["lang"] if user else "ru"
-
     phone = message.contact.phone_number if message.contact else message.text
     if not phone:
         await message.answer(TEXT[lang]["order_phone"], reply_markup=kb_contact(lang))
         return
-
     await state.update_data(phone=phone)
     await state.set_state(States.order_city)
     await message.answer(TEXT[lang]["order_city"], reply_markup=kb_main(lang, is_admin(message.from_user.id)))
@@ -797,11 +868,9 @@ async def order_phone(message: Message, state: FSMContext):
 async def order_city(message: Message, state: FSMContext):
     user = db.user_get(message.from_user.id)
     lang = user["lang"] if user else "ru"
-
     if not message.text:
         await message.answer(TEXT[lang]["order_city"])
         return
-
     await state.update_data(city=message.text)
     await state.set_state(States.order_delivery)
     await message.answer(TEXT[lang]["order_delivery"], reply_markup=kb_delivery(lang))
@@ -813,7 +882,6 @@ async def order_delivery(call: CallbackQuery, state: FSMContext):
 
     user = db.user_get(call.from_user.id)
     lang = user["lang"] if user else "ru"
-
     delivery_names = {
         "b2b": "B2B Почта" if lang == "ru" else "B2B Pochta",
         "yandex_courier": "Яндекс Курьер" if lang == "ru" else "Yandex Kuryer",
@@ -829,11 +897,9 @@ async def order_delivery(call: CallbackQuery, state: FSMContext):
 async def order_address(message: Message, state: FSMContext):
     user = db.user_get(message.from_user.id)
     lang = user["lang"] if user else "ru"
-
     if not message.text:
         await message.answer(TEXT[lang]["order_address"])
         return
-
     await state.update_data(address=message.text)
     await state.set_state(States.order_comment)
     await message.answer(TEXT[lang]["order_comment"], reply_markup=kb_main(lang, is_admin(message.from_user.id)))
@@ -843,8 +909,10 @@ async def order_comment(message: Message, state: FSMContext):
     user = db.user_get(message.from_user.id)
     lang = user["lang"] if user else "ru"
 
-    comment = message.text if message.text not in ["📜 История", "📜 Buyurtmalar", "🛠 Админ", "🛠 Admin"] else ""
-    await state.update_data(comment=(comment or "—"))
+    comment = message.text or ""
+    if comment in ["📜 История", "📜 Buyurtmalar", "🛠 Админ", "🛠 Admin"]:
+        comment = ""
+    await state.update_data(comment=(comment.strip() or "—"))
 
     data = await state.get_data()
     items = db.cart_get(message.from_user.id)
@@ -890,7 +958,6 @@ async def order_confirm(call: CallbackQuery, state: FSMContext):
 
     order_id = db.order_create(order_data)
 
-    # 1) Уведомить админов (людей) с кнопками
     for admin_id in ADMIN_IDS:
         try:
             await bot.send_message(
@@ -905,7 +972,6 @@ async def order_confirm(call: CallbackQuery, state: FSMContext):
         except Exception as e:
             print(f"Failed to notify admin {admin_id}: {e}")
 
-    # 2) Дублировать в канал (если указан) — без кнопок
     if CHANNEL_ID:
         try:
             await bot.send_message(
@@ -939,17 +1005,14 @@ async def order_cancel(call: CallbackQuery, state: FSMContext):
 async def cmd_history(message: Message, state: FSMContext):
     user = db.user_get(message.from_user.id)
     lang = user["lang"] if user else "ru"
-
     orders = db.orders_get_user(message.from_user.id)
     if not orders:
         await message.answer(TEXT[lang]["history_empty"], reply_markup=kb_main(lang, is_admin(message.from_user.id)))
         return
-
     lines = []
     for o in orders[:5]:
         status_icon = {"new": "🆕", "processing": "⚙️", "shipped": "🚚", "delivered": "✅", "cancelled": "❌"}.get(o["status"], "❓")
         lines.append(f"{status_icon} #{o['id']} • {format_price(o['total_amount'])} сум • {o['created_at'][:10]}")
-
     await message.answer(TEXT[lang]["history"].format(orders="\n".join(lines)),
                          reply_markup=kb_main(lang, is_admin(message.from_user.id)))
 
@@ -961,6 +1024,16 @@ async def cmd_admin(message: Message, state: FSMContext):
     user = db.user_get(message.from_user.id)
     lang = user["lang"] if user else "ru"
     await message.answer(TEXT[lang]["admin_menu"], reply_markup=kb_admin(lang))
+
+@dp.callback_query(F.data == "admin:back")
+async def admin_back(call: CallbackQuery, state: FSMContext):
+    if not is_admin(call.from_user.id):
+        return
+    await state.clear()
+    user = db.user_get(call.from_user.id)
+    lang = user["lang"] if user else "ru"
+    await call.message.answer(TEXT[lang]["admin_menu"], reply_markup=kb_admin(lang))
+    await call.answer()
 
 @dp.callback_query(F.data.startswith("admin:"))
 async def admin_action(call: CallbackQuery, state: FSMContext):
@@ -974,8 +1047,7 @@ async def admin_action(call: CallbackQuery, state: FSMContext):
 
     if action == "stats":
         stats = db.get_stats()
-        text = TEXT[lang]["admin_stats"].format(**stats)
-        await call.message.answer(text, reply_markup=kb_admin(lang))
+        await call.message.answer(TEXT[lang]["admin_stats"].format(**stats), reply_markup=kb_admin(lang))
 
     elif action == "new":
         orders = db.orders_get_by_status("new")
@@ -1004,16 +1076,90 @@ async def admin_action(call: CallbackQuery, state: FSMContext):
     elif action == "export":
         await generate_monthly_report(call.message, lang)
 
+    elif action == "posts":
+        # Start weekly posts flow
+        await state.set_state(States.admin_post_dow)
+        await call.message.answer("Выберите день публикации (Пн–Сб):" if lang == "ru" else "Kun tanlang (Du–Sha):",
+                                  reply_markup=kb_dow(lang))
+
     await call.answer()
 
-# Order status management
+# Admin: choose day-of-week
+@dp.callback_query(F.data.startswith("dow:"))
+async def admin_choose_dow(call: CallbackQuery, state: FSMContext):
+    if not is_admin(call.from_user.id):
+        return
+    user = db.user_get(call.from_user.id)
+    lang = user["lang"] if user else "ru"
+    dow = int(call.data.split(":")[1])  # 1..6
+    await state.update_data(post_dow=dow)
+    await state.set_state(States.admin_post_media)
+    await call.message.answer(
+        "Теперь отправьте ОДНО сообщение: фото/видео + описание (caption)."
+        if lang == "ru" else
+        "Endi BITTA xabar yuboring: foto/video + matn (caption)."
+    )
+    await call.answer()
+
+# Admin: receive media+caption
+@dp.message(States.admin_post_media)
+async def admin_receive_week_post(message: Message, state: FSMContext):
+    if not is_admin(message.from_user.id):
+        return
+
+    user = db.user_get(message.from_user.id)
+    lang = user["lang"] if user else "ru"
+
+    data = await state.get_data()
+    dow = int(data.get("post_dow", 0))
+    if dow not in (1, 2, 3, 4, 5, 6):
+        await state.clear()
+        await message.answer("Сначала выберите день." if lang == "ru" else "Avval kunni tanlang.")
+        return
+
+    caption = (message.caption or message.text or "").strip()
+    if not caption:
+        await message.answer("⚠️ Добавьте описание (текст) к фото/видео." if lang == "ru" else "⚠️ Matn (izoh) qo'shing.")
+        return
+
+    media_type = "none"
+    file_id = ""
+
+    if message.photo:
+        media_type = "photo"
+        file_id = message.photo[-1].file_id
+    elif message.video:
+        media_type = "video"
+        file_id = message.video.file_id
+    else:
+        media_type = "none"
+        file_id = ""
+
+    week_key = db.week_key_now(datetime.now())
+    db.sched_add(dow=dow, media_type=media_type, file_id=file_id, caption=caption, week_key=week_key)
+    cnt = db.sched_count_week(week_key)
+
+    await message.answer(
+        (f"✅ Добавлено в план недели: <b>{week_key}</b>\n"
+         f"📌 День: {dow} (1=Пн ... 6=Сб)\n"
+         f"🧾 Сейчас постов в этой неделе: <b>{cnt}</b>\n\n"
+         "Чтобы добавить ещё — снова нажми: 🛠 Админ → 📰 Посты недели.")
+        if lang == "ru" else
+        (f"✅ Haftalik reja: <b>{week_key}</b>\n"
+         f"📌 Kun: {dow} (1=Du ... 6=Sha)\n"
+         f"🧾 Postlar soni: <b>{cnt}</b>\n\n"
+         "Yana qo‘shish uchun: 🛠 Admin → 📰 Haftalik postlar.")
+    )
+    await state.clear()
+
+# Order status buttons
 @dp.callback_query(F.data.startswith("order_seen:"))
 async def order_seen(call: CallbackQuery, state: FSMContext):
     if not is_admin(call.from_user.id):
         return
     order_id = int(call.data.split(":")[1])
     db.order_mark_seen(order_id, call.from_user.id)
-    await call.answer("✅ Просмотрено" if call.from_user.language_code != "uz" else "✅ Ko'rilgan")
+    await call.answer("✅ Просмотрено")
 
 @dp.callback_query(F.data.startswith("order_process:"))
 async def order_process(call: CallbackQuery, state: FSMContext):
@@ -1024,8 +1170,8 @@ async def order_process(call: CallbackQuery, state: FSMContext):
 
     order = db.order_get(order_id)
     if order:
-        user = db.user_get(order["user_id"])
-        lang = user["lang"] if user else "ru"
+        user_row = db.user_get(order["user_id"])
+        lang = user_row["lang"] if user_row else "ru"
         try:
             await bot.send_message(
                 order["user_id"],
@@ -1037,7 +1183,7 @@ async def order_process(call: CallbackQuery, state: FSMContext):
         except Exception as e:
             print(f"Failed to notify user: {e}")
 
-    await call.answer("✅ В работе!" if call.from_user.language_code != "uz" else "✅ Ishlanmoqda!")
+    await call.answer("✅ В работе!")
 
 @dp.callback_query(F.data.startswith("order_ship:"))
 async def order_ship(call: CallbackQuery, state: FSMContext):
@@ -1064,10 +1210,10 @@ async def order_cancel_admin(call: CallbackQuery, state: FSMContext):
     await call.answer("❌ Отменен!")
 
 # =========================
-# MONTHLY REPORT
+# REPORTS
 # =========================
 async def generate_monthly_report(message: Message, lang: str):
-    """Генерация Excel отчета за текущий месяц"""
+    """Manual export: current month"""
     now = datetime.now()
     year, month = now.year, now.month
 
@@ -1082,47 +1228,7 @@ async def generate_monthly_report(message: Message, lang: str):
 
     Path("reports").mkdir(exist_ok=True)
     filename = f"reports/report_{year}_{month:02d}.xlsx"
-
-    wb = Workbook()
-    ws = wb.active
-    ws.title = f"Report {month}.{year}"
-
-    headers = ["ID", "Дата", "Клиент", "Телефон", "Город", "Товары", "Сумма", "Статус"]
-    ws.append(headers)
-
-    for cell in ws[1]:
-        cell.font = Font(bold=True, color="FFFFFF")
-        cell.fill = PatternFill(start_color="366092", end_color="366092", fill_type="solid")
-
-    total_amount = 0
-    for order in orders:
-        items = json.loads(order["items"]) if order.get("items") else []
-        items_str = ", ".join([f"{it.get('name','')} x{it.get('qty',1)}" for it in items])
-
-        ws.append([
-            order["id"],
-            order["created_at"],
-            order["name"],
-            order["phone"],
-            order["city"],
-            items_str[:50],
-            order["total_amount"],
-            order["status"]
-        ])
-        total_amount += int(order["total_amount"] or 0)
-
-    for col in ws.columns:
-        max_len = 0
-        col_letter = col[0].column_letter
-        for cell in col:
-            try:
-                if cell.value:
-                    max_len = max(max_len, len(str(cell.value)))
-            except:
-                pass
-        ws.column_dimensions[col_letter].width = min(max_len + 2, 50)
-
-    wb.save(filename)
+    total_amount = build_excel_report(filename, orders)
 
     text = (
         f"📊 <b>Отчет за {month:02d}.{year}</b>\n\n"
@@ -1144,23 +1250,10 @@ async def generate_monthly_report(message: Message, lang: str):
     db.report_mark_sent(year, month, filename, len(orders), total_amount)
     await message.answer("✅ Отчет отправлен!" if lang == "ru" else "✅ Hisobot yuborildi!")
 
-async def generate_monthly_report_auto():
-    now = datetime.now()
-    year, month = now.year, now.month
-
-    if db.report_is_sent(year, month):
-        return
-
-    orders = db.orders_get_monthly(year, month)
-    if not orders:
-        return
-
-    Path("reports").mkdir(exist_ok=True)
-    filename = f"reports/report_{year}_{month:02d}.xlsx"
-
+def build_excel_report(filename: str, orders: List[Dict]) -> int:
     wb = Workbook()
     ws = wb.active
-    ws.title = f"Report {month}.{year}"
+    ws.title = "Report"
 
     headers = ["ID", "Дата", "Клиент", "Телефон", "Город", "Товары", "Сумма", "Статус"]
     ws.append(headers)
@@ -1173,25 +1266,37 @@ async def generate_monthly_report_auto():
     for order in orders:
         items = json.loads(order["items"]) if order.get("items") else []
         items_str = ", ".join([f"{it.get('name','')} x{it.get('qty',1)}" for it in items])
+
         ws.append([
-            order["id"], order["created_at"], order["name"],
-            order["phone"], order["city"], items_str[:50],
-            order["total_amount"], order["status"]
+            order["id"],
+            order["created_at"],
+            order["name"],
+            order["phone"],
+            order["city"],
+            items_str[:80],
+            int(order["total_amount"] or 0),
+            order["status"]
         ])
         total_amount += int(order["total_amount"] or 0)
 
-    for col in ws.columns:
-        max_len = 0
-        col_letter = col[0].column_letter
-        for cell in col:
-            try:
-                if cell.value:
-                    max_len = max(max_len, len(str(cell.value)))
-            except:
-                pass
-        ws.column_dimensions[col_letter].width = min(max_len + 2, 50)
-
     wb.save(filename)
+    return total_amount
+
+async def cron_send_prev_month_report():
+    """Auto: previous month report (closed month)"""
+    now = datetime.now()
+    year, month = prev_month(now)
+
+    if db.report_is_sent(year, month):
+        return
+
+    orders = db.orders_get_monthly(year, month)
+    if not orders:
+        return
+
+    Path("reports").mkdir(exist_ok=True)
+    filename = f"reports/report_{year}_{month:02d}.xlsx"
+    total_amount = build_excel_report(filename, orders)
 
     text = (
         f"📊 <b>Автоотчет за {month:02d}.{year}</b>\n\n"
@@ -1207,6 +1312,57 @@ async def generate_monthly_report_auto():
             print(f"Auto report failed for {admin_id}: {e}")
 
     db.report_mark_sent(year, month, filename, len(orders), total_amount)
+
+# =========================
+# DAILY WEEKLY POST (Mon–Sat)
+# =========================
+async def cron_post_daily_to_channel():
+    if not CHANNEL_ID:
+        return
+
+    now = datetime.now()
+    dow = now.isoweekday()  # 1..7
+
+    # Sunday: remind admin
+    if dow == 7:
+        for admin_id in ADMIN_IDS:
+            try:
+                await bot.send_message(admin_id, "📌 Воскресенье: загрузите посты на новую неделю (Пн–Сб) → 🛠 Админ → 📰 Посты недели.")
+            except Exception:
+                pass
+        return
+
+    week_key = db.week_key_now(now)
+    post = db.sched_get_for_day(dow=dow, week_key=week_key)
+
+    if not post:
+        for admin_id in ADMIN_IDS:
+            try:
+                await bot.send_message(admin_id, f"⚠️ Нет поста на сегодня (день={dow}) для недели {week_key}. Загрузите: 🛠 Админ → 📰 Посты недели.")
+            except Exception:
+                pass
+        return
+
+    caption = (post.get("caption") or "").strip() or "🔥 ZARY & CO"
+    media_type = post.get("media_type") or "none"
+    file_id = post.get("file_id") or ""
+
+    try:
+        if media_type == "video" and file_id:
+            await bot.send_video(CHANNEL_ID, file_id, caption=caption)
+        elif media_type == "photo" and file_id:
+            await bot.send_photo(CHANNEL_ID, file_id, caption=caption)
+        else:
+            await bot.send_message(CHANNEL_ID, caption)
+
+        db.sched_mark_posted(post["id"])
+
+    except Exception as e:
+        for admin_id in ADMIN_IDS:
+            try:
+                await bot.send_message(admin_id, f"❌ Ошибка публикации в канал: {e}")
+            except Exception:
+                pass
 
 # =========================
 # REMINDERS
@@ -1228,18 +1384,16 @@ async def check_reminders():
         db.order_update_reminded(o["id"])
 
 # =========================
-# SCHEDULER
+# SCHEDULER (only reminders)
 # =========================
 async def scheduler():
     from apscheduler.schedulers.asyncio import AsyncIOScheduler
-
     sch = AsyncIOScheduler()
     sch.add_job(check_reminders, "interval", minutes=30)
-    sch.add_job(generate_monthly_report_auto, "cron", day="last", hour=23, minute=0)
     sch.start()
 
 # =========================
-# WEB SERVER (Render)
+# WEB SERVER + CRON ENDPOINTS
 # =========================
 from aiohttp import web
 
@@ -1249,8 +1403,24 @@ async def health_server():
     async def health(request):
         return web.Response(text="OK", status=200)
 
+    async def cron_monthly(request: web.Request):
+        secret = request.query.get("secret", "")
+        if not cron_allowed(secret):
+            return web.Response(text="Forbidden", status=403)
+        await cron_send_prev_month_report()
+        return web.Response(text="OK", status=200)
+
+    async def cron_daily(request: web.Request):
+        secret = request.query.get("secret", "")
+        if not cron_allowed(secret):
+            return web.Response(text="Forbidden", status=403)
+        await cron_post_daily_to_channel()
+        return web.Response(text="OK", status=200)
+
     app.router.add_get("/", health)
     app.router.add_get("/health", health)
+    app.router.add_get("/cron/monthly", cron_monthly)
+    app.router.add_get("/cron/daily", cron_daily)
 
     runner = web.AppRunner(app)
     await runner.setup()
@@ -1266,7 +1436,9 @@ async def main():
     await scheduler()
     print(f"✅ Bot started with {len(ADMIN_IDS)} admins: {ADMIN_IDS}")
     if CHANNEL_ID:
-        print(f"✅ Channel notifications enabled: {CHANNEL_ID}")
+        print(f"✅ Channel enabled: {CHANNEL_ID}")
+    if CRON_SECRET:
+        print("✅ Cron endpoints enabled: /cron/monthly /cron/daily")
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
