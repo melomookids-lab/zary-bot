@@ -1,5 +1,5 @@
 """
-ZARY & CO — Retail Bot v3.4 (FULL FILE)
+ZARY & CO — Retail Bot v3.5 (FULL FILE)
 ✅ aiogram 3.x
 ✅ SQLite (bot.db)
 ✅ Admins only (ADMIN_ID_1..3)
@@ -20,16 +20,19 @@ ZARY & CO — Retail Bot v3.4 (FULL FILE)
 - Funnel events + conversion: cart_add -> order_created
 - /find <phone_part> for admins (quick CRM search)
 
-✅ Thank you + follow links:
-- After order created
-- After delivered
+✅ Improvements:
+- "📞 Написать клиенту" button in admin message (tg://user?id=USER_ID)
+- Different thank-you text after DELIVERED
+- Fixed /admin/orders API URL bug
+- Removed APScheduler dependency (asyncio loop)
+- SQLite WAL + timeout to reduce delays/locks
 """
 
 import os
 import html
 import asyncio
 import json
-from datetime import datetime, timedelta, date
+from datetime import datetime, timedelta
 from calendar import monthrange
 from typing import Optional, Dict, List, Tuple
 from pathlib import Path
@@ -37,8 +40,8 @@ import sqlite3
 import threading
 
 from zoneinfo import ZoneInfo
-
 TZ = ZoneInfo("Asia/Tashkent")
+
 
 # =========================
 # ENV
@@ -53,6 +56,7 @@ for i in range(1, 4):
     if v and v.lstrip("-").isdigit():
         ADMIN_IDS.append(int(v))
 
+# fallback compatibility
 if not ADMIN_IDS:
     old_admin = os.getenv("MANAGER_CHAT_ID", "").strip()
     if old_admin and old_admin.lstrip("-").isdigit():
@@ -79,13 +83,13 @@ CRON_SECRET = os.getenv("CRON_SECRET", "").strip()
 ADMIN_PANEL_TOKEN = os.getenv("ADMIN_PANEL_TOKEN", "").strip()
 
 if not ADMIN_PANEL_TOKEN:
-    # Можно не падать, но лучше чтобы был.
     print("⚠️ ADMIN_PANEL_TOKEN не установлен! /admin будет не защищен. Рекомендуется установить.")
 
 # Follow links
 FOLLOW_TG = "https://t.me/zaryco_official"
 FOLLOW_YT = "https://www.youtube.com/@ZARYCOOFFICIAL"
 FOLLOW_IG = "https://www.instagram.com/zary.co/"
+
 
 # =========================
 # PRODUCTS (Quick order list)
@@ -102,6 +106,7 @@ PRODUCTS_UZ = [
     "Sport kostyum", "Maktab formasi (komplekt)", "Maktab jileti",
     "Kardigan", "Pijama", "Komplekt (kofta+shim)"
 ]
+
 
 # =========================
 # HELPERS
@@ -139,6 +144,7 @@ def admin_panel_allowed(token: str) -> bool:
         return True
     return token == ADMIN_PANEL_TOKEN
 
+
 # =========================
 # DB
 # =========================
@@ -148,14 +154,25 @@ class Database:
         self._local = threading.local()
         self._init_db()
 
+    def _connect(self):
+        conn = sqlite3.connect(self.db_path, check_same_thread=False, timeout=10)
+        conn.row_factory = sqlite3.Row
+        # Reduce locks + improve concurrency
+        try:
+            conn.execute("PRAGMA journal_mode=WAL;")
+            conn.execute("PRAGMA synchronous=NORMAL;")
+            conn.execute("PRAGMA temp_store=MEMORY;")
+        except Exception:
+            pass
+        return conn
+
     def _get_conn(self):
         if not hasattr(self._local, "conn") or self._local.conn is None:
-            self._local.conn = sqlite3.connect(self.db_path, check_same_thread=False)
-            self._local.conn.row_factory = sqlite3.Row
+            self._local.conn = self._connect()
         return self._local.conn
 
     def _init_db(self):
-        conn = sqlite3.connect(self.db_path)
+        conn = self._connect()
         cur = conn.cursor()
         cur.executescript("""
             CREATE TABLE IF NOT EXISTS users (
@@ -215,7 +232,6 @@ class Database:
                 posted_at TEXT
             );
 
-            -- Funnel / analytics events
             CREATE TABLE IF NOT EXISTS events (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 user_id INTEGER,
@@ -253,8 +269,10 @@ class Database:
         if cur.fetchone():
             cur.execute("UPDATE users SET username=?, lang=? WHERE user_id=?", (username, lang, user_id))
         else:
-            cur.execute("INSERT INTO users (user_id, username, lang, created_at) VALUES (?,?,?,?)",
-                        (user_id, username, lang, ts))
+            cur.execute(
+                "INSERT INTO users (user_id, username, lang, created_at) VALUES (?,?,?,?)",
+                (user_id, username, lang, ts)
+            )
         conn.commit()
 
     def user_get(self, user_id: int) -> Optional[Dict]:
@@ -271,7 +289,6 @@ class Database:
         cur.execute("INSERT INTO carts (user_id, product_name, qty, size) VALUES (?,?,?,?)",
                     (user_id, product_name, qty, size))
         conn.commit()
-        # event
         self.event_add(user_id, "cart_add", {"product": product_name, "qty": qty})
 
     def cart_get(self, user_id: int) -> List[Dict]:
@@ -495,8 +512,7 @@ class Database:
                 if not name:
                     continue
                 counter[name] = counter.get(name, 0) + qty
-        top = sorted(counter.items(), key=lambda x: x[1], reverse=True)[:limit]
-        return top
+        return sorted(counter.items(), key=lambda x: x[1], reverse=True)[:limit]
 
     def top_cities_range(self, start: str, end: str, limit: int = 10) -> List[Tuple[str, int]]:
         conn = self._get_conn()
@@ -514,7 +530,6 @@ class Database:
     def ru_vs_uz_range(self, start: str, end: str) -> Dict:
         conn = self._get_conn()
         cur = conn.cursor()
-        # lang берём из users по user_id
         cur.execute("""
             SELECT u.lang as lang, COUNT(o.id) as c
             FROM orders o
@@ -576,7 +591,9 @@ class Database:
         """, (f"%{phone_part}%", limit))
         return [dict(r) for r in cur.fetchall()]
 
+
 db = Database()
+
 
 # =========================
 # aiogram
@@ -597,6 +614,7 @@ from aiogram.types.input_file import FSInputFile
 
 from openpyxl import Workbook
 from openpyxl.styles import Font, PatternFill
+
 
 # =========================
 # TEXTS
@@ -626,7 +644,19 @@ TEXT = {
         "order_address": "📍 Введите адрес доставки:",
         "order_confirm": "📝 <b>Проверьте заказ:</b>\n\n👤 {name}\n📱 {phone}\n🏙 {city}\n🚚 {delivery}\n📍 {address}\n\n🛒 Товары:\n{items}\n\n💬 Цена: <b>по договоренности</b>\nМенеджер уточнит размер и итоговую сумму.\n\nПодтвердить?",
         "order_success": "✅ Заказ #{order_id} принят!\n\nУважаемый покупатель, вам поступят уведомления о статусе.\nМенеджер скоро свяжется и уточнит детали.\n⏰ 09:00-21:00",
-        "order_thanks": "🙏 Спасибо за заказ! Мы рады, что вы с нами 🤍\n\nЧтобы нас не потерять — подпишитесь на наши каналы:",
+
+        # ✅ оставляем как было — для "принят"
+        "thanks_new": "🙏 Спасибо за заказ! Мы рады, что вы с нами 🤍\n\nЧтобы нас не потерять — подпишитесь на наши каналы:",
+
+        # ✅ новый текст — для "доставлен"
+        "thanks_delivered": (
+            "🤍 Спасибо, что выбрали ZARY & CO!\n\n"
+            "Надеемся, одежда принесёт радость и комфорт.\n"
+            "Носите с удовольствием и на здоровье ✨\n\n"
+            "Будем рады видеть вас снова!\n"
+            "Чтобы не пропустить новинки — подпишитесь на наши каналы 👇"
+        ),
+
         "history": "📜 <b>История заказов</b>\n\n{orders}",
         "history_empty": "📜 У вас пока нет заказов",
         "admin_menu": "🛠 <b>Админ панель</b>\n\nВыберите действие:",
@@ -657,7 +687,16 @@ TEXT = {
         "order_address": "📍 Manzilni kiriting:",
         "order_confirm": "📝 <b>Buyurtmani tekshiring:</b>\n\n👤 {name}\n📱 {phone}\n🏙 {city}\n🚚 {delivery}\n📍 {address}\n\n🛒 Tovarlar:\n{items}\n\n💬 Narx: <b>kelishuv bo'yicha</b>\nMenejer o'lcham va yakuniy summani aniqlaydi.\n\nTasdiqlaysizmi?",
         "order_success": "✅ Buyurtma #{order_id} qabul qilindi!\n\nHurmatli mijoz, status bo'yicha xabarlar yuboriladi.\nMenejer tez orada bog'lanadi.\n⏰ 09:00-21:00",
-        "order_thanks": "🙏 Buyurtmangiz uchun rahmat! Siz biz bilan ekaningizdan xursandmiz 🤍\n\nBizni yo‘qotib qo‘ymaslik uchun kanallarimizga obuna bo‘ling:",
+
+        "thanks_new": "🙏 Buyurtmangiz uchun rahmat! Siz biz bilan ekaningizdan xursandmiz 🤍\n\nBizni yo‘qotib qo‘ymaslik uchun kanallarimizga obuna bo‘ling:",
+        "thanks_delivered": (
+            "🤍 ZARY & CO ni tanlaganingiz uchun rahmat!\n\n"
+            "Kiyim sizga qulaylik va xursandchilik olib kelsin.\n"
+            "Yaxshi kayfiyat bilan kiying ✨\n\n"
+            "Yana sizni ko‘rishdan xursand bo‘lamiz!\n"
+            "Yangiliklarni o‘tkazib yubormaslik uchun kanallarimizga obuna bo‘ling 👇"
+        ),
+
         "history": "📜 <b>Buyurtmalar tarixi</b>\n\n{orders}",
         "history_empty": "📜 Hozircha buyurtmalar yo'q",
         "admin_menu": "🛠 <b>Admin paneli</b>\n\nAmalni tanlang:",
@@ -665,6 +704,7 @@ TEXT = {
         "cancelled": "❌ Bekor qilindi",
     }
 }
+
 
 # =========================
 # KEYBOARDS
@@ -751,17 +791,19 @@ def kb_admin(lang: str) -> InlineKeyboardMarkup:
         [InlineKeyboardButton(text="⬅️ Назад" if lang == "ru" else "⬅️ Orqaga", callback_data="back:menu")],
     ])
 
-def kb_admin_order(order_id: int, lang: str) -> InlineKeyboardMarkup:
+# ✅ NEW: user_id inside admin keyboard (write to client)
+def kb_admin_order(order_id: int, user_id: int, lang: str) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="📞 Написать клиенту" if lang=="ru" else "📞 Mijozga yozish", url=f"tg://user?id={user_id}")],
         [
-            InlineKeyboardButton(text="👁 Просмотрено", callback_data=f"order_seen:{order_id}"),
-            InlineKeyboardButton(text="⚙️ В работу", callback_data=f"order_process:{order_id}")
+            InlineKeyboardButton(text="👁 Просмотрено" if lang=="ru" else "👁 Ko'rildi", callback_data=f"order_seen:{order_id}"),
+            InlineKeyboardButton(text="⚙️ В работу" if lang=="ru" else "⚙️ Ishga", callback_data=f"order_process:{order_id}")
         ],
         [
-            InlineKeyboardButton(text="🚚 Отправлен", callback_data=f"order_ship:{order_id}"),
-            InlineKeyboardButton(text="✅ Доставлен", callback_data=f"order_deliver:{order_id}")
+            InlineKeyboardButton(text="🚚 Отправлен" if lang=="ru" else "🚚 Jo'natildi", callback_data=f"order_ship:{order_id}"),
+            InlineKeyboardButton(text="✅ Доставлен" if lang=="ru" else "✅ Yetkazildi", callback_data=f"order_deliver:{order_id}")
         ],
-        [InlineKeyboardButton(text="❌ Отмена", callback_data=f"order_cancel:{order_id}")],
+        [InlineKeyboardButton(text="❌ Отмена" if lang=="ru" else "❌ Bekor", callback_data=f"order_cancel:{order_id}")],
     ])
 
 def kb_contact(lang: str) -> ReplyKeyboardMarkup:
@@ -827,6 +869,7 @@ def kb_dow(lang: str) -> InlineKeyboardMarkup:
     rows.append([InlineKeyboardButton(text="⬅️ Назад" if lang == "ru" else "⬅️ Orqaga", callback_data="admin:back")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
+
 # =========================
 # FSM
 # =========================
@@ -845,11 +888,13 @@ class States(StatesGroup):
     admin_post_dow = State()
     admin_post_media = State()
 
+
 # =========================
 # BOT INIT
 # =========================
 bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
 dp = Dispatcher(storage=MemoryStorage())
+
 
 # =========================
 # HANDLERS
@@ -1242,6 +1287,7 @@ async def order_confirm(call: CallbackQuery, state: FSMContext):
 
     order_id = db.order_create(order_data)
 
+    # notify admins
     for admin_id in ADMIN_IDS:
         try:
             await bot.send_message(
@@ -1254,11 +1300,12 @@ async def order_confirm(call: CallbackQuery, state: FSMContext):
                 f"📍 {esc(order_data['delivery_address'])}\n"
                 f"🛒 {', '.join([esc(it['product_name']) for it in items])}\n"
                 f"💬 Цена: по договоренности",
-                reply_markup=kb_admin_order(order_id, "ru")
+                reply_markup=kb_admin_order(order_id, order_data["user_id"], "ru")
             )
         except Exception as e:
             print(f"Failed to notify admin {admin_id}: {e}")
 
+    # notify channel (optional)
     if CHANNEL_ID:
         try:
             await bot.send_message(
@@ -1281,8 +1328,8 @@ async def order_confirm(call: CallbackQuery, state: FSMContext):
         reply_markup=kb_main(lang, is_admin(call.from_user.id))
     )
 
-    # ✅ Thank you + follow buttons
-    await call.message.answer(TEXT[lang]["order_thanks"], reply_markup=kb_follow_links(lang))
+    # ✅ Thank you + follow buttons (NEW ORDER)
+    await call.message.answer(TEXT[lang]["thanks_new"], reply_markup=kb_follow_links(lang))
 
     await call.answer()
 
@@ -1349,7 +1396,7 @@ async def admin_action(call: CallbackQuery, state: FSMContext):
                     f"🛒 {esc(items_text)}\n"
                     f"💬 Цена: по договоренности"
                 )
-                await call.message.answer(text, reply_markup=kb_admin_order(order["id"], lang))
+                await call.message.answer(text, reply_markup=kb_admin_order(order["id"], order["user_id"], lang))
 
     elif action == "processing":
         orders = db.orders_get_by_status("processing")
@@ -1500,7 +1547,8 @@ async def order_deliver(call: CallbackQuery, state: FSMContext):
                 (f"✅ Buyurtma #{order_id} yetkazildi!\nZARY & CO ni tanlaganingiz uchun rahmat 🤍"),
                 reply_markup=kb_main(lang, is_admin(order["user_id"]))
             )
-            await bot.send_message(order["user_id"], TEXT[lang]["order_thanks"], reply_markup=kb_follow_links(lang))
+            # ✅ delivered-thanks
+            await bot.send_message(order["user_id"], TEXT[lang]["thanks_delivered"], reply_markup=kb_follow_links(lang))
         except Exception as e:
             print(f"Failed to notify user delivered: {e}")
     await call.answer("✅ Доставлен!")
@@ -1526,6 +1574,7 @@ async def order_cancel_admin(call: CallbackQuery, state: FSMContext):
         except Exception as e:
             print(f"Failed to notify user cancelled: {e}")
     await call.answer("❌ Отменен!")
+
 
 # =========================
 # REPORTS
@@ -1613,6 +1662,7 @@ async def cron_send_prev_month_report():
 
     db.report_mark_sent(year, month, filename, len(orders), total_amount)
 
+
 # =========================
 # DAILY CHANNEL POST (Mon–Sat), Sunday reminder
 # =========================
@@ -1662,8 +1712,9 @@ async def cron_post_daily_to_channel():
             except Exception:
                 pass
 
+
 # =========================
-# REMINDERS
+# REMINDERS (asyncio loop instead of APScheduler)
 # =========================
 async def check_reminders():
     orders = db.orders_get_for_reminder()
@@ -1681,14 +1732,14 @@ async def check_reminders():
     for o in orders:
         db.order_update_reminded(o["id"])
 
-# =========================
-# SCHEDULER
-# =========================
-async def scheduler():
-    from apscheduler.schedulers.asyncio import AsyncIOScheduler
-    sch = AsyncIOScheduler()
-    sch.add_job(check_reminders, "interval", minutes=30)
-    sch.start()
+async def reminders_loop():
+    while True:
+        try:
+            await check_reminders()
+        except Exception as e:
+            print("reminders_loop error:", e)
+        await asyncio.sleep(30 * 60)  # every 30 minutes
+
 
 # =========================
 # WEB SERVER + CRON + ADMIN PANEL
@@ -1736,8 +1787,8 @@ a{{color:#7aa2ff; text-decoration:none}}
 <div class="header">
   <div><b>ZARY & CO</b> <span class="badge">Admin</span></div>
   <div class="small">
-    <a href="/admin{''}" id="dashLink">Dashboard</a> ·
-    <a href="/admin/orders{''}" id="ordersLink">Orders</a>
+    <a href="/admin" id="dashLink">Dashboard</a> ·
+    <a href="/admin/orders" id="ordersLink">Orders</a>
   </div>
 </div>
 <div class="container">
@@ -1829,77 +1880,68 @@ async def health_server():
         </div>
 
         <script>
-        async function api(path){{
+        async function api(path){
           const params = new URLSearchParams(location.search);
           const token = params.get("token") || "";
           const r = await fetch(path + "?token=" + encodeURIComponent(token));
           if(!r.ok) throw new Error("API error");
           return await r.json();
-        }}
+        }
 
-        function formatStats(s){{
+        function formatStats(s){
           return `Всего: ${s.total} | Новые: ${s.new} | В обработке: ${s.processing} | Отправлено: ${s.shipped} | Доставлено: ${s.delivered} | Отменено: ${s.cancelled}`;
-        }}
+        }
 
-        (async () => {{
+        (async () => {
           const today = await api("/admin/api/stats/today");
           const month = await api("/admin/api/stats/month");
 
           document.getElementById("todayStats").textContent = formatStats(today.stats);
           document.getElementById("monthStats").textContent = formatStats(month.stats);
 
-          // top products
           const tp = month.top_products;
-          new Chart(document.getElementById("topProducts"), {{
+          new Chart(document.getElementById("topProducts"), {
             type: "bar",
-            data: {{
+            data: {
               labels: tp.map(x => x.name),
-              datasets: [{{ label: "Кол-во", data: tp.map(x => x.count) }}]
-            }},
-            options: {{
-              plugins: {{ legend: {{ display: false }} }},
-              scales: {{ x: {{ ticks: {{ color:"#e8eefc" }} }}, y: {{ ticks: {{ color:"#e8eefc" }} }} }}
-            }}
-          }});
+              datasets: [{ label: "Кол-во", data: tp.map(x => x.count) }]
+            },
+            options: {
+              plugins: { legend: { display: false } }
+            }
+          });
 
-          // top cities
           const tc = month.top_cities;
-          new Chart(document.getElementById("topCities"), {{
+          new Chart(document.getElementById("topCities"), {
             type: "bar",
-            data: {{
+            data: {
               labels: tc.map(x => x.city),
-              datasets: [{{ label: "Заказы", data: tc.map(x => x.count) }}]
-            }},
-            options: {{
-              plugins: {{ legend: {{ display: false }} }},
-              scales: {{ x: {{ ticks: {{ color:"#e8eefc" }} }}, y: {{ ticks: {{ color:"#e8eefc" }} }} }}
-            }}
-          }});
+              datasets: [{ label: "Заказы", data: tc.map(x => x.count) }]
+            },
+            options: {
+              plugins: { legend: { display: false } }
+            }
+          });
 
-          // lang
           const lc = month.ru_vs_uz;
-          new Chart(document.getElementById("langChart"), {{
+          new Chart(document.getElementById("langChart"), {
             type: "doughnut",
-            data: {{
+            data: {
               labels: ["RU", "UZ", "Unknown"],
-              datasets: [{{ data: [lc.ru, lc.uz, lc.unknown] }}]
-            }},
-            options: {{
-              plugins: {{ legend: {{ labels: {{ color:"#e8eefc" }} }} }}
-            }}
-          }});
+              datasets: [{ data: [lc.ru, lc.uz, lc.unknown] }]
+            }
+          });
 
-          // funnel
           const f = month.funnel;
           document.getElementById("funnelBox").innerHTML =
             `<div class="small">Добавили в корзину: <b>${f.cart_add}</b></div>` +
             `<div class="small">Оформили заказ: <b>${f.order_created}</b></div>` +
             `<div class="small">Конверсия: <b>${f.conversion}%</b></div>`;
-        }})().catch(e => {{
+        })().catch(e => {
           document.getElementById("todayStats").textContent = "Ошибка загрузки";
           document.getElementById("monthStats").textContent = "Ошибка загрузки";
           document.getElementById("funnelBox").textContent = "Ошибка загрузки";
-        }});
+        });
         </script>
         """
         return web.Response(text=_render_base_html("ZARY Admin Dashboard", body), content_type="text/html")
@@ -1941,8 +1983,9 @@ async def health_server():
         function qs(id){ return document.getElementById(id); }
         function token(){ return new URLSearchParams(location.search).get("token") || ""; }
 
-        async function api(path, opts){ 
-          const r = await fetch(path + (path.includes("?") ? "&" : "?") + "token=" + encodeURIComponent(token()), opts || {});
+        async function api(path, opts){
+          const glue = path.includes("?") ? "&" : "?";
+          const r = await fetch(path + glue + "token=" + encodeURIComponent(token()), opts || {});
           if(!r.ok) throw new Error("API error");
           return await r.json();
         }
@@ -1983,7 +2026,6 @@ async def health_server():
           </table>`;
           qs("tableWrap").innerHTML = html;
 
-          // bind save
           document.querySelectorAll("[data-save]").forEach(btn => {
             btn.addEventListener("click", async () => {
               const id = btn.getAttribute("data-save");
@@ -2011,7 +2053,8 @@ async def health_server():
           const st = qs("st").value;
           const city = qs("city").value.trim();
           const phone = qs("phone").value.trim();
-          const data = await api(`/admin/api/orders&status=${encodeURIComponent(st)}&city=${encodeURIComponent(city)}&phone=${encodeURIComponent(phone)}`);
+          const path = `/admin/api/orders?status=${encodeURIComponent(st)}&city=${encodeURIComponent(city)}&phone=${encodeURIComponent(phone)}`;
+          const data = await api(path);
           render(data.orders);
         }
 
@@ -2063,7 +2106,6 @@ async def health_server():
         rows = db.orders_filter(status=status, city=city, phone_q=phone, limit=200)
         orders = []
         for o in rows:
-            # preview items
             try:
                 items = json.loads(o.get("items") or "[]")
                 items_preview = ", ".join([f"{it.get('name','')} x{it.get('qty',1)}" for it in items[:3]])
@@ -2097,7 +2139,7 @@ async def health_server():
 
         db.order_update_status(order_id, status, PRIMARY_ADMIN)
 
-        # notify customer same logic as telegram buttons:
+        # notify customer
         order = db.order_get(order_id)
         if order:
             user_row = db.user_get(order["user_id"])
@@ -2127,7 +2169,7 @@ async def health_server():
                         (f"✅ Buyurtma #{order_id} yetkazildi!\nZARY & CO ni tanlaganingiz uchun rahmat 🤍"),
                         reply_markup=kb_main(lang, is_admin(order["user_id"]))
                     )
-                    await bot.send_message(order["user_id"], TEXT[lang]["order_thanks"], reply_markup=kb_follow_links(lang))
+                    await bot.send_message(order["user_id"], TEXT[lang]["thanks_delivered"], reply_markup=kb_follow_links(lang))
                 elif status == "cancelled":
                     await bot.send_message(
                         order["user_id"],
@@ -2152,7 +2194,6 @@ async def health_server():
 
     app.router.add_get("/admin/api/stats/today", api_stats_today)
     app.router.add_get("/admin/api/stats/month", api_stats_month)
-    # note: used in JS as "/admin/api/orders&..." to keep one token injection
     app.router.add_get("/admin/api/orders", api_orders)
     app.router.add_post("/admin/api/order/status", api_order_status)
 
@@ -2162,12 +2203,13 @@ async def health_server():
     await site.start()
     print(f"✅ Health/Admin server on port {PORT}")
 
+
 # =========================
 # MAIN
 # =========================
 async def main():
     await health_server()
-    await scheduler()
+    asyncio.create_task(reminders_loop())
     print(f"✅ Bot started with {len(ADMIN_IDS)} admins: {ADMIN_IDS}")
     if CHANNEL_ID:
         print(f"✅ Channel enabled: {CHANNEL_ID}")
