@@ -1,614 +1,50 @@
 """
-ZARY & CO — Retail Bot v3.5 (FULL FILE)
-✅ aiogram 3.x
-✅ SQLite (bot.db)
-✅ Admins only (ADMIN_ID_1..3)
-✅ Channel notifications (CHANNEL_ID)
-✅ Orders + Cart + Admin panel
-✅ Excel export (manual)
-✅ Render HTTP endpoints for Cron:
-   - /cron/monthly?secret=...
-   - /cron/daily?secret=...
+ZARY SHOP BOT — FINAL FULL VERSION
+PART 1/4
 
-✅ Weekly scheduled posts (Mon–Sat 18:00 Tashkent via cron)
-✅ Sunday reminder to admin to upload new weekly posts
-
-✅ ADDED (Telegram + Web analytics panel):
-- Web admin dashboard: /admin?token=...
-- Orders page + filters: /admin/orders?token=...
-- API endpoints for charts + status update
-- Funnel events + conversion: cart_add -> order_created
-- /find <phone_part> for admins (quick CRM search)
-
-✅ Improvements:
-- "📞 Написать клиенту" button in admin message (tg://user?id=USER_ID)
-- Different thank-you text after DELIVERED
-- Fixed /admin/orders API URL bug
-- Removed APScheduler dependency (asyncio loop)
-- SQLite WAL + timeout to reduce delays/locks
+Что внутри этой части:
+- imports
+- env
+- helpers
+- texts RU/UZ
+- database
+- bot init
+- states
+- keyboards
 """
 
 import os
 import html
-import asyncio
 import json
+import asyncio
+import sqlite3
+import secrets
+import threading
 from datetime import datetime, timedelta
 from calendar import monthrange
-from typing import Optional, Dict, List, Tuple
 from pathlib import Path
-import sqlite3
-import threading
+from typing import Optional, Dict, List, Tuple, Any
+from urllib.parse import quote
 
 from zoneinfo import ZoneInfo
-TZ = ZoneInfo("Asia/Tashkent")
+from aiohttp import web
 
-
-# =========================
-# ENV
-# =========================
-BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
-if not BOT_TOKEN:
-    raise RuntimeError("❌ BOT_TOKEN не установлен!")
-
-ADMIN_IDS: List[int] = []
-for i in range(1, 4):
-    v = os.getenv(f"ADMIN_ID_{i}", "").strip()
-    if v and v.lstrip("-").isdigit():
-        ADMIN_IDS.append(int(v))
-
-# fallback compatibility
-if not ADMIN_IDS:
-    old_admin = os.getenv("MANAGER_CHAT_ID", "").strip()
-    if old_admin and old_admin.lstrip("-").isdigit():
-        ADMIN_IDS.append(int(old_admin))
-
-if not ADMIN_IDS:
-    raise RuntimeError("❌ Нужен хотя бы один ADMIN_ID_1 (личный Telegram ID)")
-
-PRIMARY_ADMIN = ADMIN_IDS[0]
-
-_channel_id = os.getenv("CHANNEL_ID", "").strip()
-CHANNEL_ID = int(_channel_id) if _channel_id and _channel_id.lstrip("-").isdigit() else None
-
-CHANNEL_USERNAME = os.getenv("CHANNEL_USERNAME", "zaryco_official").strip().lstrip("@")
-TG_CHANNEL_URL = f"https://t.me/{CHANNEL_USERNAME}"
-
-PHONE = os.getenv("MANAGER_PHONE", "+998771202255").strip()
-MANAGER_USERNAME = os.getenv("MANAGER_USERNAME", "zaryco_official").strip().lstrip("@")
-
-PORT = int(os.getenv("PORT", "10000"))
-DB_PATH = os.getenv("DB_PATH", "bot.db")
-
-CRON_SECRET = os.getenv("CRON_SECRET", "").strip()
-ADMIN_PANEL_TOKEN = os.getenv("ADMIN_PANEL_TOKEN", "").strip()
-
-if not ADMIN_PANEL_TOKEN:
-    print("⚠️ ADMIN_PANEL_TOKEN не установлен! /admin будет не защищен. Рекомендуется установить.")
-
-# Follow links
-FOLLOW_TG = "https://t.me/zaryco_official"
-FOLLOW_YT = "https://www.youtube.com/@ZARYCOOFFICIAL"
-FOLLOW_IG = "https://www.instagram.com/zary.co/"
-
-
-# =========================
-# PRODUCTS (Quick order list)
-# =========================
-PRODUCTS_RU = [
-    "Худи детское", "Свитшот", "Футболка", "Рубашка", "Джинсы",
-    "Брюки классические", "Юбка", "Платье", "Куртка демисезонная",
-    "Костюм спортивный", "Школьная форма (комплект)", "Жилет школьный",
-    "Кардиган", "Пижама", "Комплект (кофта+брюки)"
-]
-PRODUCTS_UZ = [
-    "Bolalar hudi", "Sviter", "Futbolka", "Ko'ylak", "Jinsi",
-    "Klassik shim", "Yubka", "Ko'ylak (dress)", "Demisezon kurtka",
-    "Sport kostyum", "Maktab formasi (komplekt)", "Maktab jileti",
-    "Kardigan", "Pijama", "Komplekt (kofta+shim)"
-]
-
-
-# =========================
-# HELPERS
-# =========================
-def now_tz() -> datetime:
-    return datetime.now(TZ)
-
-def esc(s: str) -> str:
-    return html.escape(str(s) if s else "")
-
-def is_admin(user_id: int) -> bool:
-    return user_id in ADMIN_IDS
-
-def size_by_age(age: int) -> str:
-    mapping = {1: "86", 2: "92", 3: "98", 4: "104", 5: "110", 6: "116",
-               7: "122", 8: "128", 9: "134", 10: "140", 11: "146",
-               12: "152", 13: "158", 14: "164", 15: "164"}
-    return mapping.get(age, "122-128")
-
-def size_by_height(height: int) -> str:
-    sizes = [86, 92, 98, 104, 110, 116, 122, 128, 134, 140, 146, 152, 158, 164]
-    closest = min(sizes, key=lambda x: abs(x - height))
-    return str(closest)
-
-def prev_month(dt: datetime) -> tuple[int, int]:
-    first = dt.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
-    prev_last = first - timedelta(days=1)
-    return prev_last.year, prev_last.month
-
-def cron_allowed(secret: str) -> bool:
-    return bool(CRON_SECRET) and secret == CRON_SECRET
-
-def admin_panel_allowed(token: str) -> bool:
-    if not ADMIN_PANEL_TOKEN:
-        return True
-    return token == ADMIN_PANEL_TOKEN
-
-
-# =========================
-# DB
-# =========================
-class Database:
-    def __init__(self):
-        self.db_path = DB_PATH
-        self._local = threading.local()
-        self._init_db()
-
-    def _connect(self):
-        conn = sqlite3.connect(self.db_path, check_same_thread=False, timeout=10)
-        conn.row_factory = sqlite3.Row
-        # Reduce locks + improve concurrency
-        try:
-            conn.execute("PRAGMA journal_mode=WAL;")
-            conn.execute("PRAGMA synchronous=NORMAL;")
-            conn.execute("PRAGMA temp_store=MEMORY;")
-        except Exception:
-            pass
-        return conn
-
-    def _get_conn(self):
-        if not hasattr(self._local, "conn") or self._local.conn is None:
-            self._local.conn = self._connect()
-        return self._local.conn
-
-    def _init_db(self):
-        conn = self._connect()
-        cur = conn.cursor()
-        cur.executescript("""
-            CREATE TABLE IF NOT EXISTS users (
-                user_id INTEGER PRIMARY KEY,
-                username TEXT,
-                lang TEXT DEFAULT 'ru',
-                created_at TEXT
-            );
-
-            CREATE TABLE IF NOT EXISTS carts (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                user_id INTEGER,
-                product_name TEXT,
-                qty INTEGER DEFAULT 1,
-                size TEXT,
-                added_at TEXT DEFAULT CURRENT_TIMESTAMP
-            );
-
-            CREATE TABLE IF NOT EXISTS orders (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                user_id INTEGER,
-                username TEXT,
-                name TEXT,
-                phone TEXT,
-                city TEXT,
-                items TEXT,
-                total_amount INTEGER DEFAULT 0,
-                delivery_type TEXT,
-                delivery_address TEXT,
-                comment TEXT,
-                status TEXT DEFAULT 'new',
-                manager_seen INTEGER DEFAULT 0,
-                manager_id INTEGER,
-                created_at TEXT,
-                reminded_at TEXT
-            );
-
-            CREATE TABLE IF NOT EXISTS monthly_reports (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                year INTEGER,
-                month INTEGER,
-                sent_at TEXT,
-                filename TEXT,
-                total_orders INTEGER,
-                total_amount INTEGER,
-                status TEXT DEFAULT 'pending'
-            );
-
-            CREATE TABLE IF NOT EXISTS scheduled_posts (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                dow INTEGER,
-                media_type TEXT,
-                file_id TEXT,
-                caption TEXT,
-                week_key TEXT,
-                created_at TEXT DEFAULT CURRENT_TIMESTAMP,
-                posted_at TEXT
-            );
-
-            CREATE TABLE IF NOT EXISTS events (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                user_id INTEGER,
-                event_type TEXT,
-                meta TEXT,
-                created_at TEXT
-            );
-
-            CREATE INDEX IF NOT EXISTS idx_orders_user ON orders(user_id);
-            CREATE INDEX IF NOT EXISTS idx_orders_status ON orders(status);
-            CREATE INDEX IF NOT EXISTS idx_carts_user ON carts(user_id);
-            CREATE INDEX IF NOT EXISTS idx_sched_week_dow ON scheduled_posts(week_key, dow);
-            CREATE INDEX IF NOT EXISTS idx_events_type_time ON events(event_type, created_at);
-        """)
-        conn.commit()
-        conn.close()
-
-    # --- events
-    def event_add(self, user_id: int, event_type: str, meta: Optional[Dict] = None):
-        conn = self._get_conn()
-        cur = conn.cursor()
-        ts = now_tz().strftime("%Y-%m-%d %H:%M:%S")
-        cur.execute(
-            "INSERT INTO events (user_id, event_type, meta, created_at) VALUES (?,?,?,?)",
-            (user_id, event_type, json.dumps(meta or {}, ensure_ascii=False), ts)
-        )
-        conn.commit()
-
-    # --- users
-    def user_upsert(self, user_id: int, username: str, lang: str):
-        conn = self._get_conn()
-        cur = conn.cursor()
-        ts = now_tz().strftime("%Y-%m-%d %H:%M:%S")
-        cur.execute("SELECT 1 FROM users WHERE user_id=?", (user_id,))
-        if cur.fetchone():
-            cur.execute("UPDATE users SET username=?, lang=? WHERE user_id=?", (username, lang, user_id))
-        else:
-            cur.execute(
-                "INSERT INTO users (user_id, username, lang, created_at) VALUES (?,?,?,?)",
-                (user_id, username, lang, ts)
-            )
-        conn.commit()
-
-    def user_get(self, user_id: int) -> Optional[Dict]:
-        conn = self._get_conn()
-        cur = conn.cursor()
-        cur.execute("SELECT * FROM users WHERE user_id=?", (user_id,))
-        row = cur.fetchone()
-        return dict(row) if row else None
-
-    # --- cart
-    def cart_add(self, user_id: int, product_name: str, qty: int = 1, size: str = ""):
-        conn = self._get_conn()
-        cur = conn.cursor()
-        cur.execute("INSERT INTO carts (user_id, product_name, qty, size) VALUES (?,?,?,?)",
-                    (user_id, product_name, qty, size))
-        conn.commit()
-        self.event_add(user_id, "cart_add", {"product": product_name, "qty": qty})
-
-    def cart_get(self, user_id: int) -> List[Dict]:
-        conn = self._get_conn()
-        cur = conn.cursor()
-        cur.execute("SELECT * FROM carts WHERE user_id=? ORDER BY id DESC", (user_id,))
-        return [dict(r) for r in cur.fetchall()]
-
-    def cart_clear(self, user_id: int):
-        conn = self._get_conn()
-        cur = conn.cursor()
-        cur.execute("DELETE FROM carts WHERE user_id=?", (user_id,))
-        conn.commit()
-
-    def cart_remove(self, cart_id: int):
-        conn = self._get_conn()
-        cur = conn.cursor()
-        cur.execute("DELETE FROM carts WHERE id=?", (cart_id,))
-        conn.commit()
-
-    # --- orders
-    def order_create(self, data: Dict) -> int:
-        conn = self._get_conn()
-        cur = conn.cursor()
-        ts = now_tz().strftime("%Y-%m-%d %H:%M:%S")
-        cur.execute("""
-            INSERT INTO orders (
-                user_id, username, name, phone, city, items,
-                total_amount, delivery_type, delivery_address,
-                comment, status, created_at
-            )
-            VALUES (?,?,?,?,?,?,?,?,?,?,?,?)
-        """, (
-            data["user_id"], data.get("username", ""), data["name"],
-            data["phone"], data["city"], data["items"],
-            data.get("total_amount", 0),
-            data.get("delivery_type", ""),
-            data.get("delivery_address", ""),
-            data.get("comment", "—"),
-            "new",
-            ts
-        ))
-        conn.commit()
-        order_id = cur.lastrowid
-        self.event_add(data["user_id"], "order_created", {"order_id": order_id})
-        return order_id
-
-    def order_get(self, order_id: int) -> Optional[Dict]:
-        conn = self._get_conn()
-        cur = conn.cursor()
-        cur.execute("SELECT * FROM orders WHERE id=?", (order_id,))
-        row = cur.fetchone()
-        return dict(row) if row else None
-
-    def orders_get_by_status(self, status: str, limit: int = 50) -> List[Dict]:
-        conn = self._get_conn()
-        cur = conn.cursor()
-        cur.execute("SELECT * FROM orders WHERE status=? ORDER BY created_at DESC LIMIT ?",
-                    (status, limit))
-        return [dict(r) for r in cur.fetchall()]
-
-    def orders_get_user(self, user_id: int, limit: int = 10) -> List[Dict]:
-        conn = self._get_conn()
-        cur = conn.cursor()
-        cur.execute("SELECT * FROM orders WHERE user_id=? ORDER BY id DESC LIMIT ?",
-                    (user_id, limit))
-        return [dict(r) for r in cur.fetchall()]
-
-    def order_update_status(self, order_id: int, status: str, manager_id: int = None):
-        conn = self._get_conn()
-        cur = conn.cursor()
-        if manager_id is not None:
-            cur.execute("UPDATE orders SET status=?, manager_id=?, manager_seen=1 WHERE id=?",
-                        (status, manager_id, order_id))
-        else:
-            cur.execute("UPDATE orders SET status=? WHERE id=?", (status, order_id))
-        conn.commit()
-
-    def order_mark_seen(self, order_id: int, manager_id: int):
-        conn = self._get_conn()
-        cur = conn.cursor()
-        cur.execute("UPDATE orders SET manager_seen=1, manager_id=? WHERE id=?",
-                    (manager_id, order_id))
-        conn.commit()
-
-    def orders_get_for_reminder(self) -> List[Dict]:
-        conn = self._get_conn()
-        cur = conn.cursor()
-        cutoff = (now_tz() - timedelta(minutes=30)).strftime("%Y-%m-%d %H:%M:%S")
-        cur.execute("""
-            SELECT * FROM orders
-            WHERE status='new' AND manager_seen=0
-              AND created_at < ?
-              AND (reminded_at IS NULL OR reminded_at < ?)
-            ORDER BY created_at DESC
-        """, (cutoff, cutoff))
-        return [dict(r) for r in cur.fetchall()]
-
-    def order_update_reminded(self, order_id: int):
-        conn = self._get_conn()
-        cur = conn.cursor()
-        ts = now_tz().strftime("%Y-%m-%d %H:%M:%S")
-        cur.execute("UPDATE orders SET reminded_at=? WHERE id=?", (ts, order_id))
-        conn.commit()
-
-    def orders_get_monthly(self, year: int, month: int) -> List[Dict]:
-        conn = self._get_conn()
-        cur = conn.cursor()
-        start = f"{year}-{month:02d}-01 00:00:00"
-        last_day = monthrange(year, month)[1]
-        end = f"{year}-{month:02d}-{last_day} 23:59:59"
-        cur.execute("SELECT * FROM orders WHERE created_at BETWEEN ? AND ? ORDER BY id",
-                    (start, end))
-        return [dict(r) for r in cur.fetchall()]
-
-    def report_mark_sent(self, year: int, month: int, filename: str, total_orders: int, total_amount: int):
-        conn = self._get_conn()
-        cur = conn.cursor()
-        ts = now_tz().strftime("%Y-%m-%d %H:%M:%S")
-        cur.execute("""
-            INSERT INTO monthly_reports (year, month, sent_at, filename, total_orders, total_amount, status)
-            VALUES (?,?,?,?,?,?,?)
-        """, (year, month, ts, filename, total_orders, total_amount, "sent"))
-        conn.commit()
-
-    def report_is_sent(self, year: int, month: int) -> bool:
-        conn = self._get_conn()
-        cur = conn.cursor()
-        cur.execute("SELECT 1 FROM monthly_reports WHERE year=? AND month=? AND status='sent'",
-                    (year, month))
-        return cur.fetchone() is not None
-
-    def get_stats_all(self) -> Dict:
-        conn = self._get_conn()
-        cur = conn.cursor()
-        cur.execute("""
-            SELECT
-                COUNT(*) as total,
-                SUM(CASE WHEN status='new' THEN 1 ELSE 0 END) as new,
-                SUM(CASE WHEN status='processing' THEN 1 ELSE 0 END) as processing,
-                SUM(CASE WHEN status='shipped' THEN 1 ELSE 0 END) as shipped,
-                SUM(CASE WHEN status='delivered' THEN 1 ELSE 0 END) as delivered,
-                SUM(CASE WHEN status='cancelled' THEN 1 ELSE 0 END) as cancelled,
-                COUNT(DISTINCT user_id) as unique_users
-            FROM orders
-        """)
-        row = cur.fetchone()
-        return dict(row) if row else {"total": 0, "new": 0, "processing": 0, "shipped": 0, "delivered": 0, "cancelled": 0, "unique_users": 0}
-
-    # --- weekly scheduled posts
-    def week_key_now(self, dt: datetime) -> str:
-        iso = dt.isocalendar()
-        return f"{iso[0]}-W{iso[1]:02d}"
-
-    def sched_add(self, dow: int, media_type: str, file_id: str, caption: str, week_key: str):
-        conn = self._get_conn()
-        cur = conn.cursor()
-        cur.execute("""
-            INSERT INTO scheduled_posts (dow, media_type, file_id, caption, week_key)
-            VALUES (?,?,?,?,?)
-        """, (dow, media_type, file_id, caption, week_key))
-        conn.commit()
-
-    def sched_get_for_day(self, dow: int, week_key: str) -> Optional[Dict]:
-        conn = self._get_conn()
-        cur = conn.cursor()
-        cur.execute("""
-            SELECT * FROM scheduled_posts
-            WHERE dow=? AND week_key=? AND posted_at IS NULL
-            ORDER BY id ASC
-            LIMIT 1
-        """, (dow, week_key))
-        row = cur.fetchone()
-        return dict(row) if row else None
-
-    def sched_mark_posted(self, post_id: int):
-        conn = self._get_conn()
-        cur = conn.cursor()
-        ts = now_tz().strftime("%Y-%m-%d %H:%M:%S")
-        cur.execute("UPDATE scheduled_posts SET posted_at=? WHERE id=?", (ts, post_id))
-        conn.commit()
-
-    def sched_count_week(self, week_key: str) -> int:
-        conn = self._get_conn()
-        cur = conn.cursor()
-        cur.execute("SELECT COUNT(*) as c FROM scheduled_posts WHERE week_key=?", (week_key,))
-        r = cur.fetchone()
-        return int(r["c"]) if r else 0
-
-    # --- web analytics helpers
-    def stats_range(self, start: str, end: str) -> Dict:
-        conn = self._get_conn()
-        cur = conn.cursor()
-        cur.execute("""
-            SELECT
-                COUNT(*) as total,
-                SUM(CASE WHEN status='new' THEN 1 ELSE 0 END) as new,
-                SUM(CASE WHEN status='processing' THEN 1 ELSE 0 END) as processing,
-                SUM(CASE WHEN status='shipped' THEN 1 ELSE 0 END) as shipped,
-                SUM(CASE WHEN status='delivered' THEN 1 ELSE 0 END) as delivered,
-                SUM(CASE WHEN status='cancelled' THEN 1 ELSE 0 END) as cancelled
-            FROM orders
-            WHERE created_at BETWEEN ? AND ?
-        """, (start, end))
-        row = cur.fetchone()
-        return dict(row) if row else {"total": 0, "new": 0, "processing": 0, "shipped": 0, "delivered": 0, "cancelled": 0}
-
-    def top_products_range(self, start: str, end: str, limit: int = 10) -> List[Tuple[str, int]]:
-        conn = self._get_conn()
-        cur = conn.cursor()
-        cur.execute("SELECT items FROM orders WHERE created_at BETWEEN ? AND ?", (start, end))
-        counter: Dict[str, int] = {}
-        for r in cur.fetchall():
-            try:
-                items = json.loads(r["items"] or "[]")
-            except Exception:
-                items = []
-            for it in items:
-                name = (it.get("name") or "").strip()
-                qty = int(it.get("qty") or 1)
-                if not name:
-                    continue
-                counter[name] = counter.get(name, 0) + qty
-        return sorted(counter.items(), key=lambda x: x[1], reverse=True)[:limit]
-
-    def top_cities_range(self, start: str, end: str, limit: int = 10) -> List[Tuple[str, int]]:
-        conn = self._get_conn()
-        cur = conn.cursor()
-        cur.execute("""
-            SELECT city, COUNT(*) as c
-            FROM orders
-            WHERE created_at BETWEEN ? AND ?
-            GROUP BY city
-            ORDER BY c DESC
-            LIMIT ?
-        """, (start, end, limit))
-        return [(r["city"] or "—", int(r["c"])) for r in cur.fetchall()]
-
-    def ru_vs_uz_range(self, start: str, end: str) -> Dict:
-        conn = self._get_conn()
-        cur = conn.cursor()
-        cur.execute("""
-            SELECT u.lang as lang, COUNT(o.id) as c
-            FROM orders o
-            LEFT JOIN users u ON u.user_id = o.user_id
-            WHERE o.created_at BETWEEN ? AND ?
-            GROUP BY u.lang
-        """, (start, end))
-        res = {"ru": 0, "uz": 0, "unknown": 0}
-        for r in cur.fetchall():
-            lang = (r["lang"] or "unknown").lower()
-            if lang not in res:
-                lang = "unknown"
-            res[lang] += int(r["c"])
-        return res
-
-    def funnel_range(self, start: str, end: str) -> Dict:
-        conn = self._get_conn()
-        cur = conn.cursor()
-        cur.execute("""
-            SELECT
-              SUM(CASE WHEN event_type='cart_add' THEN 1 ELSE 0 END) as cart_add,
-              SUM(CASE WHEN event_type='order_created' THEN 1 ELSE 0 END) as order_created
-            FROM events
-            WHERE created_at BETWEEN ? AND ?
-        """, (start, end))
-        r = cur.fetchone()
-        cart_add = int(r["cart_add"] or 0) if r else 0
-        order_created = int(r["order_created"] or 0) if r else 0
-        conv = (order_created / cart_add * 100.0) if cart_add > 0 else 0.0
-        return {"cart_add": cart_add, "order_created": order_created, "conversion": round(conv, 2)}
-
-    def orders_filter(self, status: str = "", city: str = "", phone_q: str = "", limit: int = 200) -> List[Dict]:
-        conn = self._get_conn()
-        cur = conn.cursor()
-        q = "SELECT * FROM orders WHERE 1=1"
-        args: List = []
-        if status:
-            q += " AND status=?"
-            args.append(status)
-        if city:
-            q += " AND city LIKE ?"
-            args.append(f"%{city}%")
-        if phone_q:
-            q += " AND phone LIKE ?"
-            args.append(f"%{phone_q}%")
-        q += " ORDER BY id DESC LIMIT ?"
-        args.append(limit)
-        cur.execute(q, tuple(args))
-        return [dict(r) for r in cur.fetchall()]
-
-    def find_orders_by_phone(self, phone_part: str, limit: int = 20) -> List[Dict]:
-        conn = self._get_conn()
-        cur = conn.cursor()
-        cur.execute("""
-            SELECT * FROM orders
-            WHERE phone LIKE ?
-            ORDER BY id DESC
-            LIMIT ?
-        """, (f"%{phone_part}%", limit))
-        return [dict(r) for r in cur.fetchall()]
-
-
-db = Database()
-
-
-# =========================
-# aiogram
-# =========================
 from aiogram import Bot, Dispatcher, F
 from aiogram.client.default import DefaultBotProperties
-from aiogram.enums import ParseMode
-from aiogram.filters import CommandStart
+from aiogram.enums import ParseMode, ContentType
+from aiogram.filters import CommandStart, Command
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.types import (
-    Message, CallbackQuery,
-    InlineKeyboardMarkup, InlineKeyboardButton,
-    ReplyKeyboardMarkup, KeyboardButton,
+    Message,
+    CallbackQuery,
+    ReplyKeyboardMarkup,
+    KeyboardButton,
+    InlineKeyboardMarkup,
+    InlineKeyboardButton,
+    WebAppInfo,
+    ReplyKeyboardRemove,
 )
 from aiogram.types.input_file import FSInputFile
 
@@ -616,1115 +52,3252 @@ from openpyxl import Workbook
 from openpyxl.styles import Font, PatternFill
 
 
-# =========================
-# TEXTS
-# =========================
-TEXT = {
-    "ru": {
-        "welcome": "👋 Добро пожаловать в <b>ZARY & CO</b>!\n\n🧸 Детская одежда премиум качества\n📦 Доставка по Узбекистану 1-5 дней\n\nВыберите действие 👇",
-        "menu": "📍 Главное меню",
-        "catalog": "📸 <b>Каталог</b>\n\nВыберите категорию:",
-        "catalog_hint": "Чтобы быстро оформить — нажмите <b>✅ Заказ</b> (выбор товаров внутри бота).",
-        "price": "🧾 <b>Прайс-лист</b>\n\n💬 Цена — по договоренности (зависит от модели/размера).\n\n✅ Нажмите «Заказ» для оформления",
-        "size": "📏 <b>Подбор размера</b>\n\nВыберите способ:",
-        "size_age": "Введите возраст (1-15 лет):\nПример: 7",
-        "size_height": "Введите рост в см:\nПример: 125",
-        "size_result": "📏 Рекомендуемый размер: <b>{size}</b>\n\n✅ Если определились — нажмите <b>✅ Заказ</b> или вернитесь в меню.",
-        "cart": "🛒 <b>Корзина</b>\n\n{items}\n\n💬 Цена: <b>по договоренности</b>\nНажмите <b>✅ Оформить</b>, чтобы продолжить.",
-        "cart_empty": "🛒 Корзина пуста\n\nПерейдите в <b>✅ Заказ</b> и выберите товар (или напишите свой).",
-        "cart_added": "✅ Добавлено в корзину",
-        "delivery": "🚚 <b>Доставка</b>\n\n1️⃣ <b>B2B Почта</b> — 2-5 дней, весь Узбекистан\n2️⃣ <b>Яндекс Курьер</b> — 1-3 дня, крупные города\n3️⃣ <b>Яндекс ПВЗ</b> — 1-3 дня, пункты выдачи\n\n💬 Стоимость доставки зависит от города.",
-        "faq": "❓ <b>FAQ</b>\n\n<b>Доставка?</b>\n— По всему Узбекистану, 1-5 дней\n\n<b>Оплата?</b>\n— Наличными или переводом\n\n<b>Возврат?</b>\n— 14 дней при сохранении вида\n\n<b>Размеры?</b>\n— Используйте подбор в боте",
-        "contact": "📞 <b>Связаться</b>\n\n☎️ {phone}\n⏰ Пн-Пт: 09:00-21:00\n📱 @{username}",
-        "order_start": "🛍 <b>Выберите товар</b>\n\nНажмите на кнопку товара ниже 👇\nЕсли вашего товара нет — нажмите <b>✍️ Ввести вручную</b>",
-        "order_manual": "📝 Введите название товара (например: худи, джинсы, школьная форма):",
-        "order_phone": "📱 Отправьте номер телефона:",
-        "order_city": "🏙 Введите город:",
-        "order_delivery": "🚚 Выберите способ доставки (нажмите кнопку):",
-        "order_address": "📍 Введите адрес доставки:",
-        "order_confirm": "📝 <b>Проверьте заказ:</b>\n\n👤 {name}\n📱 {phone}\n🏙 {city}\n🚚 {delivery}\n📍 {address}\n\n🛒 Товары:\n{items}\n\n💬 Цена: <b>по договоренности</b>\nМенеджер уточнит размер и итоговую сумму.\n\nПодтвердить?",
-        "order_success": "✅ Заказ #{order_id} принят!\n\nУважаемый покупатель, вам поступят уведомления о статусе.\nМенеджер скоро свяжется и уточнит детали.\n⏰ 09:00-21:00",
+# =========================================================
+# BASIC APP / TZ
+# =========================================================
+TZ = ZoneInfo("Asia/Tashkent")
+web_app = web.Application()
 
-        # ✅ оставляем как было — для "принят"
-        "thanks_new": "🙏 Спасибо за заказ! Мы рады, что вы с нами 🤍\n\nЧтобы нас не потерять — подпишитесь на наши каналы:",
 
-        # ✅ новый текст — для "доставлен"
-        "thanks_delivered": (
-            "🤍 Спасибо, что выбрали ZARY & CO!\n\n"
-            "Надеемся, одежда принесёт радость и комфорт.\n"
-            "Носите с удовольствием и на здоровье ✨\n\n"
-            "Будем рады видеть вас снова!\n"
-            "Чтобы не пропустить новинки — подпишитесь на наши каналы 👇"
-        ),
+# =========================================================
+# ENV
+# =========================================================
+BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
+if not BOT_TOKEN:
+    raise RuntimeError("❌ BOT_TOKEN не установлен")
 
-        "history": "📜 <b>История заказов</b>\n\n{orders}",
-        "history_empty": "📜 У вас пока нет заказов",
-        "admin_menu": "🛠 <b>Админ панель</b>\n\nВыберите действие:",
-        "admin_stats": "📊 <b>Статистика</b>\n\n📦 Всего: {total}\n🆕 Новых: {new}\n⚙️ В обработке: {processing}\n🚚 Отправлено: {shipped}\n✅ Доставлено: {delivered}\n❌ Отменено: {cancelled}\n👥 Клиентов: {unique_users}",
-        "cancelled": "❌ Отменено",
-    },
-    "uz": {
-        "welcome": "👋 <b>ZARY & CO</b> ga xush kelibsiz!\n\n🧸 Bolalar kiyimi premium sifat\n📦 O'zbekiston bo'ylab yetkazib berish 1-5 kun\n\nAmalni tanlang 👇",
-        "menu": "📍 Asosiy menyu",
-        "catalog": "📸 <b>Katalog</b>\n\nKategoriyani tanlang:",
-        "catalog_hint": "Tez buyurtma uchun <b>✅ Buyurtma</b> ni bosing (bot ichida tanlash).",
-        "price": "🧾 <b>Narxlar</b>\n\n💬 Narx — kelishuv bo'yicha (model/o'lchamga qarab).\n\n✅ «Buyurtma» ni bosing",
-        "size": "📏 <b>O'lcham tanlash</b>\n\nUsulni tanlang:",
-        "size_age": "Yoshini kiriting (1-15 yosh):\nMisol: 7",
-        "size_height": "Bo'yni sm da kiriting:\nMisol: 125",
-        "size_result": "📏 Tavsiya etilgan o'lcham: <b>{size}</b>\n\n✅ Tayyor bo'lsangiz <b>✅ Buyurtma</b> ni bosing yoki menyuga qayting.",
-        "cart": "🛒 <b>Savat</b>\n\n{items}\n\n💬 Narx: <b>kelishuv bo'yicha</b>\n<b>✅ Rasmiylashtirish</b> ni bosing.",
-        "cart_empty": "🛒 Savat bo'sh\n\n<b>✅ Buyurtma</b> ga kiring va tovar tanlang (yoki o'zingiz yozing).",
-        "cart_added": "✅ Savatga qo'shildi",
-        "delivery": "🚚 <b>Yetkazib berish</b>\n\n1️⃣ <b>B2B Pochta</b> — 2-5 kun\n2️⃣ <b>Yandex Kuryer</b> — 1-3 kun\n3️⃣ <b>Yandex PVZ</b> — 1-3 kun\n\n💬 Yetkazib berish narxi shahar bo'yicha.",
-        "faq": "❓ <b>FAQ</b>\n\n<b>Yetkazib berish?</b>\n— Butun O'zbekiston, 1-5 kun\n\n<b>To'lov?</b>\n— Naqd yoki o'tkazma\n\n<b>Qaytarish?</b>\n— 14 kun ichida (tovar ko'rinishi saqlangan bo'lsa)\n\n<b>O'lchamlar?</b>\n— Botdagi o'lcham tanlashdan foydalaning",
-        "contact": "📞 <b>Aloqa</b>\n\n☎️ {phone}\n⏰ Du-Sha: 09:00-21:00\n📱 @{username}",
-        "order_start": "🛍 <b>Tovar tanlang</b>\n\nQuyidagi tugmalardan birini bosing 👇\nAgar kerakli tovar bo'lmasa — <b>✍️ Qo'lda kiritish</b> ni bosing",
-        "order_manual": "📝 Mahsulot nomini kiriting (masalan: hudi, jinsi, maktab formasi):",
-        "order_phone": "📱 Telefon raqamingizni yuboring:",
-        "order_city": "🏙 Shaharni kiriting:",
-        "order_delivery": "🚚 Yetkazib berish usulini tanlang (tugmani bosing):",
-        "order_address": "📍 Manzilni kiriting:",
-        "order_confirm": "📝 <b>Buyurtmani tekshiring:</b>\n\n👤 {name}\n📱 {phone}\n🏙 {city}\n🚚 {delivery}\n📍 {address}\n\n🛒 Tovarlar:\n{items}\n\n💬 Narx: <b>kelishuv bo'yicha</b>\nMenejer o'lcham va yakuniy summani aniqlaydi.\n\nTasdiqlaysizmi?",
-        "order_success": "✅ Buyurtma #{order_id} qabul qilindi!\n\nHurmatli mijoz, status bo'yicha xabarlar yuboriladi.\nMenejer tez orada bog'lanadi.\n⏰ 09:00-21:00",
+PORT = int(os.getenv("PORT", "10000"))
+DB_PATH = os.getenv("DB_PATH", "bot.db")
 
-        "thanks_new": "🙏 Buyurtmangiz uchun rahmat! Siz biz bilan ekaningizdan xursandmiz 🤍\n\nBizni yo‘qotib qo‘ymaslik uchun kanallarimizga obuna bo‘ling:",
-        "thanks_delivered": (
-            "🤍 ZARY & CO ni tanlaganingiz uchun rahmat!\n\n"
-            "Kiyim sizga qulaylik va xursandchilik olib kelsin.\n"
-            "Yaxshi kayfiyat bilan kiying ✨\n\n"
-            "Yana sizni ko‘rishdan xursand bo‘lamiz!\n"
-            "Yangiliklarni o‘tkazib yubormaslik uchun kanallarimizga obuna bo‘ling 👇"
-        ),
+BASE_URL = os.getenv("BASE_URL", "").strip().rstrip("/")
+if not BASE_URL:
+    print("⚠️ BASE_URL не установлен. WebApp может работать некорректно.")
 
-        "history": "📜 <b>Buyurtmalar tarixi</b>\n\n{orders}",
-        "history_empty": "📜 Hozircha buyurtmalar yo'q",
-        "admin_menu": "🛠 <b>Admin paneli</b>\n\nAmalni tanlang:",
-        "admin_stats": "📊 <b>Statistika</b>\n\n📦 Jami: {total}\n🆕 Yangi: {new}\n⚙️ Ishlanmoqda: {processing}\n🚚 Jo'natildi: {shipped}\n✅ Yetkazildi: {delivered}\n❌ Bekor: {cancelled}\n👥 Mijozlar: {unique_users}",
-        "cancelled": "❌ Bekor qilindi",
+CRON_SECRET = os.getenv("CRON_SECRET", "").strip()
+ADMIN_PANEL_TOKEN = os.getenv("ADMIN_PANEL_TOKEN", "").strip()
+WEBAPP_SECRET = os.getenv("WEBAPP_SECRET", secrets.token_hex(16)).strip()
+
+CHANNEL_USERNAME = os.getenv("CHANNEL_USERNAME", "zaryco_official").strip().lstrip("@")
+TG_CHANNEL_URL = f"https://t.me/{CHANNEL_USERNAME}"
+
+FOLLOW_TG = "https://t.me/zaryco_official"
+FOLLOW_IG = "https://www.instagram.com/zary.co/"
+FOLLOW_YT = "https://www.youtube.com/@ZARYCOOFFICIAL"
+
+PHONE = os.getenv("MANAGER_PHONE", "+998771202255").strip()
+MANAGER_USERNAME = os.getenv("MANAGER_USERNAME", "zaryco_official").strip().lstrip("@")
+
+CLICK_MERCHANT_ID = os.getenv("CLICK_MERCHANT_ID", "").strip()
+CLICK_SERVICE_ID = os.getenv("CLICK_SERVICE_ID", "").strip()
+CLICK_SECRET_KEY = os.getenv("CLICK_SECRET_KEY", "").strip()
+
+PAYME_MERCHANT_ID = os.getenv("PAYME_MERCHANT_ID", "").strip()
+PAYME_SECRET_KEY = os.getenv("PAYME_SECRET_KEY", "").strip()
+
+_channel_id = os.getenv("CHANNEL_ID", "").strip()
+CHANNEL_ID = int(_channel_id) if _channel_id and _channel_id.lstrip("-").isdigit() else None
+
+ADMIN_IDS: List[int] = []
+for i in range(1, 6):
+    raw = os.getenv(f"ADMIN_ID_{i}", "").strip()
+    if raw and raw.lstrip("-").isdigit():
+        ADMIN_IDS.append(int(raw))
+
+if not ADMIN_IDS:
+    fallback_admin = os.getenv("MANAGER_CHAT_ID", "").strip()
+    if fallback_admin and fallback_admin.lstrip("-").isdigit():
+        ADMIN_IDS.append(int(fallback_admin))
+
+if not ADMIN_IDS:
+    raise RuntimeError("❌ Нужен хотя бы один ADMIN_ID_1")
+
+PRIMARY_ADMIN = ADMIN_IDS[0]
+
+if not ADMIN_PANEL_TOKEN:
+    print("⚠️ ADMIN_PANEL_TOKEN не установлен. /admin будет без защиты.")
+
+
+# =========================================================
+# CONSTANTS
+# =========================================================
+SHOP_CATEGORIES = ("new", "hits", "sale", "limited", "school", "casual")
+DELIVERY_TYPES = ("yandex_courier", "b2b_post", "yandex_pvz")
+PAYMENT_METHODS = ("click", "payme")
+PAYMENT_STATUSES = ("pending", "paid", "failed", "cancelled", "refunded")
+ORDER_STATUSES = ("new", "processing", "confirmed", "paid", "shipped", "delivered", "cancelled")
+
+
+# =========================================================
+# HELPERS
+# =========================================================
+def now_tz() -> datetime:
+    return datetime.now(TZ)
+
+
+def now_str() -> str:
+    return now_tz().strftime("%Y-%m-%d %H:%M:%S")
+
+
+def esc(value: Any) -> str:
+    return html.escape("" if value is None else str(value))
+
+
+def is_admin(user_id: int) -> bool:
+    return user_id in ADMIN_IDS
+
+
+def money_fmt(amount: int | float | str) -> str:
+    try:
+        return f"{int(float(amount)):,}".replace(",", " ")
+    except Exception:
+        return "0"
+
+
+def safe_int(value: Any, default: int = 0) -> int:
+    try:
+        return int(value)
+    except Exception:
+        return default
+
+
+def cron_allowed(secret: str) -> bool:
+    return bool(CRON_SECRET) and secret == CRON_SECRET
+
+
+def admin_panel_allowed(token: str) -> bool:
+    if not ADMIN_PANEL_TOKEN:
+        return True
+    return token == ADMIN_PANEL_TOKEN
+
+
+def product_public_photo_url(file_id: str) -> str:
+    if not file_id:
+        return ""
+    return f"/media/{quote(file_id)}"
+
+
+def prev_month(dt: datetime) -> tuple[int, int]:
+    first_day = dt.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+    prev_last_day = first_day - timedelta(days=1)
+    return prev_last_day.year, prev_last_day.month
+
+
+def size_by_age(age: int) -> str:
+    mapping = {
+        1: "86",
+        2: "92",
+        3: "98",
+        4: "104",
+        5: "110",
+        6: "116",
+        7: "122",
+        8: "128",
+        9: "134",
+        10: "140",
+        11: "146",
+        12: "152",
+        13: "158",
+        14: "164",
+        15: "164",
     }
+    return mapping.get(age, "122-128")
+
+
+def size_by_height(height: int) -> str:
+    sizes = [86, 92, 98, 104, 110, 116, 122, 128, 134, 140, 146, 152, 158, 164]
+    closest = min(sizes, key=lambda x: abs(x - height))
+    return str(closest)
+
+
+def normalize_phone(phone: str) -> str:
+    if not phone:
+        return ""
+    cleaned = "".join(ch for ch in phone if ch.isdigit() or ch == "+")
+    if cleaned.startswith("998") and not cleaned.startswith("+998"):
+        cleaned = "+" + cleaned
+    if cleaned.startswith("8") and len(cleaned) == 9:
+        cleaned = "+998" + cleaned
+    return cleaned
+
+
+def phone_is_valid(phone: str) -> bool:
+    phone = normalize_phone(phone)
+    digits = "".join(ch for ch in phone if ch.isdigit())
+    return len(digits) >= 9
+
+
+def parse_sizes_text(sizes: str) -> List[str]:
+    if not sizes:
+        return []
+    raw = sizes.replace(";", ",").replace("|", ",")
+    return [x.strip() for x in raw.split(",") if x.strip()]
+
+
+def user_lang_or_default(user_row: Optional[Dict]) -> str:
+    if user_row and user_row.get("lang") in ("ru", "uz"):
+        return user_row["lang"]
+    return "ru"
+
+
+# =========================================================
+# TEXTS
+# =========================================================
+TEXTS: Dict[str, Dict[str, str]] = {
+    "welcome": {
+        "ru": (
+            "👋 Добро пожаловать в <b>ZARY & CO</b>\n\n"
+            "Стильная одежда для детей и семьи.\n"
+            "Выберите действие ниже 👇"
+        ),
+        "uz": (
+            "👋 <b>ZARY & CO</b> ga xush kelibsiz\n\n"
+            "Bolalar va oila uchun zamonaviy kiyimlar.\n"
+            "Quyidan kerakli bo‘limni tanlang 👇"
+        ),
+    },
+    "shop_open": {
+        "ru": "🛍 Откройте магазин по кнопке ниже:",
+        "uz": "🛍 Do‘konni quyidagi tugma orqali oching:",
+    },
+    "cart_empty": {
+        "ru": "🛒 Корзина пустая.",
+        "uz": "🛒 Savatcha bo‘sh.",
+    },
+    "cart_title": {
+        "ru": "🛒 <b>Ваша корзина</b>",
+        "uz": "🛒 <b>Sizning savatchangiz</b>",
+    },
+    "checkout_start_name": {
+        "ru": "Введите ваше имя:",
+        "uz": "Ismingizni kiriting:",
+    },
+    "checkout_phone": {
+        "ru": "Введите номер телефона:",
+        "uz": "Telefon raqamingizni kiriting:",
+    },
+    "checkout_delivery": {
+        "ru": "Выберите способ доставки:",
+        "uz": "Yetkazib berish usulini tanlang:",
+    },
+    "checkout_address_type": {
+        "ru": "Выберите способ указания адреса:",
+        "uz": "Manzilni ko‘rsatish usulini tanlang:",
+    },
+    "checkout_city": {
+        "ru": "Введите город:",
+        "uz": "Shaharni kiriting:",
+    },
+    "checkout_address_manual": {
+        "ru": "Введите адрес вручную:",
+        "uz": "Manzilni qo‘lda kiriting:",
+    },
+    "checkout_location_wait": {
+        "ru": "Отправьте вашу геолокацию кнопкой ниже.",
+        "uz": "Quyidagi tugma orqali lokatsiyangizni yuboring.",
+    },
+    "checkout_pvz": {
+        "ru": "Введите адрес или код ПВЗ:",
+        "uz": "PVZ manzili yoki kodini kiriting:",
+    },
+    "checkout_payment": {
+        "ru": "Выберите способ оплаты:",
+        "uz": "To‘lov usulini tanlang:",
+    },
+    "checkout_comment": {
+        "ru": "Комментарий к заказу (или отправьте -):",
+        "uz": "Buyurtmaga izoh kiriting (yoki - yuboring):",
+    },
+    "checkout_confirm": {
+        "ru": "Проверьте заказ и подтвердите:",
+        "uz": "Buyurtmani tekshirib, tasdiqlang:",
+    },
+    "orders_empty": {
+        "ru": "📦 У вас пока нет заказов.",
+        "uz": "📦 Sizda hali buyurtmalar yo‘q.",
+    },
+    "size_help": {
+        "ru": (
+            "📏 <b>Подбор размера</b>\n\n"
+            "Отправьте:\n"
+            "• возраст ребёнка числом, например: <b>6</b>\n"
+            "или\n"
+            "• рост, например: <b>128</b>"
+        ),
+        "uz": (
+            "📏 <b>Razmer tanlash</b>\n\n"
+            "Yuboring:\n"
+            "• bolaning yoshini, masalan: <b>6</b>\n"
+            "yoki\n"
+            "• bo‘yini, masalan: <b>128</b>"
+        ),
+    },
+    "contacts": {
+        "ru": (
+            "📞 <b>Контакты</b>\n\n"
+            f"Телефон: {PHONE}\n"
+            f"Telegram: @{MANAGER_USERNAME}\n\n"
+            f"Telegram канал:\n{FOLLOW_TG}\n\n"
+            f"Instagram:\n{FOLLOW_IG}\n\n"
+            f"YouTube:\n{FOLLOW_YT}"
+        ),
+        "uz": (
+            "📞 <b>Aloqa</b>\n\n"
+            f"Telefon: {PHONE}\n"
+            f"Telegram: @{MANAGER_USERNAME}\n\n"
+            f"Telegram kanal:\n{FOLLOW_TG}\n\n"
+            f"Instagram:\n{FOLLOW_IG}\n\n"
+            f"YouTube:\n{FOLLOW_YT}"
+        ),
+    },
+    "thanks_order": {
+        "ru": (
+            "💛 Спасибо за заказ!\n\n"
+            "Мы очень рады, что вы с нами.\n"
+            "Пусть покупки от <b>ZARY & CO</b> приносят радость и комфорт.\n"
+            "Носите с удовольствием.\n\n"
+            "Чтобы не потерять нас и следить за новинками, подпишитесь:\n"
+            f"Telegram: {FOLLOW_TG}\n"
+            f"Instagram: {FOLLOW_IG}\n"
+            f"YouTube: {FOLLOW_YT}"
+        ),
+        "uz": (
+            "💛 Buyurtmangiz uchun rahmat!\n\n"
+            "Biz siz biz bilan ekaningizdan juda xursandmiz.\n"
+            "<b>ZARY & CO</b> sizga qulaylik va xursandchilik olib kelsin.\n"
+            "Mamnuniyat bilan kiying.\n\n"
+            "Bizni yo‘qotib qo‘ymaslik va yangiliklarni kuzatish uchun obuna bo‘ling:\n"
+            f"Telegram: {FOLLOW_TG}\n"
+            f"Instagram: {FOLLOW_IG}\n"
+            f"YouTube: {FOLLOW_YT}"
+        ),
+    },
 }
 
 
-# =========================
-# KEYBOARDS
-# =========================
-def kb_main(lang: str, is_admin_flag: bool = False) -> ReplyKeyboardMarkup:
-    if lang == "uz":
-        rows = [
-            [KeyboardButton(text="📸 Katalog"), KeyboardButton(text="🧾 Narxlar")],
-            [KeyboardButton(text="📏 O'lcham"), KeyboardButton(text="🛒 Savat")],
-            [KeyboardButton(text="🚚 Yetkazib berish"), KeyboardButton(text="❓ FAQ")],
-            [KeyboardButton(text="📞 Aloqa"), KeyboardButton(text="✅ Buyurtma")],
-            [KeyboardButton(text="📜 Buyurtmalar"), KeyboardButton(text="🌐 Til")],
+def t(lang: str, key: str) -> str:
+    lang = "uz" if lang == "uz" else "ru"
+    return TEXTS.get(key, {}).get(lang, TEXTS.get(key, {}).get("ru", key))
+
+
+# =========================================================
+# DATABASE
+# =========================================================
+class Database:
+    def __init__(self, db_path: str):
+        self.db_path = db_path
+        self._local = threading.local()
+        self._init_db()
+
+    def _connect(self) -> sqlite3.Connection:
+        conn = sqlite3.connect(self.db_path, check_same_thread=False, timeout=20)
+        conn.row_factory = sqlite3.Row
+        try:
+            conn.execute("PRAGMA journal_mode=WAL;")
+            conn.execute("PRAGMA synchronous=NORMAL;")
+            conn.execute("PRAGMA temp_store=MEMORY;")
+            conn.execute("PRAGMA foreign_keys=ON;")
+        except Exception:
+            pass
+        return conn
+
+    def _get_conn(self) -> sqlite3.Connection:
+        if not hasattr(self._local, "conn") or self._local.conn is None:
+            self._local.conn = self._connect()
+        return self._local.conn
+
+    def _init_db(self) -> None:
+        conn = self._connect()
+        cur = conn.cursor()
+
+        cur.executescript("""
+        CREATE TABLE IF NOT EXISTS users (
+            user_id INTEGER PRIMARY KEY,
+            username TEXT,
+            full_name TEXT DEFAULT '',
+            lang TEXT DEFAULT 'ru',
+            created_at TEXT,
+            updated_at TEXT
+        );
+
+        CREATE TABLE IF NOT EXISTS carts (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER NOT NULL,
+            product_id INTEGER,
+            product_name TEXT NOT NULL,
+            price INTEGER DEFAULT 0,
+            qty INTEGER DEFAULT 1,
+            size TEXT DEFAULT '',
+            photo_file_id TEXT DEFAULT '',
+            added_at TEXT DEFAULT CURRENT_TIMESTAMP
+        );
+
+        CREATE TABLE IF NOT EXISTS orders (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER,
+            username TEXT DEFAULT '',
+            customer_name TEXT DEFAULT '',
+            customer_phone TEXT DEFAULT '',
+            city TEXT DEFAULT '',
+            items TEXT DEFAULT '[]',
+            total_qty INTEGER DEFAULT 0,
+            total_amount INTEGER DEFAULT 0,
+
+            delivery_service TEXT DEFAULT '',
+            delivery_type TEXT DEFAULT '',
+            delivery_address TEXT DEFAULT '',
+            latitude REAL,
+            longitude REAL,
+            pvz_code TEXT DEFAULT '',
+            pvz_address TEXT DEFAULT '',
+
+            payment_method TEXT DEFAULT '',
+            payment_status TEXT DEFAULT 'pending',
+            payment_provider_invoice_id TEXT DEFAULT '',
+            payment_provider_url TEXT DEFAULT '',
+
+            comment TEXT DEFAULT '',
+            status TEXT DEFAULT 'new',
+            manager_seen INTEGER DEFAULT 0,
+            manager_id INTEGER,
+            source TEXT DEFAULT 'bot',
+            created_at TEXT,
+            updated_at TEXT,
+            reminded_at TEXT
+        );
+
+        CREATE TABLE IF NOT EXISTS monthly_reports (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            year INTEGER,
+            month INTEGER,
+            sent_at TEXT,
+            filename TEXT,
+            total_orders INTEGER DEFAULT 0,
+            total_amount INTEGER DEFAULT 0,
+            status TEXT DEFAULT 'pending'
+        );
+
+        CREATE TABLE IF NOT EXISTS scheduled_posts (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            dow INTEGER,
+            media_type TEXT,
+            file_id TEXT,
+            caption TEXT,
+            week_key TEXT,
+            created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+            posted_at TEXT
+        );
+
+        CREATE TABLE IF NOT EXISTS events (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER,
+            event_type TEXT,
+            meta TEXT,
+            created_at TEXT
+        );
+
+        CREATE TABLE IF NOT EXISTS shop_products (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            photo_file_id TEXT DEFAULT '',
+            title_ru TEXT NOT NULL,
+            title_uz TEXT NOT NULL,
+            description_ru TEXT DEFAULT '',
+            description_uz TEXT DEFAULT '',
+            sizes TEXT DEFAULT '',
+            category_slug TEXT DEFAULT 'casual',
+            price INTEGER DEFAULT 0,
+            old_price INTEGER DEFAULT 0,
+            price_on_request INTEGER DEFAULT 0,
+            stock_qty INTEGER DEFAULT 0,
+            is_published INTEGER DEFAULT 1,
+            sort_order INTEGER DEFAULT 0,
+            created_at TEXT,
+            updated_at TEXT
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_orders_user ON orders(user_id);
+        CREATE INDEX IF NOT EXISTS idx_orders_status ON orders(status);
+        CREATE INDEX IF NOT EXISTS idx_orders_created_at ON orders(created_at);
+        CREATE INDEX IF NOT EXISTS idx_carts_user ON carts(user_id);
+        CREATE INDEX IF NOT EXISTS idx_events_type_time ON events(event_type, created_at);
+        CREATE INDEX IF NOT EXISTS idx_sched_week_dow ON scheduled_posts(week_key, dow);
+        CREATE INDEX IF NOT EXISTS idx_products_pub_cat ON shop_products(is_published, category_slug, sort_order, id);
+        """)
+
+        conn.commit()
+        self._migrate_orders(conn)
+        self._migrate_products(conn)
+        conn.close()
+
+    def _migrate_orders(self, conn: sqlite3.Connection) -> None:
+        existing = {r["name"] for r in conn.execute("PRAGMA table_info(orders)").fetchall()}
+        columns_to_add = {
+            "customer_name": "TEXT DEFAULT ''",
+            "customer_phone": "TEXT DEFAULT ''",
+            "total_qty": "INTEGER DEFAULT 0",
+            "delivery_service": "TEXT DEFAULT ''",
+            "delivery_type": "TEXT DEFAULT ''",
+            "latitude": "REAL",
+            "longitude": "REAL",
+            "pvz_code": "TEXT DEFAULT ''",
+            "pvz_address": "TEXT DEFAULT ''",
+            "payment_method": "TEXT DEFAULT ''",
+            "payment_status": "TEXT DEFAULT 'pending'",
+            "payment_provider_invoice_id": "TEXT DEFAULT ''",
+            "payment_provider_url": "TEXT DEFAULT ''",
+            "updated_at": "TEXT",
+            "source": "TEXT DEFAULT 'bot'",
+        }
+        for col, sql_type in columns_to_add.items():
+            if col not in existing:
+                conn.execute(f"ALTER TABLE orders ADD COLUMN {col} {sql_type}")
+        conn.commit()
+
+    def _migrate_products(self, conn: sqlite3.Connection) -> None:
+        existing = {r["name"] for r in conn.execute("PRAGMA table_info(shop_products)").fetchall()}
+        columns_to_add = {
+            "old_price": "INTEGER DEFAULT 0",
+            "stock_qty": "INTEGER DEFAULT 0",
+        }
+        for col, sql_type in columns_to_add.items():
+            if col not in existing:
+                conn.execute(f"ALTER TABLE shop_products ADD COLUMN {col} {sql_type}")
+        conn.commit()
+
+    # -------------------------
+    # Users
+    # -------------------------
+    def user_upsert(self, user_id: int, username: str = "", full_name: str = "", lang: str = "ru") -> None:
+        conn = self._get_conn()
+        cur = conn.cursor()
+        cur.execute("SELECT 1 FROM users WHERE user_id=?", (user_id,))
+        if cur.fetchone():
+            cur.execute("""
+                UPDATE users
+                SET username=?, full_name=?, lang=?, updated_at=?
+                WHERE user_id=?
+            """, (username, full_name, lang, now_str(), user_id))
+        else:
+            cur.execute("""
+                INSERT INTO users (user_id, username, full_name, lang, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?)
+            """, (user_id, username, full_name, lang, now_str(), now_str()))
+        conn.commit()
+
+    def user_get(self, user_id: int) -> Optional[Dict]:
+        conn = self._get_conn()
+        row = conn.execute("SELECT * FROM users WHERE user_id=?", (user_id,)).fetchone()
+        return dict(row) if row else None
+
+    def user_set_lang(self, user_id: int, lang: str) -> None:
+        conn = self._get_conn()
+        conn.execute("UPDATE users SET lang=?, updated_at=? WHERE user_id=?", (lang, now_str(), user_id))
+        conn.commit()
+
+    # -------------------------
+    # Events
+    # -------------------------
+    def event_add(self, user_id: Optional[int], event_type: str, meta: Optional[Dict] = None) -> None:
+        conn = self._get_conn()
+        conn.execute("""
+            INSERT INTO events (user_id, event_type, meta, created_at)
+            VALUES (?, ?, ?, ?)
+        """, (
+            user_id,
+            event_type,
+            json.dumps(meta or {}, ensure_ascii=False),
+            now_str(),
+        ))
+        conn.commit()
+
+    # -------------------------
+    # Cart
+    # -------------------------
+    def cart_add(
+        self,
+        user_id: int,
+        product_id: Optional[int],
+        product_name: str,
+        price: int,
+        qty: int = 1,
+        size: str = "",
+        photo_file_id: str = "",
+    ) -> int:
+        conn = self._get_conn()
+        cur = conn.cursor()
+        cur.execute("""
+            INSERT INTO carts (user_id, product_id, product_name, price, qty, size, photo_file_id, added_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        """, (
+            user_id,
+            product_id,
+            product_name,
+            safe_int(price),
+            max(1, safe_int(qty, 1)),
+            size,
+            photo_file_id,
+            now_str(),
+        ))
+        conn.commit()
+        cart_id = cur.lastrowid
+        self.event_add(user_id, "cart_add", {
+            "product_id": product_id,
+            "product_name": product_name,
+            "qty": qty,
+            "size": size,
+        })
+        return cart_id
+
+    def cart_get(self, user_id: int) -> List[Dict]:
+        conn = self._get_conn()
+        rows = conn.execute("""
+            SELECT * FROM carts
+            WHERE user_id=?
+            ORDER BY id DESC
+        """, (user_id,)).fetchall()
+        return [dict(r) for r in rows]
+
+    def cart_clear(self, user_id: int) -> None:
+        conn = self._get_conn()
+        conn.execute("DELETE FROM carts WHERE user_id=?", (user_id,))
+        conn.commit()
+
+    def cart_remove(self, cart_id: int, user_id: Optional[int] = None) -> None:
+        conn = self._get_conn()
+        if user_id is None:
+            conn.execute("DELETE FROM carts WHERE id=?", (cart_id,))
+        else:
+            conn.execute("DELETE FROM carts WHERE id=? AND user_id=?", (cart_id, user_id))
+        conn.commit()
+
+    def cart_update_qty(self, cart_id: int, qty: int, user_id: Optional[int] = None) -> None:
+        qty = max(1, safe_int(qty, 1))
+        conn = self._get_conn()
+        if user_id is None:
+            conn.execute("UPDATE carts SET qty=? WHERE id=?", (qty, cart_id))
+        else:
+            conn.execute("UPDATE carts SET qty=? WHERE id=? AND user_id=?", (qty, cart_id, user_id))
+        conn.commit()
+
+    def cart_totals(self, user_id: int) -> Dict[str, int]:
+        cart = self.cart_get(user_id)
+        total_qty = sum(safe_int(x.get("qty"), 1) for x in cart)
+        total_amount = sum(safe_int(x.get("price"), 0) * safe_int(x.get("qty"), 1) for x in cart)
+        return {"total_qty": total_qty, "total_amount": total_amount}
+
+    # -------------------------
+    # Orders
+    # -------------------------
+    def order_create(self, data: Dict[str, Any]) -> int:
+        conn = self._get_conn()
+        cur = conn.cursor()
+
+        items_raw = data.get("items", [])
+        if isinstance(items_raw, str):
+            try:
+                items_list = json.loads(items_raw)
+            except Exception:
+                items_list = []
+        else:
+            items_list = items_raw
+
+        total_qty = data.get("total_qty")
+        if total_qty is None:
+            total_qty = sum(safe_int(x.get("qty"), 1) for x in items_list)
+
+        total_amount = data.get("total_amount")
+        if total_amount is None:
+            total_amount = sum(
+                safe_int(x.get("price"), 0) * safe_int(x.get("qty"), 1)
+                for x in items_list
+            )
+
+        created = now_str()
+
+        cur.execute("""
+            INSERT INTO orders (
+                user_id, username, customer_name, customer_phone, city,
+                items, total_qty, total_amount,
+                delivery_service, delivery_type, delivery_address,
+                latitude, longitude, pvz_code, pvz_address,
+                payment_method, payment_status, payment_provider_invoice_id, payment_provider_url,
+                comment, status, manager_seen, manager_id, source,
+                created_at, updated_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (
+            data.get("user_id"),
+            data.get("username", ""),
+            data.get("customer_name", ""),
+            normalize_phone(data.get("customer_phone", "")),
+            data.get("city", ""),
+            json.dumps(items_list, ensure_ascii=False),
+            safe_int(total_qty),
+            safe_int(total_amount),
+
+            data.get("delivery_service", ""),
+            data.get("delivery_type", ""),
+            data.get("delivery_address", ""),
+            data.get("latitude"),
+            data.get("longitude"),
+            data.get("pvz_code", ""),
+            data.get("pvz_address", ""),
+
+            data.get("payment_method", ""),
+            data.get("payment_status", "pending"),
+            data.get("payment_provider_invoice_id", ""),
+            data.get("payment_provider_url", ""),
+
+            data.get("comment", ""),
+            data.get("status", "new"),
+            safe_int(data.get("manager_seen", 0)),
+            data.get("manager_id"),
+            data.get("source", "bot"),
+            created,
+            created,
+        ))
+        conn.commit()
+
+        order_id = cur.lastrowid
+        self.event_add(data.get("user_id"), "order_created", {
+            "order_id": order_id,
+            "source": data.get("source", "bot"),
+            "payment_method": data.get("payment_method", ""),
+            "delivery_type": data.get("delivery_type", ""),
+        })
+        return order_id
+
+    def order_get(self, order_id: int) -> Optional[Dict]:
+        conn = self._get_conn()
+        row = conn.execute("SELECT * FROM orders WHERE id=?", (order_id,)).fetchone()
+        return dict(row) if row else None
+
+    def orders_get_user(self, user_id: int, limit: int = 10) -> List[Dict]:
+        conn = self._get_conn()
+        rows = conn.execute("""
+            SELECT * FROM orders
+            WHERE user_id=?
+            ORDER BY id DESC
+            LIMIT ?
+        """, (user_id, limit)).fetchall()
+        return [dict(r) for r in rows]
+
+    def orders_get_by_status(self, status: str, limit: int = 50) -> List[Dict]:
+        conn = self._get_conn()
+        rows = conn.execute("""
+            SELECT * FROM orders
+            WHERE status=?
+            ORDER BY id DESC
+            LIMIT ?
+        """, (status, limit)).fetchall()
+        return [dict(r) for r in rows]
+
+    def order_update_status(self, order_id: int, status: str, manager_id: Optional[int] = None) -> None:
+        conn = self._get_conn()
+        if manager_id is None:
+            conn.execute("""
+                UPDATE orders
+                SET status=?, updated_at=?
+                WHERE id=?
+            """, (status, now_str(), order_id))
+        else:
+            conn.execute("""
+                UPDATE orders
+                SET status=?, manager_id=?, manager_seen=1, updated_at=?
+                WHERE id=?
+            """, (status, manager_id, now_str(), order_id))
+        conn.commit()
+
+    def order_update_payment(
+        self,
+        order_id: int,
+        payment_status: str,
+        payment_provider_invoice_id: str = "",
+        payment_provider_url: str = "",
+    ) -> None:
+        conn = self._get_conn()
+        conn.execute("""
+            UPDATE orders
+            SET payment_status=?, payment_provider_invoice_id=?, payment_provider_url=?, updated_at=?
+            WHERE id=?
+        """, (
+            payment_status,
+            payment_provider_invoice_id,
+            payment_provider_url,
+            now_str(),
+            order_id,
+        ))
+        conn.commit()
+
+    def order_mark_seen(self, order_id: int, manager_id: int) -> None:
+        conn = self._get_conn()
+        conn.execute("""
+            UPDATE orders
+            SET manager_seen=1, manager_id=?, updated_at=?
+            WHERE id=?
+        """, (manager_id, now_str(), order_id))
+        conn.commit()
+
+    def orders_filter(
+        self,
+        status: str = "",
+        city: str = "",
+        phone_q: str = "",
+        limit: int = 200,
+    ) -> List[Dict]:
+        conn = self._get_conn()
+        q = "SELECT * FROM orders WHERE 1=1"
+        args: List[Any] = []
+
+        if status:
+            q += " AND status=?"
+            args.append(status)
+
+        if city:
+            q += " AND city LIKE ?"
+            args.append(f"%{city}%")
+
+        if phone_q:
+            q += " AND customer_phone LIKE ?"
+            args.append(f"%{phone_q}%")
+
+        q += " ORDER BY id DESC LIMIT ?"
+        args.append(limit)
+
+        rows = conn.execute(q, tuple(args)).fetchall()
+        return [dict(r) for r in rows]
+
+    def find_orders_by_phone(self, phone_part: str, limit: int = 20) -> List[Dict]:
+        conn = self._get_conn()
+        rows = conn.execute("""
+            SELECT * FROM orders
+            WHERE customer_phone LIKE ?
+            ORDER BY id DESC
+            LIMIT ?
+        """, (f"%{phone_part}%", limit)).fetchall()
+        return [dict(r) for r in rows]
+
+    def orders_get_for_reminder(self) -> List[Dict]:
+        conn = self._get_conn()
+        cutoff = (now_tz() - timedelta(minutes=30)).strftime("%Y-%m-%d %H:%M:%S")
+        rows = conn.execute("""
+            SELECT * FROM orders
+            WHERE status='new'
+              AND manager_seen=0
+              AND created_at < ?
+              AND (reminded_at IS NULL OR reminded_at < ?)
+            ORDER BY id DESC
+        """, (cutoff, cutoff)).fetchall()
+        return [dict(r) for r in rows]
+
+    def order_update_reminded(self, order_id: int) -> None:
+        conn = self._get_conn()
+        conn.execute("""
+            UPDATE orders
+            SET reminded_at=?, updated_at=?
+            WHERE id=?
+        """, (now_str(), now_str(), order_id))
+        conn.commit()
+
+    def orders_get_monthly(self, year: int, month: int) -> List[Dict]:
+        conn = self._get_conn()
+        start = f"{year}-{month:02d}-01 00:00:00"
+        last_day = monthrange(year, month)[1]
+        end = f"{year}-{month:02d}-{last_day} 23:59:59"
+        rows = conn.execute("""
+            SELECT * FROM orders
+            WHERE created_at BETWEEN ? AND ?
+            ORDER BY id ASC
+        """, (start, end)).fetchall()
+        return [dict(r) for r in rows]
+
+    # -------------------------
+    # Reports / stats
+    # -------------------------
+    def report_mark_sent(self, year: int, month: int, filename: str, total_orders: int, total_amount: int) -> None:
+        conn = self._get_conn()
+        conn.execute("""
+            INSERT INTO monthly_reports (year, month, sent_at, filename, total_orders, total_amount, status)
+            VALUES (?, ?, ?, ?, ?, ?, 'sent')
+        """, (year, month, now_str(), filename, total_orders, total_amount))
+        conn.commit()
+
+    def report_is_sent(self, year: int, month: int) -> bool:
+        conn = self._get_conn()
+        row = conn.execute("""
+            SELECT 1 FROM monthly_reports
+            WHERE year=? AND month=? AND status='sent'
+        """, (year, month)).fetchone()
+        return row is not None
+
+    def get_stats_all(self) -> Dict[str, int]:
+        conn = self._get_conn()
+        row = conn.execute("""
+            SELECT
+                COUNT(*) AS total,
+                SUM(CASE WHEN status='new' THEN 1 ELSE 0 END) AS new_count,
+                SUM(CASE WHEN status='processing' THEN 1 ELSE 0 END) AS processing,
+                SUM(CASE WHEN status='confirmed' THEN 1 ELSE 0 END) AS confirmed,
+                SUM(CASE WHEN status='paid' THEN 1 ELSE 0 END) AS paid_count,
+                SUM(CASE WHEN status='shipped' THEN 1 ELSE 0 END) AS shipped,
+                SUM(CASE WHEN status='delivered' THEN 1 ELSE 0 END) AS delivered,
+                SUM(CASE WHEN status='cancelled' THEN 1 ELSE 0 END) AS cancelled,
+                COUNT(DISTINCT user_id) AS unique_users
+            FROM orders
+        """).fetchone()
+
+        if not row:
+            return {
+                "total": 0,
+                "new_count": 0,
+                "processing": 0,
+                "confirmed": 0,
+                "paid_count": 0,
+                "shipped": 0,
+                "delivered": 0,
+                "cancelled": 0,
+                "unique_users": 0,
+            }
+        return dict(row)
+
+    def stats_range(self, start: str, end: str) -> Dict[str, int]:
+        conn = self._get_conn()
+        row = conn.execute("""
+            SELECT
+                COUNT(*) AS total,
+                SUM(CASE WHEN status='new' THEN 1 ELSE 0 END) AS new_count,
+                SUM(CASE WHEN status='processing' THEN 1 ELSE 0 END) AS processing,
+                SUM(CASE WHEN status='confirmed' THEN 1 ELSE 0 END) AS confirmed,
+                SUM(CASE WHEN status='paid' THEN 1 ELSE 0 END) AS paid_count,
+                SUM(CASE WHEN status='shipped' THEN 1 ELSE 0 END) AS shipped,
+                SUM(CASE WHEN status='delivered' THEN 1 ELSE 0 END) AS delivered,
+                SUM(CASE WHEN status='cancelled' THEN 1 ELSE 0 END) AS cancelled
+            FROM orders
+            WHERE created_at BETWEEN ? AND ?
+        """, (start, end)).fetchone()
+        return dict(row) if row else {}
+
+    def top_products_range(self, start: str, end: str, limit: int = 10) -> List[Tuple[str, int]]:
+        conn = self._get_conn()
+        rows = conn.execute("""
+            SELECT items FROM orders
+            WHERE created_at BETWEEN ? AND ?
+        """, (start, end)).fetchall()
+
+        counter: Dict[str, int] = {}
+        for row in rows:
+            try:
+                items = json.loads(row["items"] or "[]")
+            except Exception:
+                items = []
+            for item in items:
+                name = (item.get("product_name") or item.get("name") or "").strip()
+                qty = safe_int(item.get("qty"), 1)
+                if name:
+                    counter[name] = counter.get(name, 0) + qty
+
+        return sorted(counter.items(), key=lambda x: x[1], reverse=True)[:limit]
+
+    def top_cities_range(self, start: str, end: str, limit: int = 10) -> List[Tuple[str, int]]:
+        conn = self._get_conn()
+        rows = conn.execute("""
+            SELECT city, COUNT(*) AS c
+            FROM orders
+            WHERE created_at BETWEEN ? AND ?
+            GROUP BY city
+            ORDER BY c DESC
+            LIMIT ?
+        """, (start, end, limit)).fetchall()
+        return [(r["city"] or "—", safe_int(r["c"])) for r in rows]
+
+    def funnel_range(self, start: str, end: str) -> Dict[str, float]:
+        conn = self._get_conn()
+        row = conn.execute("""
+            SELECT
+                SUM(CASE WHEN event_type='cart_add' THEN 1 ELSE 0 END) AS cart_add,
+                SUM(CASE WHEN event_type='order_created' THEN 1 ELSE 0 END) AS order_created
+            FROM events
+            WHERE created_at BETWEEN ? AND ?
+        """, (start, end)).fetchone()
+
+        cart_add = safe_int(row["cart_add"] if row else 0)
+        order_created = safe_int(row["order_created"] if row else 0)
+        conversion = round((order_created / cart_add * 100.0), 2) if cart_add > 0 else 0.0
+
+        return {
+            "cart_add": cart_add,
+            "order_created": order_created,
+            "conversion": conversion,
+        }
+
+    # -------------------------
+    # Scheduled posts
+    # -------------------------
+    def week_key_now(self, dt: datetime) -> str:
+        iso = dt.isocalendar()
+        return f"{iso[0]}-W{iso[1]:02d}"
+
+    def sched_add(self, dow: int, media_type: str, file_id: str, caption: str, week_key: str) -> int:
+        conn = self._get_conn()
+        cur = conn.cursor()
+        cur.execute("""
+            INSERT INTO scheduled_posts (dow, media_type, file_id, caption, week_key)
+            VALUES (?, ?, ?, ?, ?)
+        """, (dow, media_type, file_id, caption, week_key))
+        conn.commit()
+        return cur.lastrowid
+
+    def sched_get_for_day(self, dow: int, week_key: str) -> Optional[Dict]:
+        conn = self._get_conn()
+        row = conn.execute("""
+            SELECT * FROM scheduled_posts
+            WHERE dow=? AND week_key=? AND posted_at IS NULL
+            ORDER BY id ASC
+            LIMIT 1
+        """, (dow, week_key)).fetchone()
+        return dict(row) if row else None
+
+    def sched_mark_posted(self, post_id: int) -> None:
+        conn = self._get_conn()
+        conn.execute("""
+            UPDATE scheduled_posts
+            SET posted_at=?
+            WHERE id=?
+        """, (now_str(), post_id))
+        conn.commit()
+
+    def sched_count_week(self, week_key: str) -> int:
+        conn = self._get_conn()
+        row = conn.execute("""
+            SELECT COUNT(*) AS c
+            FROM scheduled_posts
+            WHERE week_key=?
+        """, (week_key,)).fetchone()
+        return safe_int(row["c"] if row else 0)
+
+    # -------------------------
+    # Shop products
+    # -------------------------
+    def shop_product_add(
+        self,
+        photo_file_id: str,
+        title_ru: str,
+        title_uz: str,
+        description_ru: str,
+        description_uz: str,
+        sizes: str,
+        category_slug: str,
+        price: int,
+        old_price: int = 0,
+        price_on_request: int = 0,
+        stock_qty: int = 0,
+        is_published: int = 1,
+        sort_order: int = 0,
+    ) -> int:
+        if category_slug not in SHOP_CATEGORIES:
+            category_slug = "casual"
+
+        conn = self._get_conn()
+        cur = conn.cursor()
+        cur.execute("""
+            INSERT INTO shop_products (
+                photo_file_id, title_ru, title_uz,
+                description_ru, description_uz,
+                sizes, category_slug,
+                price, old_price, price_on_request, stock_qty,
+                is_published, sort_order,
+                created_at, updated_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (
+            photo_file_id,
+            title_ru.strip(),
+            title_uz.strip(),
+            description_ru.strip(),
+            description_uz.strip(),
+            sizes.strip(),
+            category_slug,
+            safe_int(price),
+            safe_int(old_price),
+            safe_int(price_on_request),
+            safe_int(stock_qty),
+            safe_int(is_published, 1),
+            safe_int(sort_order),
+            now_str(),
+            now_str(),
+        ))
+        conn.commit()
+        return cur.lastrowid
+
+    def shop_product_get(self, product_id: int) -> Optional[Dict]:
+        conn = self._get_conn()
+        row = conn.execute("""
+            SELECT * FROM shop_products
+            WHERE id=?
+        """, (product_id,)).fetchone()
+        return dict(row) if row else None
+
+    def shop_products_list(self, published_only: bool = True, limit: int = 500) -> List[Dict]:
+        conn = self._get_conn()
+        if published_only:
+            rows = conn.execute("""
+                SELECT * FROM shop_products
+                WHERE is_published=1
+                ORDER BY sort_order ASC, id DESC
+                LIMIT ?
+            """, (limit,)).fetchall()
+        else:
+            rows = conn.execute("""
+                SELECT * FROM shop_products
+                ORDER BY sort_order ASC, id DESC
+                LIMIT ?
+            """, (limit,)).fetchall()
+        return [dict(r) for r in rows]
+
+    def shop_products_count(self) -> int:
+        conn = self._get_conn()
+        row = conn.execute("SELECT COUNT(*) AS c FROM shop_products").fetchone()
+        return safe_int(row["c"] if row else 0)
+
+    def shop_product_delete(self, product_id: int) -> None:
+        conn = self._get_conn()
+        conn.execute("DELETE FROM shop_products WHERE id=?", (product_id,))
+        conn.commit()
+
+    def shop_product_update_publish(self, product_id: int, is_published: int) -> None:
+        conn = self._get_conn()
+        conn.execute("""
+            UPDATE shop_products
+            SET is_published=?, updated_at=?
+            WHERE id=?
+        """, (safe_int(is_published), now_str(), product_id))
+        conn.commit()
+
+    def shop_product_update_field(self, product_id: int, field_name: str, value: Any) -> None:
+        allowed = {
+            "photo_file_id", "title_ru", "title_uz",
+            "description_ru", "description_uz",
+            "sizes", "category_slug", "price", "old_price",
+            "price_on_request", "stock_qty", "is_published", "sort_order",
+        }
+        if field_name not in allowed:
+            raise ValueError("Недопустимое поле для обновления")
+
+        conn = self._get_conn()
+        conn.execute(
+            f"UPDATE shop_products SET {field_name}=?, updated_at=? WHERE id=?",
+            (value, now_str(), product_id)
+        )
+        conn.commit()
+
+    def shop_seed_demo_if_empty(self) -> None:
+        if self.shop_products_count() > 0:
+            return
+
+        demo_products = [
+            {
+                "photo_file_id": "",
+                "title_ru": "Kids Hoodie",
+                "title_uz": "Bolalar hudi",
+                "description_ru": "Тёплый и стильный худи для повседневной носки.",
+                "description_uz": "Kundalik kiyish uchun issiq va zamonaviy hudi.",
+                "sizes": "98,104,110,116",
+                "category_slug": "new",
+                "price": 250000,
+                "old_price": 290000,
+                "price_on_request": 0,
+                "stock_qty": 15,
+            },
+            {
+                "photo_file_id": "",
+                "title_ru": "Mini Boss Suit",
+                "title_uz": "Mini Boss kostyum",
+                "description_ru": "Стильный комплект для особых дней.",
+                "description_uz": "Maxsus kunlar uchun zamonaviy to‘plam.",
+                "sizes": "104,110,116,122",
+                "category_slug": "hits",
+                "price": 390000,
+                "old_price": 0,
+                "price_on_request": 0,
+                "stock_qty": 8,
+            },
+            {
+                "photo_file_id": "",
+                "title_ru": "School Set",
+                "title_uz": "Maktab formasi",
+                "description_ru": "Школьная форма премиум качества.",
+                "description_uz": "Premium sifatdagi maktab formasi.",
+                "sizes": "110,116,122,128,134",
+                "category_slug": "school",
+                "price": 320000,
+                "old_price": 350000,
+                "price_on_request": 0,
+                "stock_qty": 20,
+            },
         ]
-    else:
-        rows = [
-            [KeyboardButton(text="📸 Каталог"), KeyboardButton(text="🧾 Прайс")],
-            [KeyboardButton(text="📏 Размер"), KeyboardButton(text="🛒 Корзина")],
-            [KeyboardButton(text="🚚 Доставка"), KeyboardButton(text="❓ FAQ")],
-            [KeyboardButton(text="📞 Связаться"), KeyboardButton(text="✅ Заказ")],
-            [KeyboardButton(text="📜 История"), KeyboardButton(text="🌐 Язык")],
-        ]
-    if is_admin_flag:
-        rows.append([KeyboardButton(text="🛠 Админ" if lang == "ru" else "🛠 Admin")])
-    return ReplyKeyboardMarkup(keyboard=rows, resize_keyboard=True)
 
-def kb_catalog(lang: str) -> InlineKeyboardMarkup:
-    cats = [
-        [("👶 Мальчики", "cat:boys"), ("👧 Девочки", "cat:girls")],
-        [("🧒 Унисекс", "cat:unisex"), ("🎒 Школа", "cat:school")],
-        [("🔥 Новинки", "cat:new"), ("💰 Акции", "cat:sale")],
-    ]
-    buttons = []
-    for row in cats:
-        buttons.append([
-            InlineKeyboardButton(text=row[0][0], callback_data=row[0][1]),
-            InlineKeyboardButton(text=row[1][0], callback_data=row[1][1])
-        ])
-    buttons.append([InlineKeyboardButton(text="✅ Быстрый заказ" if lang=="ru" else "✅ Tez buyurtma", callback_data="quick_order")])
-    buttons.append([InlineKeyboardButton(text="⬅️ Назад" if lang=="ru" else "⬅️ Orqaga", callback_data="back:menu")])
-    return InlineKeyboardMarkup(inline_keyboard=buttons)
-
-def kb_size(lang: str) -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="👶 По возрасту" if lang == "ru" else "👶 Yosh bo'yicha", callback_data="size:age")],
-        [InlineKeyboardButton(text="📏 По росту" if lang == "ru" else "📏 Bo'y bo'yicha", callback_data="size:height")],
-        [InlineKeyboardButton(text="⬅️ Назад" if lang == "ru" else "⬅️ Orqaga", callback_data="back:menu")],
-    ])
-
-def kb_delivery(lang: str) -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="📦 B2B Почта" if lang=="ru" else "📦 B2B Pochta", callback_data="delivery:b2b")],
-        [InlineKeyboardButton(text="🚚 Яндекс Курьер" if lang=="ru" else "🚚 Yandex Kuryer", callback_data="delivery:yandex_courier")],
-        [InlineKeyboardButton(text="🏪 Яндекс ПВЗ" if lang=="ru" else "🏪 Yandex PVZ", callback_data="delivery:yandex_pvz")],
-        [InlineKeyboardButton(text="⬅️ Назад" if lang == "ru" else "⬅️ Orqaga", callback_data="back:menu")],
-    ])
-
-def kb_cart(items: List[Dict], lang: str) -> InlineKeyboardMarkup:
-    buttons = []
-    for item in items:
-        name = item["product_name"][:22]
-        btn_text = f"❌ {name} (x{item['qty']})"
-        buttons.append([InlineKeyboardButton(text=btn_text, callback_data=f"cart_remove:{item['id']}")])
-
-    buttons.extend([
-        [InlineKeyboardButton(text="✅ Оформить" if lang == "ru" else "✅ Rasmiylashtirish", callback_data="cart:checkout")],
-        [InlineKeyboardButton(text="🧹 Очистить" if lang == "ru" else "🧹 Tozalash", callback_data="cart:clear")],
-        [InlineKeyboardButton(text="⬅️ Назад" if lang == "ru" else "⬅️ Orqaga", callback_data="back:menu")],
-    ])
-    return InlineKeyboardMarkup(inline_keyboard=buttons)
-
-def kb_order_confirm(lang: str) -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="✅ Подтвердить" if lang=="ru" else "✅ Tasdiqlash", callback_data="order:confirm")],
-        [InlineKeyboardButton(text="❌ Отмена" if lang=="ru" else "❌ Bekor", callback_data="order:cancel")],
-    ])
-
-def kb_admin(lang: str) -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="📋 Новые заказы" if lang == "ru" else "📋 Yangi buyurtmalar", callback_data="admin:new")],
-        [InlineKeyboardButton(text="⚙️ В обработке" if lang == "ru" else "⚙️ Ishlanmoqda", callback_data="admin:processing")],
-        [InlineKeyboardButton(text="📊 Статистика" if lang == "ru" else "📊 Statistika", callback_data="admin:stats")],
-        [InlineKeyboardButton(text="📤 Excel отчет" if lang == "ru" else "📤 Excel hisobot", callback_data="admin:export")],
-        [InlineKeyboardButton(text="📰 Посты недели" if lang == "ru" else "📰 Haftalik postlar", callback_data="admin:posts")],
-        [InlineKeyboardButton(text="⬅️ Назад" if lang == "ru" else "⬅️ Orqaga", callback_data="back:menu")],
-    ])
-
-# ✅ NEW: user_id inside admin keyboard (write to client)
-def kb_admin_order(order_id: int, user_id: int, lang: str) -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="📞 Написать клиенту" if lang=="ru" else "📞 Mijozga yozish", url=f"tg://user?id={user_id}")],
-        [
-            InlineKeyboardButton(text="👁 Просмотрено" if lang=="ru" else "👁 Ko'rildi", callback_data=f"order_seen:{order_id}"),
-            InlineKeyboardButton(text="⚙️ В работу" if lang=="ru" else "⚙️ Ishga", callback_data=f"order_process:{order_id}")
-        ],
-        [
-            InlineKeyboardButton(text="🚚 Отправлен" if lang=="ru" else "🚚 Jo'natildi", callback_data=f"order_ship:{order_id}"),
-            InlineKeyboardButton(text="✅ Доставлен" if lang=="ru" else "✅ Yetkazildi", callback_data=f"order_deliver:{order_id}")
-        ],
-        [InlineKeyboardButton(text="❌ Отмена" if lang=="ru" else "❌ Bekor", callback_data=f"order_cancel:{order_id}")],
-    ])
-
-def kb_contact(lang: str) -> ReplyKeyboardMarkup:
-    if lang == "uz":
-        btn = KeyboardButton(text="📱 Raqamni yuborish", request_contact=True)
-        cancel = KeyboardButton(text="❌ Bekor qilish")
-    else:
-        btn = KeyboardButton(text="📱 Отправить номер", request_contact=True)
-        cancel = KeyboardButton(text="❌ Отмена")
-    return ReplyKeyboardMarkup(keyboard=[[btn], [cancel]], resize_keyboard=True, one_time_keyboard=True)
-
-def kb_channel_and_menu(lang: str) -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="📣 Канал" if lang=="ru" else "📣 Kanal", url=TG_CHANNEL_URL)],
-        [InlineKeyboardButton(text="⬅️ Меню" if lang=="ru" else "⬅️ Menyu", callback_data="back:menu")],
-    ])
-
-def kb_follow_links(lang: str) -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="📣 Telegram канал", url=FOLLOW_TG)],
-        [InlineKeyboardButton(text="📺 YouTube", url=FOLLOW_YT)],
-        [InlineKeyboardButton(text="📸 Instagram", url=FOLLOW_IG)],
-    ])
-
-def kb_quick_products(lang: str) -> InlineKeyboardMarkup:
-    items = PRODUCTS_RU if lang == "ru" else PRODUCTS_UZ
-    rows = []
-    for i in range(0, min(len(items), 12), 2):
-        a = items[i]
-        b = items[i + 1] if i + 1 < min(len(items), 12) else None
-        row = [InlineKeyboardButton(text=a, callback_data=f"prod:{i}")]
-        if b:
-            row.append(InlineKeyboardButton(text=b, callback_data=f"prod:{i+1}"))
-        rows.append(row)
-
-    rows.append([InlineKeyboardButton(text="✍️ Ввести вручную" if lang=="ru" else "✍️ Qo'lda kiritish", callback_data="prod_manual")])
-    rows.append([InlineKeyboardButton(text="🛒 Корзина" if lang=="ru" else "🛒 Savat", callback_data="go_cart")])
-    rows.append([InlineKeyboardButton(text="⬅️ Меню" if lang=="ru" else "⬅️ Menyu", callback_data="back:menu")])
-    return InlineKeyboardMarkup(inline_keyboard=rows)
-
-def kb_after_add(lang: str) -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="➕ Добавить ещё" if lang=="ru" else "➕ Yana qo‘shish", callback_data="quick_order")],
-        [InlineKeyboardButton(text="🛒 Перейти в корзину" if lang=="ru" else "🛒 Savatga o‘tish", callback_data="go_cart")],
-        [InlineKeyboardButton(text="✅ Оформить заказ" if lang=="ru" else "✅ Buyurtmani rasmiylashtirish", callback_data="cart:checkout")],
-        [InlineKeyboardButton(text="⬅️ Меню" if lang=="ru" else "⬅️ Menyu", callback_data="back:menu")],
-    ])
-
-def kb_dow(lang: str) -> InlineKeyboardMarkup:
-    if lang == "uz":
-        names = [(1, "Dushanba"), (2, "Seshanba"), (3, "Chorshanba"), (4, "Payshanba"), (5, "Juma"), (6, "Shanba")]
-    else:
-        names = [(1, "Понедельник"), (2, "Вторник"), (3, "Среда"), (4, "Четверг"), (5, "Пятница"), (6, "Суббота")]
-
-    rows = []
-    for i in range(0, 6, 2):
-        a = names[i]
-        b = names[i + 1]
-        rows.append([
-            InlineKeyboardButton(text=a[1], callback_data=f"dow:{a[0]}"),
-            InlineKeyboardButton(text=b[1], callback_data=f"dow:{b[0]}")
-        ])
-    rows.append([InlineKeyboardButton(text="⬅️ Назад" if lang == "ru" else "⬅️ Orqaga", callback_data="admin:back")])
-    return InlineKeyboardMarkup(inline_keyboard=rows)
+        for item in demo_products:
+            self.shop_product_add(**item)
 
 
-# =========================
-# FSM
-# =========================
-class States(StatesGroup):
-    size_age = State()
-    size_height = State()
-
-    order_name = State()
-    order_phone = State()
-    order_city = State()
-    order_delivery = State()
-    order_address = State()
-
-    prod_manual = State()
-
-    admin_post_dow = State()
-    admin_post_media = State()
+db = Database(DB_PATH)
+db.shop_seed_demo_if_empty()
 
 
-# =========================
+# =========================================================
 # BOT INIT
-# =========================
-bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
+# =========================================================
+bot = Bot(
+    token=BOT_TOKEN,
+    default=DefaultBotProperties(parse_mode=ParseMode.HTML)
+)
+
 dp = Dispatcher(storage=MemoryStorage())
 
 
-# =========================
-# HANDLERS
-# =========================
+# =========================================================
+# STATES
+# =========================================================
+class LangStates(StatesGroup):
+    waiting_lang = State()
+
+
+class SizeStates(StatesGroup):
+    waiting_input = State()
+
+
+class OrderStates(StatesGroup):
+    waiting_name = State()
+    waiting_phone = State()
+    waiting_delivery = State()
+    waiting_address_type = State()
+    waiting_city = State()
+    waiting_manual_address = State()
+    waiting_location = State()
+    waiting_pvz = State()
+    waiting_payment = State()
+    waiting_comment = State()
+    waiting_confirm = State()
+
+
+class AdminAddProductStates(StatesGroup):
+    waiting_photo = State()
+    waiting_title_ru = State()
+    waiting_title_uz = State()
+    waiting_desc_ru = State()
+    waiting_desc_uz = State()
+    waiting_sizes = State()
+    waiting_category = State()
+    waiting_price = State()
+    waiting_old_price = State()
+    waiting_stock_qty = State()
+    waiting_publish = State()
+
+
+class AdminEditProductStates(StatesGroup):
+    waiting_product_id = State()
+    waiting_field = State()
+    waiting_new_value = State()
+
+
+# =========================================================
+# KEYBOARDS
+# =========================================================
+def main_menu(lang: str, user_id: int) -> ReplyKeyboardMarkup:
+    if lang == "uz":
+        keyboard = [
+            [KeyboardButton(text="🛍 Do'kon"), KeyboardButton(text="🛒 Savatcha")],
+            [KeyboardButton(text="📦 Buyurtmalarim"), KeyboardButton(text="📏 Razmer tanlash")],
+            [KeyboardButton(text="📞 Aloqa"), KeyboardButton(text="🌐 Til")],
+        ]
+        if is_admin(user_id):
+            keyboard.append([KeyboardButton(text="🛠 Admin")])
+    else:
+        keyboard = [
+            [KeyboardButton(text="🛍 Магазин"), KeyboardButton(text="🛒 Корзина")],
+            [KeyboardButton(text="📦 Мои заказы"), KeyboardButton(text="📏 Подбор размера")],
+            [KeyboardButton(text="📞 Контакты"), KeyboardButton(text="🌐 Язык")],
+        ]
+        if is_admin(user_id):
+            keyboard.append([KeyboardButton(text="🛠 Админ")])
+
+    return ReplyKeyboardMarkup(keyboard=keyboard, resize_keyboard=True)
+
+
+def language_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(text="🇷🇺 Русский", callback_data="lang_ru"),
+                InlineKeyboardButton(text="🇺🇿 O'zbekcha", callback_data="lang_uz"),
+            ]
+        ]
+    )
+
+
+def shop_keyboard(lang: str) -> InlineKeyboardMarkup:
+    text = "🛍 Открыть магазин" if lang == "ru" else "🛍 Do'konni ochish"
+    url = f"{BASE_URL}/" if BASE_URL else "https://t.me"
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text=text, web_app=WebAppInfo(url=url))]
+        ]
+    )
+
+
+def cart_keyboard(lang: str) -> InlineKeyboardMarkup:
+    if lang == "uz":
+        return InlineKeyboardMarkup(
+            inline_keyboard=[
+                [InlineKeyboardButton(text="✅ Buyurtma berish", callback_data="checkout_start")],
+                [InlineKeyboardButton(text="🗑 Savatchani tozalash", callback_data="cart_clear")],
+            ]
+        )
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="✅ Оформить заказ", callback_data="checkout_start")],
+            [InlineKeyboardButton(text="🗑 Очистить корзину", callback_data="cart_clear")],
+        ]
+    )
+
+
+def admin_panel_keyboard(lang: str) -> InlineKeyboardMarkup:
+    if lang == "uz":
+        rows = [
+            [InlineKeyboardButton(text="📦 Yangi buyurtmalar", callback_data="admin_orders_new")],
+            [InlineKeyboardButton(text="📋 Barcha buyurtmalar", callback_data="admin_orders_all")],
+            [InlineKeyboardButton(text="➕ Tovar qo‘shish", callback_data="admin_add_product")],
+            [InlineKeyboardButton(text="📝 Tovarni tahrirlash", callback_data="admin_edit_product")],
+            [InlineKeyboardButton(text="🗑 Tovarni o‘chirish", callback_data="admin_delete_product_menu")],
+            [InlineKeyboardButton(text="📊 Statistika", callback_data="admin_stats")],
+        ]
+    else:
+        rows = [
+            [InlineKeyboardButton(text="📦 Новые заказы", callback_data="admin_orders_new")],
+            [InlineKeyboardButton(text="📋 Все заказы", callback_data="admin_orders_all")],
+            [InlineKeyboardButton(text="➕ Добавить товар", callback_data="admin_add_product")],
+            [InlineKeyboardButton(text="📝 Редактировать товар", callback_data="admin_edit_product")],
+            [InlineKeyboardButton(text="🗑 Удалить товар", callback_data="admin_delete_product_menu")],
+            [InlineKeyboardButton(text="📊 Статистика", callback_data="admin_stats")],
+        ]
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def delivery_keyboard(lang: str) -> InlineKeyboardMarkup:
+    if lang == "uz":
+        return InlineKeyboardMarkup(
+            inline_keyboard=[
+                [InlineKeyboardButton(text="🚚 Yandex kuryer", callback_data="delivery:yandex_courier")],
+                [InlineKeyboardButton(text="📦 B2B pochta", callback_data="delivery:b2b_post")],
+                [InlineKeyboardButton(text="🏪 Yandex PVZ", callback_data="delivery:yandex_pvz")],
+            ]
+        )
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="🚚 Яндекс курьер", callback_data="delivery:yandex_courier")],
+            [InlineKeyboardButton(text="📦 B2B почта", callback_data="delivery:b2b_post")],
+            [InlineKeyboardButton(text="🏪 Яндекс ПВЗ", callback_data="delivery:yandex_pvz")],
+        ]
+    )
+
+
+def address_type_keyboard(lang: str) -> InlineKeyboardMarkup:
+    if lang == "uz":
+        return InlineKeyboardMarkup(
+            inline_keyboard=[
+                [InlineKeyboardButton(text="📍 Lokatsiya yuborish", callback_data="addrtype:location")],
+                [InlineKeyboardButton(text="✍️ Qo‘lda kiritish", callback_data="addrtype:manual")],
+            ]
+        )
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="📍 Отправить локацию", callback_data="addrtype:location")],
+            [InlineKeyboardButton(text="✍️ Ввести вручную", callback_data="addrtype:manual")],
+        ]
+    )
+
+
+def payment_keyboard(lang: str) -> InlineKeyboardMarkup:
+    if lang == "uz":
+        return InlineKeyboardMarkup(
+            inline_keyboard=[
+                [InlineKeyboardButton(text="💳 Click", callback_data="pay:click")],
+                [InlineKeyboardButton(text="💳 Payme", callback_data="pay:payme")],
+            ]
+        )
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="💳 Click", callback_data="pay:click")],
+            [InlineKeyboardButton(text="💳 Payme", callback_data="pay:payme")],
+        ]
+    )
+
+
+def confirm_order_keyboard(lang: str) -> InlineKeyboardMarkup:
+    if lang == "uz":
+        return InlineKeyboardMarkup(
+            inline_keyboard=[
+                [InlineKeyboardButton(text="✅ Tasdiqlash", callback_data="confirm_order_yes")],
+                [InlineKeyboardButton(text="❌ Bekor qilish", callback_data="confirm_order_no")],
+            ]
+        )
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="✅ Подтвердить", callback_data="confirm_order_yes")],
+            [InlineKeyboardButton(text="❌ Отменить", callback_data="confirm_order_no")],
+        ]
+    )
+
+
+def location_request_keyboard(lang: str) -> ReplyKeyboardMarkup:
+    if lang == "uz":
+        return ReplyKeyboardMarkup(
+            keyboard=[
+                [KeyboardButton(text="📍 Lokatsiyani yuborish", request_location=True)],
+                [KeyboardButton(text="⬅️ Bekor qilish")],
+            ],
+            resize_keyboard=True,
+            one_time_keyboard=True,
+        )
+    return ReplyKeyboardMarkup(
+        keyboard=[
+            [KeyboardButton(text="📍 Отправить геолокацию", request_location=True)],
+            [KeyboardButton(text="⬅️ Отмена")],
+        ],
+        resize_keyboard=True,
+        one_time_keyboard=True,
+    )
+
+
+def order_admin_keyboard(order_id: int, user_id: Optional[int]) -> InlineKeyboardMarkup:
+    rows: List[List[InlineKeyboardButton]] = [
+        [
+            InlineKeyboardButton(text="🟡 В работу", callback_data=f"order_status:{order_id}:processing"),
+            InlineKeyboardButton(text="🟢 Подтвердить", callback_data=f"order_status:{order_id}:confirmed"),
+        ],
+        [
+            InlineKeyboardButton(text="💳 Оплачен", callback_data=f"order_status:{order_id}:paid"),
+            InlineKeyboardButton(text="🚚 Отправлен", callback_data=f"order_status:{order_id}:shipped"),
+        ],
+        [
+            InlineKeyboardButton(text="✅ Доставлен", callback_data=f"order_status:{order_id}:delivered"),
+            InlineKeyboardButton(text="❌ Отменён", callback_data=f"order_status:{order_id}:cancelled"),
+        ],
+    ]
+    if user_id:
+        rows.append([InlineKeyboardButton(text="📞 Написать клиенту", url=f"tg://user?id={user_id}")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def admin_products_list_keyboard(products: List[Dict], action: str) -> InlineKeyboardMarkup:
+    rows: List[List[InlineKeyboardButton]] = []
+    for product in products[:20]:
+        title = product.get("title_ru") or f"ID {product['id']}"
+        rows.append([
+            InlineKeyboardButton(
+                text=f"{product['id']} • {title[:35]}",
+                callback_data=f"{action}:{product['id']}"
+            )
+        ])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+# =========================================================
+# PART 1/4 END
+# =========================================================
+
+# =========================================================
+# PART 2/4
+# Что внутри:
+# - common helpers for bot messages
+# - start / language
+# - main menu handlers
+# - contacts / size picker / my orders
+# - cart handlers
+# - checkout FSM
+# - client order confirmation
+# =========================================================
+
+
+# =========================================================
+# BOT HELPERS
+# =========================================================
+def get_user_lang(user_id: int) -> str:
+    user = db.user_get(user_id)
+    return user_lang_or_default(user)
+
+
+def get_full_name_from_user(message: Message) -> str:
+    first_name = (message.from_user.first_name or "").strip()
+    last_name = (message.from_user.last_name or "").strip()
+    full_name = f"{first_name} {last_name}".strip()
+    return full_name
+
+
+def status_label(status: str, lang: str) -> str:
+    ru_map = {
+        "new": "Новый",
+        "processing": "В обработке",
+        "confirmed": "Подтверждён",
+        "paid": "Оплачен",
+        "shipped": "Отправлен",
+        "delivered": "Доставлен",
+        "cancelled": "Отменён",
+    }
+    uz_map = {
+        "new": "Yangi",
+        "processing": "Jarayonda",
+        "confirmed": "Tasdiqlangan",
+        "paid": "To‘langan",
+        "shipped": "Yuborilgan",
+        "delivered": "Yetkazilgan",
+        "cancelled": "Bekor qilingan",
+    }
+    if lang == "uz":
+        return uz_map.get(status, status)
+    return ru_map.get(status, status)
+
+
+def payment_label(method: str, lang: str) -> str:
+    labels = {
+        "click": "Click",
+        "payme": "Payme",
+    }
+    return labels.get(method, method or ("—" if lang == "ru" else "—"))
+
+
+def payment_status_label(status: str, lang: str) -> str:
+    ru_map = {
+        "pending": "Ожидает оплаты",
+        "paid": "Оплачен",
+        "failed": "Ошибка оплаты",
+        "cancelled": "Отменён",
+        "refunded": "Возврат",
+    }
+    uz_map = {
+        "pending": "To‘lov kutilmoqda",
+        "paid": "To‘langan",
+        "failed": "To‘lovda xato",
+        "cancelled": "Bekor qilingan",
+        "refunded": "Qaytarilgan",
+    }
+    if lang == "uz":
+        return uz_map.get(status, status)
+    return ru_map.get(status, status)
+
+
+def delivery_label(delivery_type: str, lang: str) -> str:
+    ru_map = {
+        "yandex_courier": "Яндекс курьер",
+        "b2b_post": "B2B почта",
+        "yandex_pvz": "Яндекс ПВЗ",
+    }
+    uz_map = {
+        "yandex_courier": "Yandex kuryer",
+        "b2b_post": "B2B pochta",
+        "yandex_pvz": "Yandex PVZ",
+    }
+    if lang == "uz":
+        return uz_map.get(delivery_type, delivery_type)
+    return ru_map.get(delivery_type, delivery_type)
+
+
+def cart_to_order_items(cart: List[Dict]) -> List[Dict]:
+    items: List[Dict] = []
+    for row in cart:
+        items.append({
+            "cart_id": row.get("id"),
+            "product_id": row.get("product_id"),
+            "product_name": row.get("product_name", ""),
+            "name": row.get("product_name", ""),
+            "price": safe_int(row.get("price"), 0),
+            "qty": safe_int(row.get("qty"), 1),
+            "size": row.get("size", ""),
+            "photo_file_id": row.get("photo_file_id", ""),
+        })
+    return items
+
+
+def format_cart_text(cart: List[Dict], lang: str) -> str:
+    title = t(lang, "cart_title")
+    if not cart:
+        return t(lang, "cart_empty")
+
+    lines = [title, ""]
+    total_qty = 0
+    total_amount = 0
+
+    for idx, item in enumerate(cart, start=1):
+        name = item.get("product_name", "—")
+        qty = safe_int(item.get("qty"), 1)
+        price = safe_int(item.get("price"), 0)
+        size = item.get("size", "")
+        line_total = qty * price
+
+        total_qty += qty
+        total_amount += line_total
+
+        if lang == "uz":
+            lines.append(
+                f"{idx}. <b>{esc(name)}</b>\n"
+                f"   Soni: {qty}\n"
+                f"   Razmer: {esc(size or '—')}\n"
+                f"   Narx: {money_fmt(price)} so'm\n"
+                f"   Jami: {money_fmt(line_total)} so'm"
+            )
+        else:
+            lines.append(
+                f"{idx}. <b>{esc(name)}</b>\n"
+                f"   Кол-во: {qty}\n"
+                f"   Размер: {esc(size or '—')}\n"
+                f"   Цена: {money_fmt(price)} сум\n"
+                f"   Итого: {money_fmt(line_total)} сум"
+            )
+
+    lines.append("")
+    if lang == "uz":
+        lines.append(f"Jami soni: <b>{total_qty}</b>")
+        lines.append(f"Umumiy summa: <b>{money_fmt(total_amount)} so'm</b>")
+    else:
+        lines.append(f"Всего позиций: <b>{total_qty}</b>")
+        lines.append(f"Общая сумма: <b>{money_fmt(total_amount)} сум</b>")
+
+    return "\n".join(lines)
+
+
+def format_order_items(items_raw: str | List[Dict], lang: str) -> str:
+    if isinstance(items_raw, str):
+        try:
+            items = json.loads(items_raw or "[]")
+        except Exception:
+            items = []
+    else:
+        items = items_raw
+
+    if not items:
+        return "—"
+
+    lines = []
+    for item in items:
+        name = item.get("product_name") or item.get("name") or "item"
+        qty = safe_int(item.get("qty"), 1)
+        size = item.get("size", "")
+        price = safe_int(item.get("price"), 0)
+        if lang == "uz":
+            lines.append(
+                f"• {esc(name)} x{qty}"
+                + (f" | {esc(size)}" if size else "")
+                + (f" | {money_fmt(price)} so'm" if price else "")
+            )
+        else:
+            lines.append(
+                f"• {esc(name)} x{qty}"
+                + (f" | {esc(size)}" if size else "")
+                + (f" | {money_fmt(price)} сум" if price else "")
+            )
+    return "\n".join(lines)
+
+
+def format_my_orders_text(orders: List[Dict], lang: str) -> str:
+    if not orders:
+        return t(lang, "orders_empty")
+
+    if lang == "uz":
+        lines = ["📦 <b>Buyurtmalaringiz</b>", ""]
+    else:
+        lines = ["📦 <b>Ваши заказы</b>", ""]
+
+    for o in orders:
+        created_at = (o.get("created_at") or "")[:16]
+        order_id = o.get("id")
+        total_amount = safe_int(o.get("total_amount"), 0)
+        delivery = delivery_label(o.get("delivery_type", ""), lang)
+        payment = payment_label(o.get("payment_method", ""), lang)
+        status = status_label(o.get("status", ""), lang)
+        pay_status = payment_status_label(o.get("payment_status", ""), lang)
+
+        if lang == "uz":
+            lines.append(
+                f"№<b>{order_id}</b> | {created_at}\n"
+                f"Holat: <b>{status}</b>\n"
+                f"To‘lov: {payment} ({pay_status})\n"
+                f"Yetkazish: {delivery}\n"
+                f"Summa: <b>{money_fmt(total_amount)} so'm</b>"
+            )
+        else:
+            lines.append(
+                f"№<b>{order_id}</b> | {created_at}\n"
+                f"Статус: <b>{status}</b>\n"
+                f"Оплата: {payment} ({pay_status})\n"
+                f"Доставка: {delivery}\n"
+                f"Сумма: <b>{money_fmt(total_amount)} сум</b>"
+            )
+        lines.append("")
+
+    return "\n".join(lines).strip()
+
+
+def build_checkout_preview(data: Dict[str, Any], cart: List[Dict], lang: str) -> str:
+    items_text = format_order_items(cart_to_order_items(cart), lang)
+    totals = db.cart_totals(data["user_id"])
+    delivery = delivery_label(data.get("delivery_type", ""), lang)
+    payment = payment_label(data.get("payment_method", ""), lang)
+
+    address = data.get("delivery_address", "")
+    if data.get("delivery_type") == "yandex_pvz":
+        address = data.get("pvz_address") or data.get("pvz_code") or address
+
+    if data.get("latitude") and data.get("longitude"):
+        geo_text = f"{data.get('latitude')}, {data.get('longitude')}"
+    else:
+        geo_text = "—"
+
+    if lang == "uz":
+        lines = [
+            t(lang, "checkout_confirm"),
+            "",
+            f"👤 Ism: <b>{esc(data.get('customer_name', ''))}</b>",
+            f"📞 Telefon: <b>{esc(data.get('customer_phone', ''))}</b>",
+            f"🏙 Shahar: <b>{esc(data.get('city', ''))}</b>",
+            f"🚚 Yetkazish: <b>{esc(delivery)}</b>",
+            f"💳 To‘lov: <b>{esc(payment)}</b>",
+            f"📍 Manzil: <b>{esc(address or '—')}</b>",
+            f"🗺 Lokatsiya: <b>{esc(geo_text)}</b>",
+            f"💬 Izoh: <b>{esc(data.get('comment', '—') or '—')}</b>",
+            "",
+            "🛍 <b>Tovarlar:</b>",
+            items_text,
+            "",
+            f"📦 Jami soni: <b>{totals['total_qty']}</b>",
+            f"💰 Jami summa: <b>{money_fmt(totals['total_amount'])} so'm</b>",
+        ]
+    else:
+        lines = [
+            t(lang, "checkout_confirm"),
+            "",
+            f"👤 Имя: <b>{esc(data.get('customer_name', ''))}</b>",
+            f"📞 Телефон: <b>{esc(data.get('customer_phone', ''))}</b>",
+            f"🏙 Город: <b>{esc(data.get('city', ''))}</b>",
+            f"🚚 Доставка: <b>{esc(delivery)}</b>",
+            f"💳 Оплата: <b>{esc(payment)}</b>",
+            f"📍 Адрес: <b>{esc(address or '—')}</b>",
+            f"🗺 Локация: <b>{esc(geo_text)}</b>",
+            f"💬 Комментарий: <b>{esc(data.get('comment', '—') or '—')}</b>",
+            "",
+            "🛍 <b>Товары:</b>",
+            items_text,
+            "",
+            f"📦 Всего: <b>{totals['total_qty']}</b>",
+            f"💰 Сумма: <b>{money_fmt(totals['total_amount'])} сум</b>",
+        ]
+    return "\n".join(lines)
+
+
+def build_admin_order_text(order: Dict, lang: str = "ru") -> str:
+    items_text = format_order_items(order.get("items", "[]"), "ru")
+    delivery = delivery_label(order.get("delivery_type", ""), "ru")
+    payment = payment_label(order.get("payment_method", ""), "ru")
+    pay_status = payment_status_label(order.get("payment_status", ""), "ru")
+    status = status_label(order.get("status", ""), "ru")
+
+    location_part = "—"
+    if order.get("latitude") and order.get("longitude"):
+        location_part = f"{order.get('latitude')}, {order.get('longitude')}"
+
+    username = order.get("username") or ""
+    username_line = f"@{username}" if username else "—"
+
+    address = order.get("delivery_address") or ""
+    if order.get("delivery_type") == "yandex_pvz":
+        address = order.get("pvz_address") or order.get("pvz_code") or address
+
+    return (
+        f"🆕 <b>Новый заказ #{order.get('id')}</b>\n\n"
+        f"👤 Имя: <b>{esc(order.get('customer_name') or '')}</b>\n"
+        f"📞 Телефон: <b>{esc(order.get('customer_phone') or '')}</b>\n"
+        f"👨‍💻 Username: <b>{esc(username_line)}</b>\n"
+        f"🆔 User ID: <b>{esc(order.get('user_id') or '—')}</b>\n"
+        f"🏙 Город: <b>{esc(order.get('city') or '—')}</b>\n"
+        f"🚚 Доставка: <b>{esc(delivery)}</b>\n"
+        f"📍 Адрес: <b>{esc(address or '—')}</b>\n"
+        f"🗺 Локация: <b>{esc(location_part)}</b>\n"
+        f"💳 Оплата: <b>{esc(payment)}</b>\n"
+        f"💰 Статус оплаты: <b>{esc(pay_status)}</b>\n"
+        f"📦 Статус заказа: <b>{esc(status)}</b>\n"
+        f"💬 Комментарий: <b>{esc(order.get('comment') or '—')}</b>\n"
+        f"🌐 Источник: <b>{esc(order.get('source') or 'bot')}</b>\n"
+        f"🕒 Дата: <b>{esc(order.get('created_at') or '')}</b>\n\n"
+        f"🛍 <b>Товары:</b>\n{items_text}\n\n"
+        f"📦 Кол-во: <b>{safe_int(order.get('total_qty'), 0)}</b>\n"
+        f"💵 Сумма: <b>{money_fmt(order.get('total_amount'))} сум</b>"
+    )
+
+
+async def ensure_user_record(message: Message) -> str:
+    lang = get_user_lang(message.from_user.id)
+    db.user_upsert(
+        user_id=message.from_user.id,
+        username=message.from_user.username or "",
+        full_name=get_full_name_from_user(message),
+        lang=lang,
+    )
+    return lang
+
+
+async def send_order_to_admins(order_id: int) -> None:
+    order = db.order_get(order_id)
+    if not order:
+        return
+
+    text = build_admin_order_text(order)
+    kb = order_admin_keyboard(order_id, order.get("user_id"))
+
+    for admin_id in ADMIN_IDS:
+        try:
+            await bot.send_message(admin_id, text, reply_markup=kb)
+        except Exception as e:
+            print(f"Failed to send order to admin {admin_id}: {e}")
+
+
+async def send_payment_stub(order: Dict, lang: str) -> None:
+    """
+    Пока это заглушка под Click / Payme.
+    Архитектура уже готова, позже можно подключить реальные ссылки/API.
+    """
+    order_id = order.get("id")
+    payment_method = order.get("payment_method")
+
+    if payment_method == "click":
+        fake_url = f"{BASE_URL}/pay/click/{order_id}" if BASE_URL else f"https://t.me/{CHANNEL_USERNAME}"
+        db.order_update_payment(order_id, "pending", payment_provider_url=fake_url)
+        if order.get("user_id"):
+            if lang == "uz":
+                text = (
+                    f"💳 Click to‘lovi uchun havola:\n{fake_url}\n\n"
+                    "To‘lovdan keyin status yangilanadi."
+                )
+            else:
+                text = (
+                    f"💳 Ссылка на оплату Click:\n{fake_url}\n\n"
+                    "После оплаты статус будет обновлён."
+                )
+            try:
+                await bot.send_message(order["user_id"], text)
+            except Exception:
+                pass
+
+    elif payment_method == "payme":
+        fake_url = f"{BASE_URL}/pay/payme/{order_id}" if BASE_URL else f"https://t.me/{CHANNEL_USERNAME}"
+        db.order_update_payment(order_id, "pending", payment_provider_url=fake_url)
+        if order.get("user_id"):
+            if lang == "uz":
+                text = (
+                    f"💳 Payme to‘lovi uchun havola:\n{fake_url}\n\n"
+                    "To‘lovdan keyin status yangilanadi."
+                )
+            else:
+                text = (
+                    f"💳 Ссылка на оплату Payme:\n{fake_url}\n\n"
+                    "После оплаты статус будет обновлён."
+                )
+            try:
+                await bot.send_message(order["user_id"], text)
+            except Exception:
+                pass
+
+
+# =========================================================
+# START / LANGUAGE
+# =========================================================
 @dp.message(CommandStart())
 async def cmd_start(message: Message, state: FSMContext):
     await state.clear()
+
     user_id = message.from_user.id
-    username = message.from_user.username or ""
-    lang = "uz" if (message.from_user.language_code == "uz") else "ru"
-    db.user_upsert(user_id, username, lang)
-    await message.answer(TEXT[lang]["welcome"], reply_markup=kb_main(lang, is_admin(user_id)))
+    user = db.user_get(user_id)
+    lang = user_lang_or_default(user)
 
-@dp.message(F.text.in_(["🌐 Язык", "🌐 Til"]))
-async def cmd_lang(message: Message, state: FSMContext):
-    user = db.user_get(message.from_user.id)
-    lang = "uz" if user and user.get("lang") == "ru" else "ru"
-    db.user_upsert(message.from_user.id, message.from_user.username or "", lang)
-    await message.answer(TEXT[lang]["welcome"], reply_markup=kb_main(lang, is_admin(message.from_user.id)))
-
-@dp.callback_query(F.data == "back:menu")
-async def back_menu(call: CallbackQuery, state: FSMContext):
-    await state.clear()
-    user = db.user_get(call.from_user.id)
-    lang = user["lang"] if user else "ru"
-    await call.message.answer(TEXT[lang]["menu"], reply_markup=kb_main(lang, is_admin(call.from_user.id)))
-    await call.answer()
-
-# Catalog
-@dp.message(F.text.in_(["📸 Каталог", "📸 Katalog"]))
-async def cmd_catalog(message: Message, state: FSMContext):
-    user = db.user_get(message.from_user.id)
-    lang = user["lang"] if user else "ru"
-    await message.answer(TEXT[lang]["catalog"], reply_markup=kb_catalog(lang))
-    await message.answer(TEXT[lang]["catalog_hint"], reply_markup=kb_main(lang, is_admin(message.from_user.id)))
-
-@dp.callback_query(F.data.startswith("cat:"))
-async def cat_select(call: CallbackQuery, state: FSMContext):
-    user = db.user_get(call.from_user.id)
-    lang = user["lang"] if user else "ru"
-    cat = call.data.split(":")[1]
-    await call.message.answer(
-        f"📸 {cat.upper()}\n\nСмотрите полный каталог в канале 👇" if lang == "ru"
-        else f"📸 {cat.upper()}\n\nTo'liq katalog kanalimizda 👇",
-        reply_markup=kb_channel_and_menu(lang)
+    db.user_upsert(
+        user_id=user_id,
+        username=message.from_user.username or "",
+        full_name=get_full_name_from_user(message),
+        lang=lang,
     )
-    await call.answer()
-
-@dp.callback_query(F.data == "quick_order")
-async def quick_order(call: CallbackQuery, state: FSMContext):
-    user = db.user_get(call.from_user.id)
-    lang = user["lang"] if user else "ru"
-    await state.clear()
-    await call.message.answer(TEXT[lang]["order_start"], reply_markup=kb_quick_products(lang))
-    await call.answer()
-
-# Price
-@dp.message(F.text.in_(["🧾 Прайс", "🧾 Narxlar"]))
-async def cmd_price(message: Message, state: FSMContext):
-    user = db.user_get(message.from_user.id)
-    lang = user["lang"] if user else "ru"
-    await message.answer(TEXT[lang]["price"], reply_markup=kb_main(lang, is_admin(message.from_user.id)))
-
-# Size
-@dp.message(F.text.in_(["📏 Размер", "📏 O'lcham"]))
-async def cmd_size(message: Message, state: FSMContext):
-    user = db.user_get(message.from_user.id)
-    lang = user["lang"] if user else "ru"
-    await message.answer(TEXT[lang]["size"], reply_markup=kb_size(lang))
-
-@dp.callback_query(F.data.startswith("size:"))
-async def size_select(call: CallbackQuery, state: FSMContext):
-    user = db.user_get(call.from_user.id)
-    lang = user["lang"] if user else "ru"
-    mode = call.data.split(":")[1]
-    if mode == "age":
-        await state.set_state(States.size_age)
-        await call.message.answer(TEXT[lang]["size_age"])
-    else:
-        await state.set_state(States.size_height)
-        await call.message.answer(TEXT[lang]["size_height"])
-    await call.answer()
-
-@dp.message(States.size_age)
-async def size_age_input(message: Message, state: FSMContext):
-    user = db.user_get(message.from_user.id)
-    lang = user["lang"] if user else "ru"
-    if not message.text or not message.text.isdigit():
-        await message.answer(TEXT[lang]["size_age"])
-        return
-    age = int(message.text)
-    if not (1 <= age <= 15):
-        await message.answer(TEXT[lang]["size_age"])
-        return
-    size = size_by_age(age)
-    await message.answer(TEXT[lang]["size_result"].format(size=size), reply_markup=kb_main(lang, is_admin(message.from_user.id)))
-    await state.clear()
-
-@dp.message(States.size_height)
-async def size_height_input(message: Message, state: FSMContext):
-    user = db.user_get(message.from_user.id)
-    lang = user["lang"] if user else "ru"
-    if not message.text or not message.text.isdigit():
-        await message.answer(TEXT[lang]["size_height"])
-        return
-    height = int(message.text)
-    if not (50 <= height <= 180):
-        await message.answer(TEXT[lang]["size_height"])
-        return
-    size = size_by_height(height)
-    await message.answer(TEXT[lang]["size_result"].format(size=size), reply_markup=kb_main(lang, is_admin(message.from_user.id)))
-    await state.clear()
-
-# FAQ
-@dp.message(F.text.in_(["❓ FAQ"]))
-async def cmd_faq(message: Message, state: FSMContext):
-    user = db.user_get(message.from_user.id)
-    lang = user["lang"] if user else "ru"
-    await message.answer(TEXT[lang]["faq"], reply_markup=kb_channel_and_menu(lang))
-    await message.answer(TEXT[lang]["menu"], reply_markup=kb_main(lang, is_admin(message.from_user.id)))
-
-# Delivery info
-@dp.message(F.text.in_(["🚚 Доставка", "🚚 Yetkazib berish"]))
-async def cmd_delivery(message: Message, state: FSMContext):
-    user = db.user_get(message.from_user.id)
-    lang = user["lang"] if user else "ru"
-    await message.answer(TEXT[lang]["delivery"], reply_markup=kb_delivery(lang))
-
-# Contact
-@dp.message(F.text.in_(["📞 Связаться", "📞 Aloqa"]))
-async def cmd_contact(message: Message, state: FSMContext):
-    user = db.user_get(message.from_user.id)
-    lang = user["lang"] if user else "ru"
-    text = TEXT[lang]["contact"].format(phone=PHONE, username=MANAGER_USERNAME or CHANNEL_USERNAME)
-    await message.answer(text, reply_markup=kb_main(lang, is_admin(message.from_user.id)))
-
-# Cart
-@dp.message(F.text.in_(["🛒 Корзина", "🛒 Savat"]))
-async def cmd_cart(message: Message, state: FSMContext):
-    user = db.user_get(message.from_user.id)
-    lang = user["lang"] if user else "ru"
-
-    items = db.cart_get(message.from_user.id)
-    if not items:
-        await message.answer(TEXT[lang]["cart_empty"], reply_markup=kb_main(lang, is_admin(message.from_user.id)))
-        return
-
-    items_text = "\n".join([f"• {esc(it['product_name'])} x{it['qty']}" for it in items])
-    text = TEXT[lang]["cart"].format(items=items_text)
-    await message.answer(text, reply_markup=kb_cart(items, lang))
-
-@dp.callback_query(F.data == "go_cart")
-async def go_cart(call: CallbackQuery, state: FSMContext):
-    user = db.user_get(call.from_user.id)
-    lang = user["lang"] if user else "ru"
-    items = db.cart_get(call.from_user.id)
-    if not items:
-        await call.message.answer(TEXT[lang]["cart_empty"], reply_markup=kb_main(lang, is_admin(call.from_user.id)))
-    else:
-        items_text = "\n".join([f"• {esc(it['product_name'])} x{it['qty']}" for it in items])
-        text = TEXT[lang]["cart"].format(items=items_text)
-        await call.message.answer(text, reply_markup=kb_cart(items, lang))
-    await call.answer()
-
-@dp.callback_query(F.data.startswith("cart_remove:"))
-async def cart_remove(call: CallbackQuery, state: FSMContext):
-    cart_id = int(call.data.split(":")[1])
-    db.cart_remove(cart_id)
-
-    user = db.user_get(call.from_user.id)
-    lang = user["lang"] if user else "ru"
-
-    items = db.cart_get(call.from_user.id)
-    if not items:
-        await call.message.edit_text(TEXT[lang]["cart_empty"])
-    else:
-        items_text = "\n".join([f"• {esc(it['product_name'])} x{it['qty']}" for it in items])
-        text = TEXT[lang]["cart"].format(items=items_text)
-        await call.message.edit_text(text, reply_markup=kb_cart(items, lang))
-
-    await call.answer("❌ Удалено" if lang == "ru" else "❌ O'chirildi")
-
-@dp.callback_query(F.data == "cart:clear")
-async def cart_clear(call: CallbackQuery, state: FSMContext):
-    db.cart_clear(call.from_user.id)
-    user = db.user_get(call.from_user.id)
-    lang = user["lang"] if user else "ru"
-    await call.message.edit_text(TEXT[lang]["cart_empty"])
-    await call.answer()
-
-@dp.callback_query(F.data == "cart:checkout")
-async def cart_checkout(call: CallbackQuery, state: FSMContext):
-    user = db.user_get(call.from_user.id)
-    lang = user["lang"] if user else "ru"
-
-    items = db.cart_get(call.from_user.id)
-    if not items:
-        await call.answer("Корзина пуста!" if lang == "ru" else "Savat bo'sh!")
-        return
-
-    await state.set_state(States.order_name)
-    await call.message.answer("Введите ваше имя:" if lang == "ru" else "Ismingizni kiriting:")
-    await call.answer()
-
-# Quick products select
-@dp.callback_query(F.data.startswith("prod:"))
-async def prod_select(call: CallbackQuery, state: FSMContext):
-    user = db.user_get(call.from_user.id)
-    lang = user["lang"] if user else "ru"
-    idx = int(call.data.split(":")[1])
-
-    items = PRODUCTS_RU if lang == "ru" else PRODUCTS_UZ
-    if 0 <= idx < len(items):
-        db.cart_add(call.from_user.id, items[idx], 1)
-
-        await call.message.answer(TEXT[lang]["cart_added"])
-        await call.message.answer(
-            ("🛒 Товар добавлен!\n\n"
-             "Если хотите — добавьте ещё товары.\n"
-             "Если достаточно — перейдите в корзину и оформите заказ 👇")
-            if lang == "ru" else
-            ("🛒 Mahsulot savatga qo‘shildi!\n\n"
-             "Xohlasangiz yana qo‘shing.\n"
-             "Yetarli bo‘lsa savatga o‘ting va buyurtmani rasmiylashtiring 👇"),
-            reply_markup=kb_after_add(lang)
-        )
-
-    await call.answer()
-
-@dp.callback_query(F.data == "prod_manual")
-async def prod_manual_start(call: CallbackQuery, state: FSMContext):
-    user = db.user_get(call.from_user.id)
-    lang = user["lang"] if user else "ru"
-    await state.set_state(States.prod_manual)
-    await call.message.answer(TEXT[lang]["order_manual"])
-    await call.answer()
-
-@dp.message(States.prod_manual)
-async def prod_manual_input(message: Message, state: FSMContext):
-    user = db.user_get(message.from_user.id)
-    lang = user["lang"] if user else "ru"
-    if not message.text or len(message.text.strip()) < 2:
-        await message.answer(TEXT[lang]["order_manual"])
-        return
-    db.cart_add(message.from_user.id, message.text.strip(), 1)
-    await message.answer(TEXT[lang]["cart_added"], reply_markup=kb_main(lang, is_admin(message.from_user.id)))
-    await state.clear()
-
-# Order flow entry
-@dp.message(F.text.in_(["✅ Заказ", "✅ Buyurtma"]))
-async def cmd_order(message: Message, state: FSMContext):
-    user = db.user_get(message.from_user.id)
-    lang = user["lang"] if user else "ru"
-    await state.clear()
-    await message.answer(TEXT[lang]["order_start"], reply_markup=kb_quick_products(lang))
-
-# Admin CRM quick find
-@dp.message(F.text.startswith("/find"))
-async def admin_find(message: Message):
-    if not is_admin(message.from_user.id):
-        return
-    parts = (message.text or "").split(maxsplit=1)
-    if len(parts) < 2 or len(parts[1].strip()) < 3:
-        await message.answer("Пример: /find 99877\nИщу по номеру телефона (часть номера).")
-        return
-    q = parts[1].strip()
-    rows = db.find_orders_by_phone(q, limit=20)
-    if not rows:
-        await message.answer(f"Ничего не найдено по: {esc(q)}")
-        return
-    lines = []
-    for o in rows[:10]:
-        lines.append(f"#{o['id']} • {o['created_at'][:16]} • {esc(o['name'])} • {esc(o['phone'])} • {esc(o['city'])} • {o['status']}")
-    await message.answer("🔎 Найдено:\n" + "\n".join(lines))
-
-# Order steps
-@dp.message(States.order_name)
-async def order_name(message: Message, state: FSMContext):
-    user = db.user_get(message.from_user.id)
-    lang = user["lang"] if user else "ru"
-    if not message.text or len(message.text.strip()) < 2:
-        await message.answer("Введите ваше имя:" if lang == "ru" else "Ismingizni kiriting:")
-        return
-    await state.update_data(name=message.text.strip())
-    await state.set_state(States.order_phone)
-    await message.answer(TEXT[lang]["order_phone"], reply_markup=kb_contact(lang))
-
-@dp.message(States.order_phone)
-async def order_phone(message: Message, state: FSMContext):
-    user = db.user_get(message.from_user.id)
-    lang = user["lang"] if user else "ru"
-    phone = message.contact.phone_number if message.contact else (message.text or "").strip()
-    if not phone:
-        await message.answer(TEXT[lang]["order_phone"], reply_markup=kb_contact(lang))
-        return
-    await state.update_data(phone=phone)
-    await state.set_state(States.order_city)
-    await message.answer(TEXT[lang]["order_city"], reply_markup=kb_main(lang, is_admin(message.from_user.id)))
-
-@dp.message(States.order_city)
-async def order_city(message: Message, state: FSMContext):
-    user = db.user_get(message.from_user.id)
-    lang = user["lang"] if user else "ru"
-    if not message.text or len(message.text.strip()) < 2:
-        await message.answer(TEXT[lang]["order_city"])
-        return
-    await state.update_data(city=message.text.strip())
-    await state.set_state(States.order_delivery)
-    await message.answer(TEXT[lang]["order_delivery"], reply_markup=kb_delivery(lang))
-
-@dp.message(States.order_delivery)
-async def order_delivery_text_guard(message: Message, state: FSMContext):
-    user = db.user_get(message.from_user.id)
-    lang = user["lang"] if user else "ru"
-    await message.answer(TEXT[lang]["order_delivery"], reply_markup=kb_delivery(lang))
-
-@dp.callback_query(F.data.startswith("delivery:"))
-async def order_delivery_callback(call: CallbackQuery, state: FSMContext):
-    delivery_type = call.data.split(":")[1]
-    user = db.user_get(call.from_user.id)
-    lang = user["lang"] if user else "ru"
-
-    delivery_names = {
-        "b2b": "B2B Почта" if lang == "ru" else "B2B Pochta",
-        "yandex_courier": "Яндекс Курьер" if lang == "ru" else "Yandex Kuryer",
-        "yandex_pvz": "Яндекс ПВЗ" if lang == "ru" else "Yandex PVZ"
-    }
-
-    await state.update_data(delivery=delivery_type, delivery_name=delivery_names.get(delivery_type, delivery_type))
-    await state.set_state(States.order_address)
-    await call.message.answer(TEXT[lang]["order_address"])
-    await call.answer()
-
-@dp.message(States.order_address)
-async def order_address(message: Message, state: FSMContext):
-    user = db.user_get(message.from_user.id)
-    lang = user["lang"] if user else "ru"
-    if not message.text or len(message.text.strip()) < 3:
-        await message.answer(TEXT[lang]["order_address"])
-        return
-
-    await state.update_data(address=message.text.strip())
-
-    data = await state.get_data()
-    items = db.cart_get(message.from_user.id)
-    if not items:
-        await state.clear()
-        await message.answer(TEXT[lang]["cart_empty"], reply_markup=kb_main(lang, is_admin(message.from_user.id)))
-        return
-
-    items_text = "\n".join([f"• {esc(it['product_name'])} x{it['qty']}" for it in items])
-
-    text = TEXT[lang]["order_confirm"].format(
-        name=esc(data["name"]),
-        phone=esc(data["phone"]),
-        city=esc(data["city"]),
-        delivery=esc(data.get("delivery_name", "—")),
-        address=esc(data["address"]),
-        items=items_text
-    )
-    await message.answer(text, reply_markup=kb_order_confirm(lang))
-
-@dp.callback_query(F.data == "order:confirm")
-async def order_confirm(call: CallbackQuery, state: FSMContext):
-    user_row = db.user_get(call.from_user.id)
-    lang = user_row["lang"] if user_row else "ru"
-    data = await state.get_data()
-
-    items = db.cart_get(call.from_user.id)
-    if not items:
-        await state.clear()
-        await call.message.answer(TEXT[lang]["cart_empty"], reply_markup=kb_main(lang, is_admin(call.from_user.id)))
-        await call.answer()
-        return
-
-    items_json = json.dumps([{"name": it["product_name"], "qty": it["qty"]} for it in items], ensure_ascii=False)
-
-    order_data = {
-        "user_id": call.from_user.id,
-        "username": call.from_user.username or "",
-        "name": data.get("name", "—"),
-        "phone": data.get("phone", "—"),
-        "city": data.get("city", "—"),
-        "items": items_json,
-        "total_amount": 0,
-        "delivery_type": data.get("delivery", ""),
-        "delivery_address": data.get("address", ""),
-        "comment": "—",
-    }
-
-    order_id = db.order_create(order_data)
-
-    # notify admins
-    for admin_id in ADMIN_IDS:
-        try:
-            await bot.send_message(
-                admin_id,
-                f"🆕 Новый заказ #{order_id}\n\n"
-                f"👤 {esc(order_data['name'])}\n"
-                f"📱 {esc(order_data['phone'])}\n"
-                f"🏙 {esc(order_data['city'])}\n"
-                f"🚚 {esc(data.get('delivery_name','—'))}\n"
-                f"📍 {esc(order_data['delivery_address'])}\n"
-                f"🛒 {', '.join([esc(it['product_name']) for it in items])}\n"
-                f"💬 Цена: по договоренности",
-                reply_markup=kb_admin_order(order_id, order_data["user_id"], "ru")
-            )
-        except Exception as e:
-            print(f"Failed to notify admin {admin_id}: {e}")
-
-    # notify channel (optional)
-    if CHANNEL_ID:
-        try:
-            await bot.send_message(
-                CHANNEL_ID,
-                f"🆕 Новый заказ #{order_id}\n"
-                f"👤 {esc(order_data['name'])}\n"
-                f"📱 {esc(order_data['phone'])}\n"
-                f"🏙 {esc(order_data['city'])}\n"
-                f"🛒 {', '.join([esc(it['product_name']) for it in items])}\n"
-                f"💬 Цена: по договоренности"
-            )
-        except Exception as e:
-            print(f"Failed to send to channel {CHANNEL_ID}: {e}")
-
-    db.cart_clear(call.from_user.id)
-    await state.clear()
-
-    await call.message.answer(
-        TEXT[lang]["order_success"].format(order_id=order_id),
-        reply_markup=kb_main(lang, is_admin(call.from_user.id))
-    )
-
-    # ✅ Thank you + follow buttons (NEW ORDER)
-    await call.message.answer(TEXT[lang]["thanks_new"], reply_markup=kb_follow_links(lang))
-
-    await call.answer()
-
-@dp.callback_query(F.data == "order:cancel")
-async def order_cancel(call: CallbackQuery, state: FSMContext):
-    await state.clear()
-    user = db.user_get(call.from_user.id)
-    lang = user["lang"] if user else "ru"
-    await call.message.answer(TEXT[lang]["cancelled"], reply_markup=kb_main(lang, is_admin(call.from_user.id)))
-    await call.answer()
-
-# History
-@dp.message(F.text.in_(["📜 История", "📜 Buyurtmalar"]))
-async def cmd_history(message: Message, state: FSMContext):
-    user = db.user_get(message.from_user.id)
-    lang = user["lang"] if user else "ru"
-    orders = db.orders_get_user(message.from_user.id)
-    if not orders:
-        await message.answer(TEXT[lang]["history_empty"], reply_markup=kb_main(lang, is_admin(message.from_user.id)))
-        return
-    lines = []
-    for o in orders[:5]:
-        status_icon = {"new": "🆕", "processing": "⚙️", "shipped": "🚚", "delivered": "✅", "cancelled": "❌"}.get(o["status"], "❓")
-        lines.append(f"{status_icon} #{o['id']} • {o['created_at'][:10]}")
-    await message.answer(TEXT[lang]["history"].format(orders="\n".join(lines)),
-                         reply_markup=kb_main(lang, is_admin(message.from_user.id)))
-
-# Admin panel (telegram)
-@dp.message(F.text.in_(["🛠 Админ", "🛠 Admin"]))
-async def cmd_admin(message: Message, state: FSMContext):
-    if not is_admin(message.from_user.id):
-        return
-    user = db.user_get(message.from_user.id)
-    lang = user["lang"] if user else "ru"
-    await message.answer(TEXT[lang]["admin_menu"], reply_markup=kb_admin(lang))
-
-@dp.callback_query(F.data.startswith("admin:"))
-async def admin_action(call: CallbackQuery, state: FSMContext):
-    if not is_admin(call.from_user.id):
-        await call.answer("Access denied")
-        return
-
-    action = call.data.split(":")[1]
-    user = db.user_get(call.from_user.id)
-    lang = user["lang"] if user else "ru"
-
-    if action == "stats":
-        stats = db.get_stats_all()
-        await call.message.answer(TEXT[lang]["admin_stats"].format(**stats), reply_markup=kb_admin(lang))
-
-    elif action == "new":
-        orders = db.orders_get_by_status("new")
-        if not orders:
-            await call.message.answer("Нет новых заказов" if lang == "ru" else "Yangi buyurtmalar yo'q")
-        else:
-            for order in orders[:5]:
-                items = json.loads(order["items"]) if order.get("items") else []
-                items_text = ", ".join([f"{it.get('name','')} x{it.get('qty',1)}" for it in items[:3]])
-                text = (
-                    f"🆕 Заказ #{order['id']}\n"
-                    f"👤 {esc(order['name'])}\n"
-                    f"📱 {esc(order['phone'])}\n"
-                    f"🏙 {esc(order['city'])}\n"
-                    f"🛒 {esc(items_text)}\n"
-                    f"💬 Цена: по договоренности"
-                )
-                await call.message.answer(text, reply_markup=kb_admin_order(order["id"], order["user_id"], lang))
-
-    elif action == "processing":
-        orders = db.orders_get_by_status("processing")
-        await call.message.answer(
-            (f"В обработке: {len(orders)} заказов") if lang == "ru" else (f"Ishlanmoqda: {len(orders)} ta")
-        )
-
-    elif action == "export":
-        await generate_monthly_report(call.message, lang)
-
-    elif action == "posts":
-        await state.set_state(States.admin_post_dow)
-        await call.message.answer("Выберите день публикации (Пн–Сб):" if lang == "ru" else "Kun tanlang (Du–Sha):",
-                                  reply_markup=kb_dow(lang))
-
-    await call.answer()
-
-# Admin weekly posts
-@dp.callback_query(F.data.startswith("dow:"))
-async def admin_choose_dow(call: CallbackQuery, state: FSMContext):
-    if not is_admin(call.from_user.id):
-        return
-    user = db.user_get(call.from_user.id)
-    lang = user["lang"] if user else "ru"
-    dow = int(call.data.split(":")[1])
-    await state.update_data(post_dow=dow)
-    await state.set_state(States.admin_post_media)
-    await call.message.answer(
-        "Теперь отправьте ОДНО сообщение: фото/видео + описание (caption)."
-        if lang == "ru" else
-        "Endi BITTA xabar yuboring: foto/video + matn (caption)."
-    )
-    await call.answer()
-
-@dp.message(States.admin_post_media)
-async def admin_receive_week_post(message: Message, state: FSMContext):
-    if not is_admin(message.from_user.id):
-        return
-    user = db.user_get(message.from_user.id)
-    lang = user["lang"] if user else "ru"
-
-    data = await state.get_data()
-    dow = int(data.get("post_dow", 0))
-    if dow not in (1, 2, 3, 4, 5, 6):
-        await state.clear()
-        await message.answer("Сначала выберите день." if lang == "ru" else "Avval kunni tanlang.")
-        return
-
-    caption = (message.caption or message.text or "").strip()
-    if not caption:
-        await message.answer("⚠️ Добавьте описание (текст) к фото/видео." if lang == "ru" else "⚠️ Matn (izoh) qo'shing.")
-        return
-
-    media_type = "none"
-    file_id = ""
-    if message.photo:
-        media_type = "photo"
-        file_id = message.photo[-1].file_id
-    elif message.video:
-        media_type = "video"
-        file_id = message.video.file_id
-
-    week_key = db.week_key_now(now_tz())
-    db.sched_add(dow=dow, media_type=media_type, file_id=file_id, caption=caption, week_key=week_key)
-    cnt = db.sched_count_week(week_key)
 
     await message.answer(
-        (f"✅ Добавлено в план недели: <b>{week_key}</b>\n"
-         f"📌 День: {dow} (1=Пн ... 6=Сб)\n"
-         f"🧾 Постов в этой неделе: <b>{cnt}</b>\n\n"
-         "Чтобы добавить ещё — 🛠 Админ → 📰 Посты недели.")
-        if lang == "ru" else
-        (f"✅ Haftalik reja: <b>{week_key}</b>\n"
-         f"📌 Kun: {dow} (1=Du ... 6=Sha)\n"
-         f"🧾 Postlar soni: <b>{cnt}</b>\n\n"
-         "Yana qo‘shish: 🛠 Admin → 📰 Haftalik postlar.")
+        t(lang, "welcome"),
+        reply_markup=main_menu(lang, user_id),
     )
+
+
+@dp.message(F.text.in_(["🌐 Язык", "🌐 Til"]))
+async def choose_language(message: Message):
+    lang = await ensure_user_record(message)
+    text = "Выберите язык:" if lang == "ru" else "Tilni tanlang:"
+    await message.answer(text, reply_markup=language_keyboard())
+
+
+@dp.callback_query(F.data.in_(["lang_ru", "lang_uz"]))
+async def set_language(cb: CallbackQuery):
+    lang = "uz" if cb.data == "lang_uz" else "ru"
+
+    db.user_upsert(
+        user_id=cb.from_user.id,
+        username=cb.from_user.username or "",
+        full_name=f"{cb.from_user.first_name or ''} {cb.from_user.last_name or ''}".strip(),
+        lang=lang,
+    )
+    db.user_set_lang(cb.from_user.id, lang)
+
+    text = "✅ Язык изменён." if lang == "ru" else "✅ Til o‘zgartirildi."
+    await cb.message.edit_text(text)
+    await cb.message.answer(
+        t(lang, "welcome"),
+        reply_markup=main_menu(lang, cb.from_user.id),
+    )
+    await cb.answer()
+
+
+# =========================================================
+# MAIN MENU
+# =========================================================
+@dp.message(F.text.in_(["🛍 Магазин", "🛍 Do'kon"]))
+async def open_shop(message: Message):
+    lang = await ensure_user_record(message)
+    await message.answer(
+        t(lang, "shop_open"),
+        reply_markup=shop_keyboard(lang),
+    )
+
+
+@dp.message(F.text.in_(["📞 Контакты", "📞 Aloqa"]))
+async def show_contacts(message: Message):
+    lang = await ensure_user_record(message)
+    await message.answer(t(lang, "contacts"))
+
+
+@dp.message(F.text.in_(["📦 Мои заказы", "📦 Buyurtmalarim"]))
+async def show_my_orders(message: Message):
+    lang = await ensure_user_record(message)
+    orders = db.orders_get_user(message.from_user.id, limit=10)
+    await message.answer(format_my_orders_text(orders, lang))
+
+
+@dp.message(F.text.in_(["📏 Подбор размера", "📏 Razmer tanlash"]))
+async def size_picker_start(message: Message, state: FSMContext):
+    lang = await ensure_user_record(message)
+    await state.set_state(SizeStates.waiting_input)
+    await message.answer(t(lang, "size_help"))
+
+
+@dp.message(SizeStates.waiting_input)
+async def size_picker_process(message: Message, state: FSMContext):
+    lang = await ensure_user_record(message)
+    text = (message.text or "").strip()
+
+    if not text.isdigit():
+        if lang == "uz":
+            await message.answer("Iltimos, faqat raqam yuboring. Masalan: 6 yoki 128")
+        else:
+            await message.answer("Пожалуйста, отправьте только число. Например: 6 или 128")
+        return
+
+    value = int(text)
+
+    if 1 <= value <= 15:
+        size = size_by_age(value)
+        if lang == "uz":
+            reply = f"✅ Tavsiya etilgan razmer: <b>{size}</b>\n(Yosh bo‘yicha: {value})"
+        else:
+            reply = f"✅ Рекомендуемый размер: <b>{size}</b>\n(По возрасту: {value})"
+    elif 80 <= value <= 170:
+        size = size_by_height(value)
+        if lang == "uz":
+            reply = f"✅ Tavsiya etilgan razmer: <b>{size}</b>\n(Bo‘y bo‘yicha: {value} sm)"
+        else:
+            reply = f"✅ Рекомендуемый размер: <b>{size}</b>\n(По росту: {value} см)"
+    else:
+        if lang == "uz":
+            reply = "Mos qiymat kiriting: yosh uchun 1–15, bo‘y uchun 80–170."
+        else:
+            reply = "Введите подходящее значение: возраст 1–15, рост 80–170."
+        await message.answer(reply)
+        return
+
+    await message.answer(reply, reply_markup=main_menu(lang, message.from_user.id))
     await state.clear()
 
-# Status buttons (admin -> customer notify)
-@dp.callback_query(F.data.startswith("order_seen:"))
-async def order_seen(call: CallbackQuery, state: FSMContext):
-    if not is_admin(call.from_user.id):
-        return
-    order_id = int(call.data.split(":")[1])
-    db.order_mark_seen(order_id, call.from_user.id)
-    await call.answer("✅ Просмотрено")
 
-@dp.callback_query(F.data.startswith("order_process:"))
-async def order_process(call: CallbackQuery, state: FSMContext):
-    if not is_admin(call.from_user.id):
+# =========================================================
+# CART
+# =========================================================
+@dp.message(F.text.in_(["🛒 Корзина", "🛒 Savatcha"]))
+async def open_cart(message: Message):
+    lang = await ensure_user_record(message)
+    cart = db.cart_get(message.from_user.id)
+
+    if not cart:
+        await message.answer(t(lang, "cart_empty"))
         return
-    order_id = int(call.data.split(":")[1])
-    db.order_update_status(order_id, "processing", call.from_user.id)
+
+    await message.answer(
+        format_cart_text(cart, lang),
+        reply_markup=cart_keyboard(lang),
+    )
+
+
+@dp.callback_query(F.data == "cart_clear")
+async def cart_clear_handler(cb: CallbackQuery):
+    lang = get_user_lang(cb.from_user.id)
+    db.cart_clear(cb.from_user.id)
+
+    if lang == "uz":
+        await cb.message.edit_text("🗑 Savatcha tozalandi.")
+    else:
+        await cb.message.edit_text("🗑 Корзина очищена.")
+    await cb.answer()
+
+
+# =========================================================
+# CHECKOUT FSM
+# =========================================================
+@dp.callback_query(F.data == "checkout_start")
+async def checkout_start(cb: CallbackQuery, state: FSMContext):
+    lang = get_user_lang(cb.from_user.id)
+    cart = db.cart_get(cb.from_user.id)
+
+    if not cart:
+        await cb.answer("Корзина пустая" if lang == "ru" else "Savatcha bo‘sh", show_alert=True)
+        return
+
+    await state.clear()
+    await state.update_data(user_id=cb.from_user.id, lang=lang)
+
+    await cb.message.answer(t(lang, "checkout_start_name"))
+    await state.set_state(OrderStates.waiting_name)
+    await cb.answer()
+
+
+@dp.message(OrderStates.waiting_name)
+async def checkout_name(message: Message, state: FSMContext):
+    lang = await ensure_user_record(message)
+    name = (message.text or "").strip()
+
+    if len(name) < 2:
+        if lang == "uz":
+            await message.answer("Iltimos, ismingizni to‘liqroq kiriting.")
+        else:
+            await message.answer("Пожалуйста, введите имя корректно.")
+        return
+
+    await state.update_data(customer_name=name)
+    await message.answer(t(lang, "checkout_phone"))
+    await state.set_state(OrderStates.waiting_phone)
+
+
+@dp.message(OrderStates.waiting_phone)
+async def checkout_phone(message: Message, state: FSMContext):
+    lang = await ensure_user_record(message)
+    phone = normalize_phone((message.text or "").strip())
+
+    if not phone_is_valid(phone):
+        if lang == "uz":
+            await message.answer("Telefon raqamini to‘g‘ri kiriting. Masalan: +998901234567")
+        else:
+            await message.answer("Введите телефон корректно. Например: +998901234567")
+        return
+
+    await state.update_data(customer_phone=phone)
+    await message.answer(
+        t(lang, "checkout_delivery"),
+        reply_markup=delivery_keyboard(lang),
+    )
+    await state.set_state(OrderStates.waiting_delivery)
+
+
+@dp.callback_query(OrderStates.waiting_delivery, F.data.startswith("delivery:"))
+async def checkout_delivery(cb: CallbackQuery, state: FSMContext):
+    lang = get_user_lang(cb.from_user.id)
+    delivery_type = cb.data.split(":", 1)[1]
+
+    if delivery_type not in DELIVERY_TYPES:
+        await cb.answer("Ошибка")
+        return
+
+    await state.update_data(delivery_type=delivery_type, delivery_service=delivery_type)
+
+    if delivery_type == "yandex_pvz":
+        await cb.message.answer(t(lang, "checkout_city"))
+        await state.set_state(OrderStates.waiting_city)
+    else:
+        await cb.message.answer(
+            t(lang, "checkout_address_type"),
+            reply_markup=address_type_keyboard(lang),
+        )
+        await state.set_state(OrderStates.waiting_address_type)
+
+    await cb.answer()
+
+
+@dp.callback_query(OrderStates.waiting_address_type, F.data.startswith("addrtype:"))
+async def checkout_address_type(cb: CallbackQuery, state: FSMContext):
+    lang = get_user_lang(cb.from_user.id)
+    address_type = cb.data.split(":", 1)[1]
+
+    await state.update_data(address_type=address_type)
+
+    if address_type == "manual":
+        await cb.message.answer(t(lang, "checkout_city"))
+        await state.set_state(OrderStates.waiting_city)
+    elif address_type == "location":
+        await cb.message.answer(
+            t(lang, "checkout_location_wait"),
+            reply_markup=location_request_keyboard(lang),
+        )
+        await state.set_state(OrderStates.waiting_location)
+    else:
+        await cb.answer("Ошибка")
+        return
+
+    await cb.answer()
+
+
+@dp.message(OrderStates.waiting_location, F.location)
+async def checkout_location_received(message: Message, state: FSMContext):
+    lang = await ensure_user_record(message)
+
+    latitude = message.location.latitude
+    longitude = message.location.longitude
+
+    await state.update_data(latitude=latitude, longitude=longitude)
+    await message.answer(
+        t(lang, "checkout_city"),
+        reply_markup=ReplyKeyboardRemove(),
+    )
+    await state.set_state(OrderStates.waiting_city)
+
+
+@dp.message(OrderStates.waiting_location)
+async def checkout_location_text_fallback(message: Message, state: FSMContext):
+    lang = await ensure_user_record(message)
+
+    cancel_texts = ["⬅️ Отмена", "⬅️ Bekor qilish"]
+    if (message.text or "").strip() in cancel_texts:
+        await state.clear()
+        if lang == "uz":
+            await message.answer("Bekor qilindi.", reply_markup=main_menu(lang, message.from_user.id))
+        else:
+            await message.answer("Отменено.", reply_markup=main_menu(lang, message.from_user.id))
+        return
+
+    if lang == "uz":
+        await message.answer("Iltimos, lokatsiyani tugma orqali yuboring.")
+    else:
+        await message.answer("Пожалуйста, отправьте геолокацию кнопкой.")
+
+
+@dp.message(OrderStates.waiting_city)
+async def checkout_city(message: Message, state: FSMContext):
+    lang = await ensure_user_record(message)
+    city = (message.text or "").strip()
+
+    if len(city) < 2:
+        if lang == "uz":
+            await message.answer("Shahar nomini kiriting.")
+        else:
+            await message.answer("Введите город.")
+        return
+
+    await state.update_data(city=city)
+    data = await state.get_data()
+    delivery_type = data.get("delivery_type")
+
+    if delivery_type == "yandex_pvz":
+        await message.answer(t(lang, "checkout_pvz"))
+        await state.set_state(OrderStates.waiting_pvz)
+        return
+
+    address_type = data.get("address_type")
+    if address_type == "manual":
+        await message.answer(t(lang, "checkout_address_manual"))
+        await state.set_state(OrderStates.waiting_manual_address)
+    elif address_type == "location":
+        await state.update_data(delivery_address="Локация отправлена" if lang == "ru" else "Lokatsiya yuborildi")
+        await message.answer(t(lang, "checkout_payment"), reply_markup=payment_keyboard(lang))
+        await state.set_state(OrderStates.waiting_payment)
+    else:
+        await message.answer(t(lang, "checkout_address_type"), reply_markup=address_type_keyboard(lang))
+        await state.set_state(OrderStates.waiting_address_type)
+
+
+@dp.message(OrderStates.waiting_manual_address)
+async def checkout_manual_address(message: Message, state: FSMContext):
+    lang = await ensure_user_record(message)
+    address = (message.text or "").strip()
+
+    if len(address) < 4:
+        if lang == "uz":
+            await message.answer("Manzilni to‘liqroq kiriting.")
+        else:
+            await message.answer("Введите адрес подробнее.")
+        return
+
+    await state.update_data(delivery_address=address)
+    await message.answer(t(lang, "checkout_payment"), reply_markup=payment_keyboard(lang))
+    await state.set_state(OrderStates.waiting_payment)
+
+
+@dp.message(OrderStates.waiting_pvz)
+async def checkout_pvz(message: Message, state: FSMContext):
+    lang = await ensure_user_record(message)
+    pvz = (message.text or "").strip()
+
+    if len(pvz) < 2:
+        if lang == "uz":
+            await message.answer("PVZ manzili yoki kodini kiriting.")
+        else:
+            await message.answer("Введите адрес или код ПВЗ.")
+        return
+
+    await state.update_data(
+        pvz_code=pvz,
+        pvz_address=pvz,
+        delivery_address=pvz,
+    )
+    await message.answer(t(lang, "checkout_payment"), reply_markup=payment_keyboard(lang))
+    await state.set_state(OrderStates.waiting_payment)
+
+
+@dp.callback_query(OrderStates.waiting_payment, F.data.startswith("pay:"))
+async def checkout_payment(cb: CallbackQuery, state: FSMContext):
+    lang = get_user_lang(cb.from_user.id)
+    payment_method = cb.data.split(":", 1)[1]
+
+    if payment_method not in PAYMENT_METHODS:
+        await cb.answer("Ошибка")
+        return
+
+    await state.update_data(payment_method=payment_method, payment_status="pending")
+    await cb.message.answer(t(lang, "checkout_comment"))
+    await state.set_state(OrderStates.waiting_comment)
+    await cb.answer()
+
+
+@dp.message(OrderStates.waiting_comment)
+async def checkout_comment(message: Message, state: FSMContext):
+    lang = await ensure_user_record(message)
+    comment = (message.text or "").strip()
+    if comment == "-":
+        comment = ""
+
+    await state.update_data(comment=comment)
+
+    data = await state.get_data()
+    cart = db.cart_get(message.from_user.id)
+    if not cart:
+        if lang == "uz":
+            await message.answer("Savatcha bo‘sh.")
+        else:
+            await message.answer("Корзина пустая.")
+        await state.clear()
+        return
+
+    preview = build_checkout_preview(data, cart, lang)
+    await message.answer(
+        preview,
+        reply_markup=confirm_order_keyboard(lang),
+    )
+    await state.set_state(OrderStates.waiting_confirm)
+
+
+@dp.callback_query(OrderStates.waiting_confirm, F.data == "confirm_order_no")
+async def checkout_cancel(cb: CallbackQuery, state: FSMContext):
+    lang = get_user_lang(cb.from_user.id)
+    await state.clear()
+
+    if lang == "uz":
+        await cb.message.edit_text("❌ Buyurtma bekor qilindi.")
+    else:
+        await cb.message.edit_text("❌ Заказ отменён.")
+
+    await cb.message.answer(
+        t(lang, "welcome"),
+        reply_markup=main_menu(lang, cb.from_user.id),
+    )
+    await cb.answer()
+
+
+@dp.callback_query(OrderStates.waiting_confirm, F.data == "confirm_order_yes")
+async def checkout_confirm(cb: CallbackQuery, state: FSMContext):
+    data = await state.get_data()
+    lang = data.get("lang") or get_user_lang(cb.from_user.id)
+
+    cart = db.cart_get(cb.from_user.id)
+    if not cart:
+        await state.clear()
+        await cb.answer("Корзина пуста" if lang == "ru" else "Savatcha bo‘sh", show_alert=True)
+        return
+
+    items = cart_to_order_items(cart)
+    totals = db.cart_totals(cb.from_user.id)
+
+    order_id = db.order_create({
+        "user_id": cb.from_user.id,
+        "username": cb.from_user.username or "",
+        "customer_name": data.get("customer_name", ""),
+        "customer_phone": data.get("customer_phone", ""),
+        "city": data.get("city", ""),
+        "items": items,
+        "total_qty": totals["total_qty"],
+        "total_amount": totals["total_amount"],
+        "delivery_service": data.get("delivery_type", ""),
+        "delivery_type": data.get("delivery_type", ""),
+        "delivery_address": data.get("delivery_address", ""),
+        "latitude": data.get("latitude"),
+        "longitude": data.get("longitude"),
+        "pvz_code": data.get("pvz_code", ""),
+        "pvz_address": data.get("pvz_address", ""),
+        "payment_method": data.get("payment_method", ""),
+        "payment_status": "pending",
+        "comment": data.get("comment", ""),
+        "status": "new",
+        "source": "bot",
+    })
+
     order = db.order_get(order_id)
+    db.cart_clear(cb.from_user.id)
+
+    if lang == "uz":
+        text = (
+            f"✅ Buyurtmangiz №<b>{order_id}</b> qabul qilindi.\n\n"
+            + t(lang, "thanks_order")
+        )
+    else:
+        text = (
+            f"✅ Ваш заказ №<b>{order_id}</b> принят.\n\n"
+            + t(lang, "thanks_order")
+        )
+
+    await cb.message.edit_text(text)
+    await cb.message.answer(
+        t(lang, "welcome"),
+        reply_markup=main_menu(lang, cb.from_user.id),
+    )
+
+    await send_order_to_admins(order_id)
+
     if order:
-        user_row = db.user_get(order["user_id"])
-        lang = user_row["lang"] if user_row else "ru"
-        try:
-            await bot.send_message(
-                order["user_id"],
-                (f"⚙️ Заказ #{order_id} в обработке!\nМенеджер скоро свяжется.")
-                if lang == "ru" else
-                (f"⚙️ Buyurtma #{order_id} ishlanmoqda!\nMenejer tez orada bog'lanadi."),
-                reply_markup=kb_main(lang, is_admin(order["user_id"]))
-            )
-        except Exception as e:
-            print(f"Failed to notify user processing: {e}")
-    await call.answer("✅ В работе!")
+        await send_payment_stub(order, lang)
 
-@dp.callback_query(F.data.startswith("order_ship:"))
-async def order_ship(call: CallbackQuery, state: FSMContext):
-    if not is_admin(call.from_user.id):
-        return
-    order_id = int(call.data.split(":")[1])
-    db.order_update_status(order_id, "shipped", call.from_user.id)
-    order = db.order_get(order_id)
-    if order:
-        user_row = db.user_get(order["user_id"])
-        lang = user_row["lang"] if user_row else "ru"
-        try:
-            await bot.send_message(
-                order["user_id"],
-                (f"🚚 Заказ #{order_id} отправлен и уже в пути!\nМы сообщим, когда он будет доставлен.\n⏰ 09:00-21:00")
-                if lang == "ru" else
-                (f"🚚 Buyurtma #{order_id} jo'natildi va yo'lda!\nYetkazilganda xabar beramiz.\n⏰ 09:00-21:00"),
-                reply_markup=kb_main(lang, is_admin(order["user_id"]))
-            )
-        except Exception as e:
-            print(f"Failed to notify user shipped: {e}")
-    await call.answer("✅ Отправлен!")
-
-@dp.callback_query(F.data.startswith("order_deliver:"))
-async def order_deliver(call: CallbackQuery, state: FSMContext):
-    if not is_admin(call.from_user.id):
-        return
-    order_id = int(call.data.split(":")[1])
-    db.order_update_status(order_id, "delivered", call.from_user.id)
-    order = db.order_get(order_id)
-    if order:
-        user_row = db.user_get(order["user_id"])
-        lang = user_row["lang"] if user_row else "ru"
-        try:
-            await bot.send_message(
-                order["user_id"],
-                (f"✅ Заказ #{order_id} доставлен!\nСпасибо, что выбрали ZARY & CO 🤍")
-                if lang == "ru" else
-                (f"✅ Buyurtma #{order_id} yetkazildi!\nZARY & CO ni tanlaganingiz uchun rahmat 🤍"),
-                reply_markup=kb_main(lang, is_admin(order["user_id"]))
-            )
-            # ✅ delivered-thanks
-            await bot.send_message(order["user_id"], TEXT[lang]["thanks_delivered"], reply_markup=kb_follow_links(lang))
-        except Exception as e:
-            print(f"Failed to notify user delivered: {e}")
-    await call.answer("✅ Доставлен!")
-
-@dp.callback_query(F.data.startswith("order_cancel:"))
-async def order_cancel_admin(call: CallbackQuery, state: FSMContext):
-    if not is_admin(call.from_user.id):
-        return
-    order_id = int(call.data.split(":")[1])
-    db.order_update_status(order_id, "cancelled", call.from_user.id)
-    order = db.order_get(order_id)
-    if order:
-        user_row = db.user_get(order["user_id"])
-        lang = user_row["lang"] if user_row else "ru"
-        try:
-            await bot.send_message(
-                order["user_id"],
-                (f"❌ Заказ #{order_id} отменён.\nЕсли это ошибка — напишите менеджеру.")
-                if lang == "ru" else
-                (f"❌ Buyurtma #{order_id} bekor qilindi.\nAgar xato bo‘lsa — menejerga yozing."),
-                reply_markup=kb_main(lang, is_admin(order["user_id"]))
-            )
-        except Exception as e:
-            print(f"Failed to notify user cancelled: {e}")
-    await call.answer("❌ Отменен!")
+    await state.clear()
+    await cb.answer()
 
 
-# =========================
-# REPORTS
-# =========================
-async def generate_monthly_report(message: Message, lang: str):
-    now = now_tz()
-    year, month = now.year, now.month
+# =========================================================
+# FALLBACK HELPERS
+# =========================================================
+@dp.message(F.text.in_(["/menu", "меню", "menu"]))
+async def menu_command(message: Message, state: FSMContext):
+    lang = await ensure_user_record(message)
+    await state.clear()
+    await message.answer(
+        t(lang, "welcome"),
+        reply_markup=main_menu(lang, message.from_user.id),
+    )
 
-    if db.report_is_sent(year, month):
-        await message.answer("Отчет за этот месяц уже отправлен!" if lang == "ru" else "Bu oy hisobot yuborilgan!")
+
+@dp.message(Command("cancel"))
+async def universal_cancel(message: Message, state: FSMContext):
+    lang = await ensure_user_record(message)
+    await state.clear()
+
+    if lang == "uz":
+        await message.answer("Bekor qilindi.", reply_markup=main_menu(lang, message.from_user.id))
+    else:
+        await message.answer("Отменено.", reply_markup=main_menu(lang, message.from_user.id))
+
+
+# =========================================================
+# PART 2/4 END
+# =========================================================
+
+# =========================================================
+# PART 3/4
+# ADMIN PANEL
+# PRODUCT MANAGEMENT
+# ORDER MANAGEMENT
+# =========================================================
+
+# ================================
+# ADMIN PANEL
+# ================================
+
+@dp.message(F.text.in_(["🛠 Админ","🛠 Admin"]))
+async def admin_panel(message: Message):
+    
+    if message.from_user.id not in ADMIN_IDS:
         return
 
-    orders = db.orders_get_monthly(year, month)
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="📦 Заказы", callback_data="admin_orders")],
+        [InlineKeyboardButton(text="🛍 Товары", callback_data="admin_products")],
+        [InlineKeyboardButton(text="📊 Статистика", callback_data="admin_stats")]
+    ])
+
+    await message.answer("🛠 Админ панель", reply_markup=kb)
+
+
+# ================================
+# ADMIN ORDERS
+# ================================
+
+@dp.callback_query(F.data=="admin_orders")
+async def admin_orders(cb: CallbackQuery):
+
+    if cb.from_user.id not in ADMIN_IDS:
+        return
+
+    orders = db.orders_recent()
+
     if not orders:
-        await message.answer("Нет заказов за этот месяц" if lang == "ru" else "Bu oy buyurtmalar yo'q")
+        await cb.message.answer("Нет заказов")
         return
 
-    Path("reports").mkdir(exist_ok=True)
-    filename = f"reports/report_{year}_{month:02d}.xlsx"
-    total_amount = build_excel_report(filename, orders)
+    for o in orders:
 
-    for admin_id in ADMIN_IDS:
-        try:
-            await bot.send_message(admin_id, f"📊 Отчет {month:02d}.{year}\n📦 Заказов: {len(orders)}\n💰 Сумма: {total_amount}")
-            await bot.send_document(admin_id, FSInputFile(filename))
-        except Exception as e:
-            print(f"Failed to send report to {admin_id}: {e}")
+        text = build_admin_order_text(o)
 
-    db.report_mark_sent(year, month, filename, len(orders), total_amount)
-    await message.answer("✅ Отчет отправлен!" if lang == "ru" else "✅ Hisobot yuborildi!")
+        kb = order_admin_keyboard(o["id"], o["user_id"])
 
-def build_excel_report(filename: str, orders: List[Dict]) -> int:
-    wb = Workbook()
-    ws = wb.active
-    ws.title = "Report"
-    headers = ["ID", "Дата", "Клиент", "Телефон", "Город", "Товары", "Сумма", "Статус"]
-    ws.append(headers)
+        await cb.message.answer(text, reply_markup=kb)
 
-    for cell in ws[1]:
-        cell.font = Font(bold=True, color="FFFFFF")
-        cell.fill = PatternFill(start_color="366092", end_color="366092", fill_type="solid")
+    await cb.answer()
 
-    total_amount = 0
+
+# ================================
+# ORDER STATUS CHANGE
+# ================================
+
+@dp.callback_query(F.data.startswith("order_status:"))
+async def order_status_update(cb: CallbackQuery):
+
+    if cb.from_user.id not in ADMIN_IDS:
+        return
+
+    _,order_id,status = cb.data.split(":")
+
+    db.order_update_status(int(order_id),status)
+
+    await cb.answer("Статус обновлен")
+
+
+# ================================
+# PRODUCT MENU
+# ================================
+
+@dp.callback_query(F.data=="admin_products")
+async def admin_products(cb: CallbackQuery):
+
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="➕ Добавить товар", callback_data="add_product")],
+        [InlineKeyboardButton(text="📋 Список товаров", callback_data="list_products")]
+    ])
+
+    await cb.message.answer("🛍 Управление товарами",reply_markup=kb)
+
+    await cb.answer()
+
+
+# ================================
+# ADD PRODUCT
+# ================================
+
+@dp.callback_query(F.data=="add_product")
+async def add_product_start(cb: CallbackQuery,state:FSMContext):
+
+    await state.set_state(AdminProductStates.wait_photo)
+
+    await cb.message.answer("Отправьте фото товара")
+
+    await cb.answer()
+
+
+@dp.message(AdminProductStates.wait_photo, F.photo)
+async def add_product_photo(message:Message,state:FSMContext):
+
+    photo = message.photo[-1].file_id
+
+    await state.update_data(photo=photo)
+
+    await message.answer("Введите название RU")
+
+    await state.set_state(AdminProductStates.wait_title_ru)
+
+
+@dp.message(AdminProductStates.wait_title_ru)
+async def add_product_title_ru(message:Message,state:FSMContext):
+
+    await state.update_data(title_ru=message.text)
+
+    await message.answer("Введите название UZ")
+
+    await state.set_state(AdminProductStates.wait_title_uz)
+
+
+@dp.message(AdminProductStates.wait_title_uz)
+async def add_product_title_uz(message:Message,state:FSMContext):
+
+    await state.update_data(title_uz=message.text)
+
+    await message.answer("Введите цену")
+
+    await state.set_state(AdminProductStates.wait_price)
+
+
+@dp.message(AdminProductStates.wait_price)
+async def add_product_price(message:Message,state:FSMContext):
+
+    price=int(message.text)
+
+    await state.update_data(price=price)
+
+    await message.answer("Введите описание")
+
+    await state.set_state(AdminProductStates.wait_description)
+
+
+@dp.message(AdminProductStates.wait_description)
+async def add_product_description(message:Message,state:FSMContext):
+
+    data=await state.get_data()
+
+    db.product_add({
+        "photo_file_id":data["photo"],
+        "title_ru":data["title_ru"],
+        "title_uz":data["title_uz"],
+        "price":data["price"],
+        "description_ru":message.text,
+        "description_uz":message.text
+    })
+
+    await message.answer("✅ Товар добавлен")
+
+    await state.clear()
+
+
+# ================================
+# PRODUCT LIST
+# ================================
+
+@dp.callback_query(F.data=="list_products")
+async def list_products(cb:CallbackQuery):
+
+    products=db.products_all()
+
+    if not products:
+
+        await cb.message.answer("Нет товаров")
+
+        return
+
+    kb=admin_products_list_keyboard(products,"delete_product")
+
+    await cb.message.answer("Выберите товар",reply_markup=kb)
+
+
+# ================================
+# DELETE PRODUCT
+# ================================
+
+@dp.callback_query(F.data.startswith("delete_product:"))
+async def delete_product(cb:CallbackQuery):
+
+    _,pid=cb.data.split(":")
+
+    db.product_delete(int(pid))
+
+    await cb.answer("Товар удален")
+
+# ================================
+# ADMIN STATS
+# ================================
+
+@dp.callback_query(F.data=="admin_stats")
+async def admin_stats(cb:CallbackQuery):
+
+    stats=db.stats()
+
+    text=(
+        f"📊 Статистика\n\n"
+        f"Заказы: {stats['orders']}\n"
+        f"Пользователи: {stats['users']}\n"
+        f"Товары: {stats['products']}"
+    )
+
+    await cb.message.answer(text)
+
+    await cb.answer()
+
+
+# =========================================================
+# PART 3/4 END
+# =========================================================
+
+# =========================================================
+# PART 3/4
+# - admin panel
+# - admin orders
+# - admin products add/edit/delete/publish
+# - stats
+# - reminders
+# - reports
+# - scheduled posts
+# =========================================================
+
+
+# =========================================================
+# EXTRA TEXT HELPERS
+# =========================================================
+def admin_text(lang: str, ru_text: str, uz_text: str) -> str:
+    return uz_text if lang == "uz" else ru_text
+
+
+def product_card_text(product: Dict, lang: str = "ru") -> str:
+    title = product.get("title_uz") if lang == "uz" else product.get("title_ru")
+    desc = product.get("description_uz") if lang == "uz" else product.get("description_ru")
+    sizes = product.get("sizes") or "—"
+    category = product.get("category_slug") or "casual"
+    price = safe_int(product.get("price"), 0)
+    old_price = safe_int(product.get("old_price"), 0)
+    stock_qty = safe_int(product.get("stock_qty"), 0)
+    is_published = safe_int(product.get("is_published"), 1)
+
+    if lang == "uz":
+        lines = [
+            f"🆔 ID: <b>{product.get('id')}</b>",
+            f"🛍 Nomi: <b>{esc(title or '')}</b>",
+            f"📝 Tavsif: {esc(desc or '—')}",
+            f"📏 Razmerlar: <b>{esc(sizes)}</b>",
+            f"🏷 Kategoriya: <b>{esc(category)}</b>",
+            f"💰 Narx: <b>{money_fmt(price)} so'm</b>",
+            f"💸 Eski narx: <b>{money_fmt(old_price)} so'm</b>" if old_price else "💸 Eski narx: —",
+            f"📦 Qoldiq: <b>{stock_qty}</b>",
+            f"👁 Holat: <b>{'Ko‘rinadi' if is_published else 'Yashirin'}</b>",
+        ]
+    else:
+        lines = [
+            f"🆔 ID: <b>{product.get('id')}</b>",
+            f"🛍 Название: <b>{esc(title or '')}</b>",
+            f"📝 Описание: {esc(desc or '—')}",
+            f"📏 Размеры: <b>{esc(sizes)}</b>",
+            f"🏷 Категория: <b>{esc(category)}</b>",
+            f"💰 Цена: <b>{money_fmt(price)} сум</b>",
+            f"💸 Старая цена: <b>{money_fmt(old_price)} сум</b>" if old_price else "💸 Старая цена: —",
+            f"📦 Остаток: <b>{stock_qty}</b>",
+            f"👁 Статус: <b>{'Опубликован' if is_published else 'Скрыт'}</b>",
+        ]
+    return "\n".join(lines)
+
+
+def admin_product_actions_keyboard(product_id: int, is_published: int) -> InlineKeyboardMarkup:
+    publish_text = "🙈 Скрыть" if is_published else "👁 Опубликовать"
+    publish_value = 0 if is_published else 1
+
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(text="✏ Изменить поле", callback_data=f"admin_edit_pick:{product_id}"),
+                InlineKeyboardButton(text=publish_text, callback_data=f"admin_publish:{product_id}:{publish_value}"),
+            ],
+            [
+                InlineKeyboardButton(text="🗑 Удалить", callback_data=f"admin_delete_product:{product_id}"),
+            ]
+        ]
+    )
+
+
+def admin_edit_fields_keyboard(product_id: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="🖼 Фото", callback_data=f"edit_field:{product_id}:photo_file_id")],
+            [InlineKeyboardButton(text="🇷🇺 Название RU", callback_data=f"edit_field:{product_id}:title_ru")],
+            [InlineKeyboardButton(text="🇺🇿 Название UZ", callback_data=f"edit_field:{product_id}:title_uz")],
+            [InlineKeyboardButton(text="📝 Описание RU", callback_data=f"edit_field:{product_id}:description_ru")],
+            [InlineKeyboardButton(text="📝 Описание UZ", callback_data=f"edit_field:{product_id}:description_uz")],
+            [InlineKeyboardButton(text="📏 Размеры", callback_data=f"edit_field:{product_id}:sizes")],
+            [InlineKeyboardButton(text="🏷 Категория", callback_data=f"edit_field:{product_id}:category_slug")],
+            [InlineKeyboardButton(text="💰 Цена", callback_data=f"edit_field:{product_id}:price")],
+            [InlineKeyboardButton(text="💸 Старая цена", callback_data=f"edit_field:{product_id}:old_price")],
+            [InlineKeyboardButton(text="📦 Остаток", callback_data=f"edit_field:{product_id}:stock_qty")],
+            [InlineKeyboardButton(text="↕ Сортировка", callback_data=f"edit_field:{product_id}:sort_order")],
+        ]
+    )
+
+
+def format_orders_short_list(orders: List[Dict]) -> str:
+    if not orders:
+        return "Нет заказов."
+    lines = []
+    for o in orders[:30]:
+        lines.append(
+            f"#{o['id']} | {esc((o.get('created_at') or '')[:16])} | "
+            f"{esc(o.get('customer_name') or '')} | "
+            f"{esc(o.get('customer_phone') or '')} | "
+            f"{status_label(o.get('status') or '', 'ru')}"
+        )
+    return "\n".join(lines)
+
+
+# =========================================================
+# ADMIN ACCESS
+# =========================================================
+def admin_only(user_id: int) -> bool:
+    return user_id in ADMIN_IDS
+
+
+# =========================================================
+# ADMIN MENU
+# =========================================================
+@dp.message(F.text.in_(["🛠 Админ", "🛠 Admin"]))
+async def admin_panel_open(message: Message):
+    if not admin_only(message.from_user.id):
+        return
+
+    lang = get_user_lang(message.from_user.id)
+    text = admin_text(lang, "🛠 Админ панель", "🛠 Admin panel")
+    await message.answer(text, reply_markup=admin_panel_keyboard(lang))
+
+
+# =========================================================
+# ADMIN ORDERS
+# =========================================================
+@dp.callback_query(F.data == "admin_orders_new")
+async def admin_orders_new(cb: CallbackQuery):
+    if not admin_only(cb.from_user.id):
+        await cb.answer()
+        return
+
+    orders = db.orders_get_by_status("new", limit=20)
+    if not orders:
+        await cb.message.answer("Новых заказов нет.")
+        await cb.answer()
+        return
+
     for order in orders:
-        items = json.loads(order["items"]) if order.get("items") else []
-        items_str = ", ".join([f"{it.get('name','')} x{it.get('qty',1)}" for it in items])
-        amt = int(order.get("total_amount") or 0)
+        db.order_mark_seen(order["id"], cb.from_user.id)
+        await cb.message.answer(
+            build_admin_order_text(order),
+            reply_markup=order_admin_keyboard(order["id"], order.get("user_id")),
+        )
 
-        ws.append([
-            order["id"],
-            order["created_at"],
-            order["name"],
-            order["phone"],
-            order["city"],
-            items_str[:120],
-            amt,
-            order["status"]
-        ])
-        total_amount += amt
+    await cb.answer()
 
-    wb.save(filename)
-    return total_amount
 
-async def cron_send_prev_month_report():
-    now = now_tz()
-    year, month = prev_month(now)
-
-    if db.report_is_sent(year, month):
+@dp.callback_query(F.data == "admin_orders_all")
+async def admin_orders_all(cb: CallbackQuery):
+    if not admin_only(cb.from_user.id):
+        await cb.answer()
         return
 
-    orders = db.orders_get_monthly(year, month)
+    orders = db.orders_filter(limit=30)
     if not orders:
+        await cb.message.answer("Заказов пока нет.")
+        await cb.answer()
         return
 
-    Path("reports").mkdir(exist_ok=True)
-    filename = f"reports/report_{year}_{month:02d}.xlsx"
-    total_amount = build_excel_report(filename, orders)
-
-    for admin_id in ADMIN_IDS:
-        try:
-            await bot.send_message(admin_id, f"📊 Автоотчет {month:02d}.{year}\n📦 Заказов: {len(orders)}\n💰 Сумма: {total_amount}")
-            await bot.send_document(admin_id, FSInputFile(filename))
-        except Exception as e:
-            print(f"Auto report failed for {admin_id}: {e}")
-
-    db.report_mark_sent(year, month, filename, len(orders), total_amount)
+    await cb.message.answer("📋 Последние заказы:\n\n" + format_orders_short_list(orders))
+    await cb.answer()
 
 
-# =========================
-# DAILY CHANNEL POST (Mon–Sat), Sunday reminder
-# =========================
-async def cron_post_daily_to_channel():
-    if not CHANNEL_ID:
+@dp.message(Command("find"))
+async def admin_find_orders(message: Message):
+    if not admin_only(message.from_user.id):
         return
 
-    now = now_tz()
-    dow = now.isoweekday()  # 1..7
-
-    if dow == 7:
-        for admin_id in ADMIN_IDS:
-            try:
-                await bot.send_message(admin_id, "📌 Воскресенье: загрузите посты на новую неделю (Пн–Сб) → 🛠 Админ → 📰 Посты недели.")
-            except Exception:
-                pass
+    parts = (message.text or "").split(maxsplit=1)
+    if len(parts) < 2:
+        await message.answer("Использование: /find 90 или /find 901234")
         return
 
-    week_key = db.week_key_now(now)
-    post = db.sched_get_for_day(dow=dow, week_key=week_key)
-
-    if not post:
-        for admin_id in ADMIN_IDS:
-            try:
-                await bot.send_message(admin_id, f"⚠️ Нет поста на сегодня (день={dow}) для недели {week_key}.")
-            except Exception:
-                pass
+    phone_part = parts[1].strip()
+    rows = db.find_orders_by_phone(phone_part, limit=20)
+    if not rows:
+        await message.answer("Ничего не найдено.")
         return
 
-    caption = (post.get("caption") or "").strip() or "🔥 ZARY & CO"
-    media_type = post.get("media_type") or "none"
-    file_id = post.get("file_id") or ""
+    for order in rows:
+        await message.answer(
+            build_admin_order_text(order),
+            reply_markup=order_admin_keyboard(order["id"], order.get("user_id")),
+        )
+
+
+@dp.callback_query(F.data.startswith("order_status:"))
+async def order_status_update(cb: CallbackQuery):
+    if not admin_only(cb.from_user.id):
+        await cb.answer()
+        return
 
     try:
-        if media_type == "video" and file_id:
-            await bot.send_video(CHANNEL_ID, file_id, caption=caption)
-        elif media_type == "photo" and file_id:
-            await bot.send_photo(CHANNEL_ID, file_id, caption=caption)
+        _, order_id_str, new_status = cb.data.split(":")
+        order_id = int(order_id_str)
+    except Exception:
+        await cb.answer("Ошибка")
+        return
+
+    if new_status not in ORDER_STATUSES:
+        await cb.answer("Неверный статус")
+        return
+
+    db.order_update_status(order_id, new_status, manager_id=cb.from_user.id)
+    order = db.order_get(order_id)
+
+    await cb.answer("Статус обновлён")
+
+    if order and order.get("user_id"):
+        user_lang = get_user_lang(order["user_id"])
+        if user_lang == "uz":
+            text = f"📦 Buyurtmangiz №{order_id} holati yangilandi: <b>{status_label(new_status, 'uz')}</b>"
         else:
-            await bot.send_message(CHANNEL_ID, caption)
+            text = f"📦 Статус вашего заказа №{order_id} обновлён: <b>{status_label(new_status, 'ru')}</b>"
 
-        db.sched_mark_posted(post["id"])
-    except Exception as e:
-        for admin_id in ADMIN_IDS:
+        try:
+            await bot.send_message(order["user_id"], text)
+        except Exception:
+            pass
+
+    try:
+        await cb.message.edit_reply_markup(reply_markup=order_admin_keyboard(order_id, order.get("user_id") if order else None))
+    except Exception:
+        pass
+
+
+# =========================================================
+# ADMIN PRODUCT MENU
+# =========================================================
+@dp.callback_query(F.data == "admin_add_product")
+async def admin_add_product_start(cb: CallbackQuery, state: FSMContext):
+    if not admin_only(cb.from_user.id):
+        await cb.answer()
+        return
+
+    await state.clear()
+    await state.set_state(AdminAddProductStates.waiting_photo)
+    await cb.message.answer("📸 Отправьте фото товара.")
+    await cb.answer()
+
+
+@dp.callback_query(F.data == "admin_edit_product")
+async def admin_edit_product_menu(cb: CallbackQuery):
+    if not admin_only(cb.from_user.id):
+        await cb.answer()
+        return
+
+    products = db.shop_products_list(published_only=False, limit=50)
+    if not products:
+        await cb.message.answer("Товаров пока нет.")
+        await cb.answer()
+        return
+
+    await cb.message.answer(
+        "Выберите товар для редактирования:",
+        reply_markup=admin_products_list_keyboard(products, "admin_edit_pick"),
+    )
+    await cb.answer()
+
+
+@dp.callback_query(F.data == "admin_delete_product_menu")
+async def admin_delete_product_menu(cb: CallbackQuery):
+    if not admin_only(cb.from_user.id):
+        await cb.answer()
+        return
+
+    products = db.shop_products_list(published_only=False, limit=50)
+    if not products:
+        await cb.message.answer("Товаров пока нет.")
+        await cb.answer()
+        return
+
+    await cb.message.answer(
+        "Выберите товар для удаления:",
+        reply_markup=admin_products_list_keyboard(products, "admin_delete_product"),
+    )
+    await cb.answer()
+
+
+# =========================================================
+# ADD PRODUCT FSM
+# =========================================================
+@dp.message(AdminAddProductStates.waiting_photo, F.photo)
+async def add_product_photo(message: Message, state: FSMContext):
+    if not admin_only(message.from_user.id):
+        return
+
+    photo_file_id = message.photo[-1].file_id
+    await state.update_data(photo_file_id=photo_file_id)
+    await state.set_state(AdminAddProductStates.waiting_title_ru)
+    await message.answer("🇷🇺 Введите название товара на русском:")
+
+
+@dp.message(AdminAddProductStates.waiting_photo)
+async def add_product_photo_invalid(message: Message):
+    if not admin_only(message.from_user.id):
+        return
+    await message.answer("Нужно отправить именно фото товара.")
+
+
+@dp.message(AdminAddProductStates.waiting_title_ru)
+async def add_product_title_ru(message: Message, state: FSMContext):
+    await state.update_data(title_ru=(message.text or "").strip())
+    await state.set_state(AdminAddProductStates.waiting_title_uz)
+    await message.answer("🇺🇿 Введите название товара на узбекском:")
+
+
+@dp.message(AdminAddProductStates.waiting_title_uz)
+async def add_product_title_uz(message: Message, state: FSMContext):
+    await state.update_data(title_uz=(message.text or "").strip())
+    await state.set_state(AdminAddProductStates.waiting_desc_ru)
+    await message.answer("📝 Введите описание на русском:")
+
+
+@dp.message(AdminAddProductStates.waiting_desc_ru)
+async def add_product_desc_ru(message: Message, state: FSMContext):
+    await state.update_data(description_ru=(message.text or "").strip())
+    await state.set_state(AdminAddProductStates.waiting_desc_uz)
+    await message.answer("📝 Введите описание на узбекском:")
+
+
+@dp.message(AdminAddProductStates.waiting_desc_uz)
+async def add_product_desc_uz(message: Message, state: FSMContext):
+    await state.update_data(description_uz=(message.text or "").strip())
+    await state.set_state(AdminAddProductStates.waiting_sizes)
+    await message.answer("📏 Введите размеры через запятую. Например: 98,104,110,116")
+
+
+@dp.message(AdminAddProductStates.waiting_sizes)
+async def add_product_sizes(message: Message, state: FSMContext):
+    await state.update_data(sizes=(message.text or "").strip())
+    await state.set_state(AdminAddProductStates.waiting_category)
+    await message.answer(
+        "🏷 Введите категорию:\n"
+        "new / hits / sale / limited / school / casual"
+    )
+
+
+@dp.message(AdminAddProductStates.waiting_category)
+async def add_product_category(message: Message, state: FSMContext):
+    category = (message.text or "").strip().lower()
+    if category not in SHOP_CATEGORIES:
+        await message.answer("Неверная категория. Введите одну из: new, hits, sale, limited, school, casual")
+        return
+
+    await state.update_data(category_slug=category)
+    await state.set_state(AdminAddProductStates.waiting_price)
+    await message.answer("💰 Введите цену товара цифрами. Например: 250000")
+
+
+@dp.message(AdminAddProductStates.waiting_price)
+async def add_product_price(message: Message, state: FSMContext):
+    text = (message.text or "").strip().replace(" ", "")
+    if not text.isdigit():
+        await message.answer("Цена должна быть числом.")
+        return
+
+    await state.update_data(price=int(text))
+    await state.set_state(AdminAddProductStates.waiting_old_price)
+    await message.answer("💸 Введите старую цену цифрами или 0 если её нет.")
+
+
+@dp.message(AdminAddProductStates.waiting_old_price)
+async def add_product_old_price(message: Message, state: FSMContext):
+    text = (message.text or "").strip().replace(" ", "")
+    if not text.isdigit():
+        await message.answer("Старая цена должна быть числом.")
+        return
+
+    await state.update_data(old_price=int(text))
+    await state.set_state(AdminAddProductStates.waiting_stock_qty)
+    await message.answer("📦 Введите остаток товара. Например: 10")
+
+
+@dp.message(AdminAddProductStates.waiting_stock_qty)
+async def add_product_stock_qty(message: Message, state: FSMContext):
+    text = (message.text or "").strip().replace(" ", "")
+    if not text.isdigit():
+        await message.answer("Остаток должен быть числом.")
+        return
+
+    await state.update_data(stock_qty=int(text))
+    await state.set_state(AdminAddProductStates.waiting_publish)
+    await message.answer("👁 Опубликовать товар сразу? Напишите: да или нет")
+
+
+@dp.message(AdminAddProductStates.waiting_publish)
+async def add_product_publish(message: Message, state: FSMContext):
+    answer = ((message.text or "").strip().lower())
+    is_published = 1 if answer in ("да", "ha", "yes", "y", "1") else 0
+
+    data = await state.get_data()
+
+    product_id = db.shop_product_add(
+        photo_file_id=data.get("photo_file_id", ""),
+        title_ru=data.get("title_ru", ""),
+        title_uz=data.get("title_uz", ""),
+        description_ru=data.get("description_ru", ""),
+        description_uz=data.get("description_uz", ""),
+        sizes=data.get("sizes", ""),
+        category_slug=data.get("category_slug", "casual"),
+        price=safe_int(data.get("price"), 0),
+        old_price=safe_int(data.get("old_price"), 0),
+        price_on_request=0,
+        stock_qty=safe_int(data.get("stock_qty"), 0),
+        is_published=is_published,
+        sort_order=0,
+    )
+
+    product = db.shop_product_get(product_id)
+    await state.clear()
+
+    await message.answer("✅ Товар добавлен.")
+    if product:
+        caption = product_card_text(product, "ru")
+        if product.get("photo_file_id"):
             try:
-                await bot.send_message(admin_id, f"❌ Ошибка публикации в канал: {e}")
+                await message.answer_photo(
+                    product["photo_file_id"],
+                    caption=caption,
+                    reply_markup=admin_product_actions_keyboard(product_id, safe_int(product.get("is_published"), 1)),
+                )
             except Exception:
-                pass
+                await message.answer(
+                    caption,
+                    reply_markup=admin_product_actions_keyboard(product_id, safe_int(product.get("is_published"), 1)),
+                )
+        else:
+            await message.answer(
+                caption,
+                reply_markup=admin_product_actions_keyboard(product_id, safe_int(product.get("is_published"), 1)),
+            )
 
 
-# =========================
-# REMINDERS (asyncio loop instead of APScheduler)
-# =========================
+# =========================================================
+# EDIT PRODUCT
+# =========================================================
+@dp.callback_query(F.data.startswith("admin_edit_pick:"))
+async def admin_edit_pick(cb: CallbackQuery):
+    if not admin_only(cb.from_user.id):
+        await cb.answer()
+        return
+
+    try:
+        product_id = int(cb.data.split(":")[1])
+    except Exception:
+        await cb.answer("Ошибка")
+        return
+
+    product = db.shop_product_get(product_id)
+    if not product:
+        await cb.message.answer("Товар не найден.")
+        await cb.answer()
+        return
+
+    await cb.message.answer(
+        product_card_text(product, "ru"),
+        reply_markup=admin_edit_fields_keyboard(product_id),
+    )
+    await cb.answer()
+
+
+@dp.callback_query(F.data.startswith("edit_field:"))
+async def admin_edit_field_select(cb: CallbackQuery, state: FSMContext):
+    if not admin_only(cb.from_user.id):
+        await cb.answer()
+        return
+
+    try:
+        _, product_id_str, field_name = cb.data.split(":")
+        product_id = int(product_id_str)
+    except Exception:
+        await cb.answer("Ошибка")
+        return
+
+    await state.clear()
+    await state.update_data(product_id=product_id, field_name=field_name)
+    await state.set_state(AdminEditProductStates.waiting_new_value)
+
+    prompts = {
+        "photo_file_id": "Отправьте новое фото товара.",
+        "title_ru": "Введите новое название RU.",
+        "title_uz": "Введите новое название UZ.",
+        "description_ru": "Введите новое описание RU.",
+        "description_uz": "Введите новое описание UZ.",
+        "sizes": "Введите новые размеры. Например: 98,104,110",
+        "category_slug": "Введите категорию: new / hits / sale / limited / school / casual",
+        "price": "Введите новую цену цифрами.",
+        "old_price": "Введите новую старую цену цифрами.",
+        "stock_qty": "Введите новый остаток цифрами.",
+        "sort_order": "Введите новую сортировку цифрами.",
+    }
+    await cb.message.answer(prompts.get(field_name, "Введите новое значение."))
+    await cb.answer()
+
+
+@dp.message(AdminEditProductStates.waiting_new_value, F.photo)
+async def admin_edit_new_photo(message: Message, state: FSMContext):
+    if not admin_only(message.from_user.id):
+        return
+
+    data = await state.get_data()
+    field_name = data.get("field_name")
+    product_id = safe_int(data.get("product_id"))
+
+    if field_name != "photo_file_id":
+        await message.answer("Сейчас ожидается текстовое значение, а не фото.")
+        return
+
+    new_value = message.photo[-1].file_id
+    db.shop_product_update_field(product_id, "photo_file_id", new_value)
+    product = db.shop_product_get(product_id)
+    await state.clear()
+
+    await message.answer("✅ Фото обновлено.")
+    if product:
+        await message.answer(
+            product_card_text(product, "ru"),
+            reply_markup=admin_product_actions_keyboard(product_id, safe_int(product.get("is_published"), 1)),
+        )
+
+
+@dp.message(AdminEditProductStates.waiting_new_value)
+async def admin_edit_new_value(message: Message, state: FSMContext):
+    if not admin_only(message.from_user.id):
+        return
+
+    data = await state.get_data()
+    field_name = data.get("field_name")
+    product_id = safe_int(data.get("product_id"))
+    raw_value = (message.text or "").strip()
+
+    if field_name in ("price", "old_price", "stock_qty", "sort_order"):
+        if not raw_value.replace(" ", "").isdigit():
+            await message.answer("Нужно ввести число.")
+            return
+        value: Any = int(raw_value.replace(" ", ""))
+    elif field_name == "category_slug":
+        value = raw_value.lower()
+        if value not in SHOP_CATEGORIES:
+            await message.answer("Неверная категория. Используйте: new, hits, sale, limited, school, casual")
+            return
+    else:
+        value = raw_value
+
+    db.shop_product_update_field(product_id, field_name, value)
+    product = db.shop_product_get(product_id)
+    await state.clear()
+
+    await message.answer("✅ Поле обновлено.")
+    if product:
+        await message.answer(
+            product_card_text(product, "ru"),
+            reply_markup=admin_product_actions_keyboard(product_id, safe_int(product.get("is_published"), 1)),
+        )
+
+
+# =========================================================
+# DELETE / PUBLISH PRODUCT
+# =========================================================
+@dp.callback_query(F.data.startswith("admin_delete_product:"))
+async def admin_delete_product(cb: CallbackQuery):
+    if not admin_only(cb.from_user.id):
+        await cb.answer()
+        return
+
+    try:
+        product_id = int(cb.data.split(":")[1])
+    except Exception:
+        await cb.answer("Ошибка")
+        return
+
+    db.shop_product_delete(product_id)
+    await cb.message.answer(f"🗑 Товар ID {product_id} удалён.")
+    await cb.answer("Удалено")
+
+
+@dp.callback_query(F.data.startswith("admin_publish:"))
+async def admin_publish_product(cb: CallbackQuery):
+    if not admin_only(cb.from_user.id):
+        await cb.answer()
+        return
+
+    try:
+        _, product_id_str, publish_str = cb.data.split(":")
+        product_id = int(product_id_str)
+        publish_value = int(publish_str)
+    except Exception:
+        await cb.answer("Ошибка")
+        return
+
+    db.shop_product_update_publish(product_id, publish_value)
+    product = db.shop_product_get(product_id)
+    if not product:
+        await cb.answer("Товар не найден")
+        return
+
+    text = "✅ Статус публикации обновлён.\n\n" + product_card_text(product, "ru")
+    await cb.message.answer(
+        text,
+        reply_markup=admin_product_actions_keyboard(product_id, safe_int(product.get("is_published"), 1)),
+    )
+    await cb.answer("Готово")
+
+
+# =========================================================
+# ADMIN STATS
+# =========================================================
+@dp.callback_query(F.data == "admin_stats")
+async def admin_stats(cb: CallbackQuery):
+    if not admin_only(cb.from_user.id):
+        await cb.answer()
+        return
+
+    stats = db.get_stats_all()
+    products_count = db.shop_products_count()
+
+    text = (
+        "📊 <b>Статистика</b>\n\n"
+        f"Всего заказов: <b>{safe_int(stats.get('total'), 0)}</b>\n"
+        f"Новые: <b>{safe_int(stats.get('new_count'), 0)}</b>\n"
+        f"В обработке: <b>{safe_int(stats.get('processing'), 0)}</b>\n"
+        f"Подтверждены: <b>{safe_int(stats.get('confirmed'), 0)}</b>\n"
+        f"Оплачены: <b>{safe_int(stats.get('paid_count'), 0)}</b>\n"
+        f"Отправлены: <b>{safe_int(stats.get('shipped'), 0)}</b>\n"
+        f"Доставлены: <b>{safe_int(stats.get('delivered'), 0)}</b>\n"
+        f"Отменены: <b>{safe_int(stats.get('cancelled'), 0)}</b>\n"
+        f"Уникальных клиентов: <b>{safe_int(stats.get('unique_users'), 0)}</b>\n"
+        f"Товаров в базе: <b>{products_count}</b>"
+    )
+    await cb.message.answer(text)
+    await cb.answer()
+
+
+# =========================================================
+# REMINDERS
+# =========================================================
 async def check_reminders():
     orders = db.orders_get_for_reminder()
     if not orders:
         return
 
+    lines = []
+    for o in orders[:10]:
+        lines.append(
+            f"🆕 #{o['id']} | {esc(o.get('customer_name') or '')} | "
+            f"{esc(o.get('customer_phone') or '')}"
+        )
+
+    text = "🔔 <b>Напоминание: есть новые заказы</b>\n\n" + "\n".join(lines)
+
     for admin_id in ADMIN_IDS:
         try:
-            lines = [f"🆕 #{o['id']} | {esc(o['name'])} | {esc(o['phone'])}" for o in orders[:10]]
-            text = "🔔 <b>Напоминание: новые заказы!</b>\n\n" + "\n".join(lines)
             await bot.send_message(admin_id, text)
         except Exception as e:
             print(f"Reminder failed for {admin_id}: {e}")
@@ -1732,492 +3305,1010 @@ async def check_reminders():
     for o in orders:
         db.order_update_reminded(o["id"])
 
+
 async def reminders_loop():
     while True:
         try:
             await check_reminders()
         except Exception as e:
             print("reminders_loop error:", e)
-        await asyncio.sleep(30 * 60)  # every 30 minutes
+        await asyncio.sleep(30 * 60)
 
 
-# =========================
-# WEB SERVER + CRON + ADMIN PANEL
-# =========================
-from aiohttp import web
+# =========================================================
+# EXCEL REPORTS
+# =========================================================
+def build_excel_report(filename: str, orders: List[Dict]) -> int:
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Orders"
 
-def _month_range_strings(dt: datetime) -> Tuple[str, str]:
-    start = dt.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
-    last = monthrange(dt.year, dt.month)[1]
-    end = dt.replace(day=last, hour=23, minute=59, second=59, microsecond=0)
-    return start.strftime("%Y-%m-%d %H:%M:%S"), end.strftime("%Y-%m-%d %H:%M:%S")
+    headers = [
+        "ID", "Дата", "Имя", "Телефон", "Город", "Товары",
+        "Сумма", "Статус", "Оплата", "Статус оплаты", "Источник"
+    ]
+    ws.append(headers)
 
-def _today_range_strings(dt: datetime) -> Tuple[str, str]:
-    start = dt.replace(hour=0, minute=0, second=0, microsecond=0)
-    end = dt.replace(hour=23, minute=59, second=59, microsecond=0)
-    return start.strftime("%Y-%m-%d %H:%M:%S"), end.strftime("%Y-%m-%d %H:%M:%S")
+    for cell in ws[1]:
+        cell.font = Font(bold=True)
+        cell.fill = PatternFill(start_color="DDDDDD", end_color="DDDDDD", fill_type="solid")
 
-def _render_base_html(title: str, body: str) -> str:
-    return f"""<!doctype html>
-<html lang="ru">
+    total_amount = 0
+
+    for o in orders:
+        try:
+            items = json.loads(o.get("items") or "[]")
+        except Exception:
+            items = []
+
+        items_text = ", ".join([
+            f"{(it.get('product_name') or it.get('name') or 'item')} x{it.get('qty', 1)}"
+            for it in items
+        ])
+
+        order_sum = safe_int(o.get("total_amount"), 0)
+        total_amount += order_sum
+
+        ws.append([
+            o.get("id"),
+            o.get("created_at"),
+            o.get("customer_name"),
+            o.get("customer_phone"),
+            o.get("city"),
+            items_text,
+            order_sum,
+            o.get("status"),
+            o.get("payment_method"),
+            o.get("payment_status"),
+            o.get("source", "bot"),
+        ])
+
+    wb.save(filename)
+    return total_amount
+
+
+async def generate_monthly_report_to_admins():
+    year, month = prev_month(now_tz())
+
+    if db.report_is_sent(year, month):
+        return
+
+    orders = db.orders_get_monthly(year, month)
+    if not orders:
+        return
+
+    Path("reports").mkdir(exist_ok=True)
+    filename = f"reports/report_{year}_{month:02d}.xlsx"
+    total_amount = build_excel_report(filename, orders)
+
+    for admin_id in ADMIN_IDS:
+        try:
+            await bot.send_message(
+                admin_id,
+                f"📊 Отчёт {month:02d}.{year}\n"
+                f"📦 Заказов: {len(orders)}\n"
+                f"💰 Сумма: {money_fmt(total_amount)} сум"
+            )
+            await bot.send_document(admin_id, FSInputFile(filename))
+        except Exception as e:
+            print(f"Failed to send report to {admin_id}: {e}")
+
+    db.report_mark_sent(year, month, filename, len(orders), total_amount)
+
+
+# =========================================================
+# SCHEDULED POSTS
+# =========================================================
+async def cron_post_daily_to_channel():
+    if not CHANNEL_ID:
+        return
+
+    now = now_tz()
+    dow = now.isoweekday()
+
+    if dow == 7:
+        for admin_id in ADMIN_IDS:
+            try:
+                await bot.send_message(admin_id, "📌 Воскресенье: загрузите посты на новую неделю.")
+            except Exception:
+                pass
+        return
+
+    week_key = db.week_key_now(now)
+    post = db.sched_get_for_day(dow, week_key)
+    if not post:
+        return
+
+    caption = (post.get("caption") or "").strip() or "🔥 ZARY & CO"
+    media_type = post.get("media_type") or "none"
+    file_id = post.get("file_id") or ""
+
+    try:
+        if media_type == "photo" and file_id:
+            await bot.send_photo(CHANNEL_ID, file_id, caption=caption)
+        elif media_type == "video" and file_id:
+            await bot.send_video(CHANNEL_ID, file_id, caption=caption)
+        else:
+            await bot.send_message(CHANNEL_ID, caption)
+
+        db.sched_mark_posted(post["id"])
+    except Exception as e:
+        print("Post error:", e)
+
+
+# =========================================================
+# CRON COMMANDS IN BOT
+# =========================================================
+@dp.message(Command("monthly_report"))
+async def manual_monthly_report(message: Message):
+    if not admin_only(message.from_user.id):
+        return
+    await message.answer("Генерирую отчёт...")
+    await generate_monthly_report_to_admins()
+    await message.answer("Готово.")
+
+
+# =========================================================
+# PART 3/4 END
+# =========================================================
+
+# =========================================================
+# PART 4/4
+# - web shop
+# - payment stub pages
+# - api
+# - media proxy
+# - web admin
+# - health/cron
+# - main()
+# =========================================================
+
+
+# =========================================================
+# WEB HELPERS
+# =========================================================
+def parse_web_lang(request: web.Request) -> str:
+    lang = (request.query.get("lang") or "ru").strip().lower()
+    return "uz" if lang == "uz" else "ru"
+
+
+def product_to_web_dict(product: Dict, lang: str) -> Dict[str, Any]:
+    return {
+        "id": product.get("id"),
+        "title": product.get("title_uz") if lang == "uz" else product.get("title_ru"),
+        "title_ru": product.get("title_ru"),
+        "title_uz": product.get("title_uz"),
+        "description": product.get("description_uz") if lang == "uz" else product.get("description_ru"),
+        "description_ru": product.get("description_ru"),
+        "description_uz": product.get("description_uz"),
+        "sizes": parse_sizes_text(product.get("sizes") or ""),
+        "sizes_text": product.get("sizes") or "",
+        "category_slug": product.get("category_slug") or "casual",
+        "price": safe_int(product.get("price"), 0),
+        "old_price": safe_int(product.get("old_price"), 0),
+        "price_on_request": safe_int(product.get("price_on_request"), 0),
+        "stock_qty": safe_int(product.get("stock_qty"), 0),
+        "photo": product_public_photo_url(product.get("photo_file_id") or ""),
+        "is_published": safe_int(product.get("is_published"), 1),
+    }
+
+
+def admin_orders_html_rows(rows: List[Dict]) -> str:
+    html_rows = []
+    for o in rows:
+        try:
+            items = json.loads(o.get("items") or "[]")
+        except Exception:
+            items = []
+
+        items_preview = ", ".join([
+            f"{esc((it.get('product_name') or it.get('name') or 'item'))} x{safe_int(it.get('qty'), 1)}"
+            for it in items[:3]
+        ])
+
+        html_rows.append(
+            "<tr>"
+            f"<td>#{o['id']}</td>"
+            f"<td>{esc((o.get('created_at') or '')[:16])}</td>"
+            f"<td>{esc(o.get('customer_name') or '')}</td>"
+            f"<td>{esc(o.get('customer_phone') or '')}</td>"
+            f"<td>{esc(o.get('city') or '')}</td>"
+            f"<td>{esc(delivery_label(o.get('delivery_type') or '', 'ru'))}</td>"
+            f"<td>{esc(payment_label(o.get('payment_method') or '', 'ru'))}</td>"
+            f"<td>{esc(items_preview)}</td>"
+            f"<td>{money_fmt(o.get('total_amount') or 0)}</td>"
+            f"<td>{esc(status_label(o.get('status') or '', 'ru'))}</td>"
+            "</tr>"
+        )
+    return "\n".join(html_rows)
+
+
+def admin_products_html_rows(rows: List[Dict]) -> str:
+    html_rows = []
+    for p in rows:
+        html_rows.append(
+            "<tr>"
+            f"<td>{p['id']}</td>"
+            f"<td>{esc(p.get('title_ru') or '')}</td>"
+            f"<td>{esc(p.get('category_slug') or '')}</td>"
+            f"<td>{money_fmt(p.get('price') or 0)}</td>"
+            f"<td>{money_fmt(p.get('old_price') or 0)}</td>"
+            f"<td>{safe_int(p.get('stock_qty'), 0)}</td>"
+            f"<td>{'Да' if safe_int(p.get('is_published'), 1) else 'Нет'}</td>"
+            "</tr>"
+        )
+    return "\n".join(html_rows)
+
+
+# =========================================================
+# WEB PAGES
+# =========================================================
+async def shop_index(request: web.Request) -> web.Response:
+    lang = parse_web_lang(request)
+    is_uz = lang == "uz"
+
+    title = "ZARY SHOP" if not is_uz else "ZARY DO'KON"
+    shop_label = "Магазин" if not is_uz else "Do'kon"
+    cart_label = "Корзина" if not is_uz else "Savatcha"
+    order_label = "Оформить заказ" if not is_uz else "Buyurtma berish"
+    empty_cart_label = "Корзина пуста" if not is_uz else "Savatcha bo'sh"
+    name_label = "Имя" if not is_uz else "Ism"
+    phone_label = "Телефон" if not is_uz else "Telefon"
+    city_label = "Город" if not is_uz else "Shahar"
+    address_label = "Адрес" if not is_uz else "Manzil"
+    comment_label = "Комментарий" if not is_uz else "Izoh"
+    delivery_label_title = "Доставка" if not is_uz else "Yetkazish"
+    payment_label_title = "Оплата" if not is_uz else "To'lov"
+    success_label = "Заказ отправлен" if not is_uz else "Buyurtma yuborildi"
+    sizes_label = "Размеры" if not is_uz else "Razmerlar"
+    total_label = "Итого" if not is_uz else "Jami"
+    add_to_cart_label = "В корзину" if not is_uz else "Savatchaga"
+    old_price_label = "Старая цена" if not is_uz else "Eski narx"
+    stock_label = "Остаток" if not is_uz else "Qoldiq"
+    delivery_1 = "Яндекс курьер" if not is_uz else "Yandex kuryer"
+    delivery_2 = "B2B почта" if not is_uz else "B2B pochta"
+    delivery_3 = "Яндекс ПВЗ" if not is_uz else "Yandex PVZ"
+
+    html_page = f"""
+<!DOCTYPE html>
+<html lang="{lang}">
 <head>
 <meta charset="utf-8"/>
 <meta name="viewport" content="width=device-width, initial-scale=1"/>
-<title>{esc(title)}</title>
-<script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+<title>{title}</title>
 <style>
-body{{font-family:Arial, sans-serif; background:#0b0f17; color:#e8eefc; margin:0;}}
-a{{color:#7aa2ff; text-decoration:none}}
-.header{{padding:16px 20px; border-bottom:1px solid #1c2742; display:flex; justify-content:space-between; align-items:center}}
-.container{{padding:20px; max-width:1100px; margin:0 auto}}
-.card{{background:#101826; border:1px solid #1c2742; border-radius:14px; padding:16px; margin-bottom:14px}}
-.grid{{display:grid; grid-template-columns:repeat(2, 1fr); gap:12px}}
-@media (max-width:900px){{.grid{{grid-template-columns:1fr}}}}
-.small{{opacity:.85; font-size:13px}}
-.badge{{display:inline-block; padding:4px 10px; border-radius:999px; border:1px solid #2b3b66; font-size:12px}}
-.table{{width:100%; border-collapse:collapse}}
-.table th,.table td{{border-bottom:1px solid #1c2742; padding:10px; text-align:left; font-size:14px}}
-.input,select{{background:#0b1220; border:1px solid #1c2742; color:#e8eefc; padding:8px 10px; border-radius:10px}}
-.btn{{background:#243a7a; border:none; color:#fff; padding:9px 12px; border-radius:10px; cursor:pointer}}
-.btn2{{background:#162542; border:1px solid #2b3b66}}
-.row{{display:flex; gap:10px; flex-wrap:wrap; align-items:center}}
+*{{box-sizing:border-box}}
+body{{margin:0;font-family:Arial,sans-serif;background:#f6f6f6;color:#111}}
+header{{background:#111;color:#fff;padding:18px 16px;position:sticky;top:0;z-index:9}}
+.wrap{{max-width:1180px;margin:0 auto;padding:18px}}
+.topbar{{display:flex;justify-content:space-between;align-items:center;gap:12px;flex-wrap:wrap}}
+.brand{{font-size:24px;font-weight:700;letter-spacing:.5px}}
+.langs a{{color:#fff;text-decoration:none;margin-left:10px;padding:6px 10px;border:1px solid rgba(255,255,255,.2);border-radius:8px}}
+.layout{{display:grid;grid-template-columns:1fr 360px;gap:18px}}
+.grid{{display:grid;grid-template-columns:repeat(auto-fill,minmax(230px,1fr));gap:16px}}
+.card{{background:#fff;border-radius:16px;overflow:hidden;box-shadow:0 6px 18px rgba(0,0,0,.06)}}
+.card img{{width:100%;height:250px;object-fit:cover;background:#ececec}}
+.card .ph{{width:100%;height:250px;background:#ececec;display:flex;align-items:center;justify-content:center;color:#777}}
+.card-body{{padding:14px}}
+.card h3{{margin:0 0 8px;font-size:18px}}
+.muted{{color:#666;font-size:14px}}
+.price{{font-size:20px;font-weight:700;margin:10px 0 4px}}
+.old{{text-decoration:line-through;color:#999;font-size:14px}}
+.sizes{{font-size:13px;color:#555;margin:8px 0}}
+.stock{{font-size:13px;color:#555;margin:8px 0}}
+.btn{{display:inline-block;width:100%;padding:11px 12px;border:none;border-radius:10px;background:#111;color:#fff;cursor:pointer;font-size:15px}}
+.btn.secondary{{background:#e9e9e9;color:#111}}
+.side{{background:#fff;border-radius:16px;padding:16px;box-shadow:0 6px 18px rgba(0,0,0,.06);position:sticky;top:90px;height:max-content}}
+.field{{margin-bottom:10px}}
+.field label{{display:block;font-size:13px;margin-bottom:6px;color:#555}}
+.field input,.field select,.field textarea{{width:100%;padding:10px;border:1px solid #ddd;border-radius:10px;font-size:14px}}
+.cart-list{{max-height:240px;overflow:auto;margin-bottom:14px}}
+.cart-item{{padding:10px 0;border-bottom:1px solid #eee;font-size:14px}}
+.row{{display:flex;justify-content:space-between;gap:8px}}
+.badge{{display:inline-block;padding:4px 8px;border-radius:999px;background:#f1f1f1;font-size:12px;margin-right:6px;margin-bottom:6px}}
+.notice{{padding:10px 12px;border-radius:10px;background:#f8f3d8;color:#6a5800;font-size:13px;margin-bottom:12px}}
+.footer{{padding:30px 0 10px;color:#777;font-size:13px}}
+@media (max-width: 920px) {{
+  .layout{{grid-template-columns:1fr}}
+  .side{{position:static}}
+}}
 </style>
 </head>
 <body>
-<div class="header">
-  <div><b>ZARY & CO</b> <span class="badge">Admin</span></div>
-  <div class="small">
-    <a href="/admin" id="dashLink">Dashboard</a> ·
-    <a href="/admin/orders" id="ordersLink">Orders</a>
+<header>
+  <div class="wrap topbar">
+    <div class="brand">ZARY & CO</div>
+    <div class="langs">
+      <a href="/?lang=ru">RU</a>
+      <a href="/?lang=uz">UZ</a>
+    </div>
   </div>
-</div>
-<div class="container">
-{body}
+</header>
+
+<div class="wrap">
+  <div class="layout">
+    <section>
+      <h2 style="margin:0 0 14px">{shop_label}</h2>
+      <div id="products" class="grid"></div>
+      <div class="footer">
+        Telegram: {FOLLOW_TG}<br/>
+        Instagram: {FOLLOW_IG}<br/>
+        YouTube: {FOLLOW_YT}
+      </div>
+    </section>
+
+    <aside class="side">
+      <h3 style="margin-top:0">{cart_label}</h3>
+      <div id="cartList" class="cart-list"></div>
+      <div class="row" style="margin:12px 0 16px">
+        <strong>{total_label}</strong>
+        <strong id="cartTotal">0</strong>
+      </div>
+
+      <div class="notice">
+        Click / Payme integration ready structure. Real API can be connected later.
+      </div>
+
+      <div class="field">
+        <label>{name_label}</label>
+        <input id="name" />
+      </div>
+      <div class="field">
+        <label>{phone_label}</label>
+        <input id="phone" />
+      </div>
+      <div class="field">
+        <label>{city_label}</label>
+        <input id="city" />
+      </div>
+      <div class="field">
+        <label>{delivery_label_title}</label>
+        <select id="delivery">
+          <option value="yandex_courier">{delivery_1}</option>
+          <option value="b2b_post">{delivery_2}</option>
+          <option value="yandex_pvz">{delivery_3}</option>
+        </select>
+      </div>
+      <div class="field">
+        <label>{payment_label_title}</label>
+        <select id="payment">
+          <option value="click">Click</option>
+          <option value="payme">Payme</option>
+        </select>
+      </div>
+      <div class="field">
+        <label>{address_label}</label>
+        <input id="address" />
+      </div>
+      <div class="field">
+        <label>{comment_label}</label>
+        <textarea id="comment" rows="3"></textarea>
+      </div>
+
+      <button class="btn" onclick="submitOrder()">{order_label}</button>
+      <button class="btn secondary" style="margin-top:10px" onclick="clearCart()">{empty_cart_label}</button>
+    </aside>
+  </div>
 </div>
 
 <script>
-(function(){{
-  const params = new URLSearchParams(location.search);
-  const token = params.get("token") || "";
-  const dash = document.getElementById("dashLink");
-  const ord = document.getElementById("ordersLink");
-  if(dash) dash.href = "/admin?token=" + encodeURIComponent(token);
-  if(ord) ord.href = "/admin/orders?token=" + encodeURIComponent(token);
-}})();
+const LANG = "{lang}";
+let PRODUCTS = [];
+let CART = JSON.parse(localStorage.getItem("zary_cart") || "[]");
+
+function money(v) {{
+  try {{
+    return Number(v || 0).toLocaleString("ru-RU");
+  }} catch(e) {{
+    return String(v || 0);
+  }}
+}}
+
+function saveCart() {{
+  localStorage.setItem("zary_cart", JSON.stringify(CART));
+}}
+
+function renderCart() {{
+  const box = document.getElementById("cartList");
+  const totalEl = document.getElementById("cartTotal");
+
+  if (!CART.length) {{
+    box.innerHTML = '<div class="muted">{empty_cart_label}</div>';
+    totalEl.textContent = '0';
+    return;
+  }}
+
+  let total = 0;
+  box.innerHTML = CART.map((item, idx) => {{
+    const line = (Number(item.price || 0) * Number(item.qty || 1));
+    total += line;
+    return `
+      <div class="cart-item">
+        <div><b>${{item.title}}</b></div>
+        <div class="muted">${{item.size || '—'}} | x${{item.qty || 1}}</div>
+        <div class="row">
+          <span>${{money(item.price)}} сум</span>
+          <button class="btn secondary" style="width:auto;padding:4px 8px" onclick="removeCartItem(${{idx}})">✕</button>
+        </div>
+      </div>
+    `;
+  }}).join("");
+
+  totalEl.textContent = money(total) + " сум";
+}}
+
+function removeCartItem(idx) {{
+  CART.splice(idx, 1);
+  saveCart();
+  renderCart();
+}}
+
+function clearCart() {{
+  CART = [];
+  saveCart();
+  renderCart();
+}}
+
+function addToCart(productId) {{
+  const product = PRODUCTS.find(p => Number(p.id) === Number(productId));
+  if (!product) return;
+
+  let chosenSize = "";
+  if (product.sizes && product.sizes.length) {{
+    chosenSize = prompt("{sizes_label}: " + product.sizes.join(", "), product.sizes[0]) || product.sizes[0];
+  }}
+
+  CART.push({{
+    id: product.id,
+    product_id: product.id,
+    title: product.title,
+    product_name: product.title,
+    qty: 1,
+    price: product.price || 0,
+    size: chosenSize
+  }});
+
+  saveCart();
+  renderCart();
+}}
+
+function renderProducts() {{
+  const box = document.getElementById("products");
+  box.innerHTML = PRODUCTS.map(p => `
+    <div class="card">
+      ${
+        "`${p.photo ? `<img src=\"${p.photo}\" alt=\"\">` : `<div class=\"ph\">No photo</div>`}`"
+      }
+      <div class="card-body">
+        <h3>${"${p.title || ''}"}</h3>
+        <div class="muted">${"${p.description || ''}"}</div>
+        <div class="sizes"><b>{sizes_label}:</b> ${"${(p.sizes || []).join(', ') || '—'}"}</div>
+        <div class="stock"><b>{stock_label}:</b> ${"${p.stock_qty || 0}"}</div>
+        ${"${p.old_price ? `<div class=\"old\">{old_price_label}: ${money(p.old_price)} сум</div>` : ''}"}
+        <div class="price">${"${money(p.price || 0)}"} сум</div>
+        <button class="btn" onclick="addToCart(${ "${p.id}" })">{add_to_cart_label}</button>
+      </div>
+    </div>
+  `).join("");
+}}
+
+async function loadProducts() {{
+  const res = await fetch("/api/shop/products?lang=" + LANG);
+  const data = await res.json();
+  PRODUCTS = data.products || [];
+  renderProducts();
+}}
+
+async function submitOrder() {{
+  if (!CART.length) {{
+    alert("{empty_cart_label}");
+    return;
+  }}
+
+  const payload = {{
+    name: document.getElementById("name").value.trim(),
+    phone: document.getElementById("phone").value.trim(),
+    city: document.getElementById("city").value.trim(),
+    delivery_type: document.getElementById("delivery").value,
+    payment_method: document.getElementById("payment").value,
+    address: document.getElementById("address").value.trim(),
+    comment: document.getElementById("comment").value.trim(),
+    items: CART
+  }};
+
+  if (!payload.name || !payload.phone) {{
+    alert("Fill name and phone");
+    return;
+  }}
+
+  const res = await fetch("/api/shop/order", {{
+    method: "POST",
+    headers: {{"Content-Type": "application/json"}},
+    body: JSON.stringify(payload)
+  }});
+
+  const data = await res.json();
+  if (data.status === "ok") {{
+    alert("{success_label} #" + data.order_id);
+    clearCart();
+    document.getElementById("name").value = "";
+    document.getElementById("phone").value = "";
+    document.getElementById("city").value = "";
+    document.getElementById("address").value = "";
+    document.getElementById("comment").value = "";
+  }} else {{
+    alert(data.message || "Error");
+  }}
+}}
+
+loadProducts();
+renderCart();
 </script>
-
 </body>
-</html>"""
+</html>
+"""
+    return web.Response(text=html_page, content_type="text/html")
 
-async def health_server():
-    app = web.Application()
 
-    async def health(request):
-        return web.Response(text="OK", status=200)
+# =========================================================
+# PAYMENT STUB PAGES
+# =========================================================
+async def pay_click_page(request: web.Request) -> web.Response:
+    order_id = safe_int(request.match_info.get("order_id"))
+    order = db.order_get(order_id)
 
-    async def cron_monthly(request: web.Request):
-        secret = request.query.get("secret", "")
-        if not cron_allowed(secret):
-            return web.Response(text="Forbidden", status=403)
-        await cron_send_prev_month_report()
-        return web.Response(text="OK", status=200)
+    if not order:
+        return web.Response(text="Order not found", status=404)
 
-    async def cron_daily(request: web.Request):
-        secret = request.query.get("secret", "")
-        if not cron_allowed(secret):
-            return web.Response(text="Forbidden", status=403)
-        await cron_post_daily_to_channel()
-        return web.Response(text="OK", status=200)
+    html_page = f"""
+    <html>
+    <head><meta charset="utf-8"><title>Click Payment</title></head>
+    <body style="font-family:Arial;padding:40px">
+      <h1>Click payment stub</h1>
+      <p>Order: #{order_id}</p>
+      <p>Amount: {money_fmt(order.get('total_amount') or 0)} сум</p>
+      <p>This is a placeholder page. Real Click API can be connected later.</p>
+      <form method="post" action="/pay/click/{order_id}/success">
+        <button type="submit" style="padding:12px 18px">Mark as paid</button>
+      </form>
+    </body>
+    </html>
+    """
+    return web.Response(text=html_page, content_type="text/html")
 
-    # -------- Admin Panel Pages --------
-    async def admin_dashboard(request: web.Request):
-        token = request.query.get("token", "")
-        if not admin_panel_allowed(token):
-            return web.Response(text="Forbidden", status=403)
 
-        body = """
-        <div class="card">
-          <div style="display:flex; justify-content:space-between; align-items:center; gap:10px; flex-wrap:wrap">
-            <div>
-              <div style="font-size:20px"><b>Аналитика</b></div>
-              <div class="small">Данные из SQLite (orders + events). Время: Asia/Tashkent.</div>
-            </div>
-            <div class="small">Открой: <b>/admin?token=...</b></div>
-          </div>
-        </div>
+async def pay_click_success(request: web.Request) -> web.Response:
+    order_id = safe_int(request.match_info.get("order_id"))
+    order = db.order_get(order_id)
+    if not order:
+        return web.Response(text="Order not found", status=404)
 
-        <div class="grid">
-          <div class="card">
-            <div><b>Сегодня</b></div>
-            <div class="small" id="todayStats">Загрузка...</div>
-          </div>
-          <div class="card">
-            <div><b>Этот месяц</b></div>
-            <div class="small" id="monthStats">Загрузка...</div>
-          </div>
-        </div>
+    db.order_update_payment(order_id, "paid")
+    db.order_update_status(order_id, "paid")
 
-        <div class="grid">
-          <div class="card">
-            <div><b>Топ товары (месяц)</b></div>
-            <canvas id="topProducts"></canvas>
-          </div>
-          <div class="card">
-            <div><b>Топ города (месяц)</b></div>
-            <canvas id="topCities"></canvas>
-          </div>
-        </div>
+    if order.get("user_id"):
+        user_lang = get_user_lang(order["user_id"])
+        try:
+            if user_lang == "uz":
+                await bot.send_message(order["user_id"], f"💳 Buyurtmangiz #{order_id} bo'yicha to'lov tasdiqlandi.")
+            else:
+                await bot.send_message(order["user_id"], f"💳 Оплата по заказу #{order_id} подтверждена.")
+        except Exception:
+            pass
 
-        <div class="grid">
-          <div class="card">
-            <div><b>RU vs UZ (месяц)</b></div>
-            <canvas id="langChart"></canvas>
-          </div>
-          <div class="card">
-            <div><b>Конверсия (месяц)</b></div>
-            <div class="small" id="funnelBox">Загрузка...</div>
-          </div>
-        </div>
+    return web.Response(text="Payment marked as paid", content_type="text/plain")
 
-        <script>
-        async function api(path){
-          const params = new URLSearchParams(location.search);
-          const token = params.get("token") || "";
-          const r = await fetch(path + "?token=" + encodeURIComponent(token));
-          if(!r.ok) throw new Error("API error");
-          return await r.json();
-        }
 
-        function formatStats(s){
-          return `Всего: ${s.total} | Новые: ${s.new} | В обработке: ${s.processing} | Отправлено: ${s.shipped} | Доставлено: ${s.delivered} | Отменено: ${s.cancelled}`;
-        }
+async def pay_payme_page(request: web.Request) -> web.Response:
+    order_id = safe_int(request.match_info.get("order_id"))
+    order = db.order_get(order_id)
 
-        (async () => {
-          const today = await api("/admin/api/stats/today");
-          const month = await api("/admin/api/stats/month");
+    if not order:
+        return web.Response(text="Order not found", status=404)
 
-          document.getElementById("todayStats").textContent = formatStats(today.stats);
-          document.getElementById("monthStats").textContent = formatStats(month.stats);
+    html_page = f"""
+    <html>
+    <head><meta charset="utf-8"><title>Payme Payment</title></head>
+    <body style="font-family:Arial;padding:40px">
+      <h1>Payme payment stub</h1>
+      <p>Order: #{order_id}</p>
+      <p>Amount: {money_fmt(order.get('total_amount') or 0)} сум</p>
+      <p>This is a placeholder page. Real Payme API can be connected later.</p>
+      <form method="post" action="/pay/payme/{order_id}/success">
+        <button type="submit" style="padding:12px 18px">Mark as paid</button>
+      </form>
+    </body>
+    </html>
+    """
+    return web.Response(text=html_page, content_type="text/html")
 
-          const tp = month.top_products;
-          new Chart(document.getElementById("topProducts"), {
-            type: "bar",
-            data: {
-              labels: tp.map(x => x.name),
-              datasets: [{ label: "Кол-во", data: tp.map(x => x.count) }]
-            },
-            options: {
-              plugins: { legend: { display: false } }
-            }
-          });
 
-          const tc = month.top_cities;
-          new Chart(document.getElementById("topCities"), {
-            type: "bar",
-            data: {
-              labels: tc.map(x => x.city),
-              datasets: [{ label: "Заказы", data: tc.map(x => x.count) }]
-            },
-            options: {
-              plugins: { legend: { display: false } }
-            }
-          });
+async def pay_payme_success(request: web.Request) -> web.Response:
+    order_id = safe_int(request.match_info.get("order_id"))
+    order = db.order_get(order_id)
+    if not order:
+        return web.Response(text="Order not found", status=404)
 
-          const lc = month.ru_vs_uz;
-          new Chart(document.getElementById("langChart"), {
-            type: "doughnut",
-            data: {
-              labels: ["RU", "UZ", "Unknown"],
-              datasets: [{ data: [lc.ru, lc.uz, lc.unknown] }]
-            }
-          });
+    db.order_update_payment(order_id, "paid")
+    db.order_update_status(order_id, "paid")
 
-          const f = month.funnel;
-          document.getElementById("funnelBox").innerHTML =
-            `<div class="small">Добавили в корзину: <b>${f.cart_add}</b></div>` +
-            `<div class="small">Оформили заказ: <b>${f.order_created}</b></div>` +
-            `<div class="small">Конверсия: <b>${f.conversion}%</b></div>`;
-        })().catch(e => {
-          document.getElementById("todayStats").textContent = "Ошибка загрузки";
-          document.getElementById("monthStats").textContent = "Ошибка загрузки";
-          document.getElementById("funnelBox").textContent = "Ошибка загрузки";
-        });
-        </script>
-        """
-        return web.Response(text=_render_base_html("ZARY Admin Dashboard", body), content_type="text/html")
+    if order.get("user_id"):
+        user_lang = get_user_lang(order["user_id"])
+        try:
+            if user_lang == "uz":
+                await bot.send_message(order["user_id"], f"💳 Buyurtmangiz #{order_id} bo'yicha to'lov tasdiqlandi.")
+            else:
+                await bot.send_message(order["user_id"], f"💳 Оплата по заказу #{order_id} подтверждена.")
+        except Exception:
+            pass
 
-    async def admin_orders(request: web.Request):
-        token = request.query.get("token", "")
-        if not admin_panel_allowed(token):
-            return web.Response(text="Forbidden", status=403)
+    return web.Response(text="Payment marked as paid", content_type="text/plain")
 
-        body = """
-        <div class="card">
-          <div style="display:flex; justify-content:space-between; align-items:center; gap:10px; flex-wrap:wrap">
-            <div>
-              <div style="font-size:20px"><b>Заказы</b></div>
-              <div class="small">Фильтр: статус/город/телефон. Можно менять статус прямо тут.</div>
-            </div>
-          </div>
 
-          <div class="row" style="margin-top:12px">
-            <select class="input" id="st">
-              <option value="">Все статусы</option>
-              <option value="new">new</option>
-              <option value="processing">processing</option>
-              <option value="shipped">shipped</option>
-              <option value="delivered">delivered</option>
-              <option value="cancelled">cancelled</option>
-            </select>
-            <input class="input" id="city" placeholder="Город (часть)"/>
-            <input class="input" id="phone" placeholder="Телефон (часть)"/>
-            <button class="btn" id="go">Показать</button>
-          </div>
-        </div>
+# =========================================================
+# API
+# =========================================================
+async def api_shop_products(request: web.Request) -> web.Response:
+    lang = parse_web_lang(request)
+    products = db.shop_products_list(published_only=True, limit=500)
 
-        <div class="card">
-          <div id="tableWrap" class="small">Загрузка...</div>
-        </div>
+    result = [product_to_web_dict(p, lang) for p in products if safe_int(p.get("is_published"), 1) == 1]
+    return web.json_response({"status": "ok", "products": result})
 
-        <script>
-        function qs(id){ return document.getElementById(id); }
-        function token(){ return new URLSearchParams(location.search).get("token") || ""; }
 
-        async function api(path, opts){
-          const glue = path.includes("?") ? "&" : "?";
-          const r = await fetch(path + glue + "token=" + encodeURIComponent(token()), opts || {});
-          if(!r.ok) throw new Error("API error");
-          return await r.json();
-        }
+async def api_shop_order(request: web.Request) -> web.Response:
+    try:
+        data = await request.json()
+    except Exception:
+        return web.json_response({"status": "error", "message": "Invalid JSON"}, status=400)
 
-        function statusSelect(id, current){
-          const st = ["new","processing","shipped","delivered","cancelled"];
-          return `<select class="input" data-oid="${id}">
-            ${st.map(s => `<option value="${s}" ${s===current?"selected":""}>${s}</option>`).join("")}
-          </select>`;
-        }
+    name = (data.get("name") or "").strip()
+    phone = normalize_phone((data.get("phone") or "").strip())
+    city = (data.get("city") or "").strip()
+    address = (data.get("address") or "").strip()
+    comment = (data.get("comment") or "").strip()
+    delivery_type = (data.get("delivery_type") or "yandex_courier").strip()
+    payment_method = (data.get("payment_method") or "click").strip()
+    items = data.get("items") or []
 
-        function render(rows){
-          if(!rows.length){
-            qs("tableWrap").innerHTML = "Нет заказов по фильтру";
-            return;
-          }
-          const html = `
-          <table class="table">
-            <thead>
-              <tr>
-                <th>ID</th><th>Дата</th><th>Клиент</th><th>Телефон</th><th>Город</th><th>Товары</th><th>Статус</th><th>Действие</th>
-              </tr>
-            </thead>
-            <tbody>
-              ${rows.map(o => `
-                <tr>
-                  <td>#${o.id}</td>
-                  <td>${(o.created_at||"").slice(0,16)}</td>
-                  <td>${o.name||""}</td>
-                  <td>${o.phone||""}</td>
-                  <td>${o.city||""}</td>
-                  <td>${(o.items_preview||"")}</td>
-                  <td>${statusSelect(o.id, o.status)}</td>
-                  <td><button class="btn btn2" data-save="${o.id}">Сохранить</button></td>
-                </tr>
-              `).join("")}
-            </tbody>
-          </table>`;
-          qs("tableWrap").innerHTML = html;
+    if not name or not phone_is_valid(phone):
+        return web.json_response({"status": "error", "message": "Invalid name or phone"}, status=400)
 
-          document.querySelectorAll("[data-save]").forEach(btn => {
-            btn.addEventListener("click", async () => {
-              const id = btn.getAttribute("data-save");
-              const sel = document.querySelector(`select[data-oid="${id}"]`);
-              const status = sel.value;
-              btn.textContent = "...";
-              try{
-                await api("/admin/api/order/status", {
-                  method:"POST",
-                  headers: {"Content-Type":"application/json"},
-                  body: JSON.stringify({order_id: Number(id), status})
-                });
-                btn.textContent = "OK";
-                setTimeout(()=>btn.textContent="Сохранить", 800);
-              }catch(e){
-                btn.textContent = "ERR";
-                setTimeout(()=>btn.textContent="Сохранить", 1200);
-              }
-            });
-          });
-        }
+    if delivery_type not in DELIVERY_TYPES:
+        delivery_type = "yandex_courier"
 
-        async function load(){
-          qs("tableWrap").textContent = "Загрузка...";
-          const st = qs("st").value;
-          const city = qs("city").value.trim();
-          const phone = qs("phone").value.trim();
-          const path = `/admin/api/orders?status=${encodeURIComponent(st)}&city=${encodeURIComponent(city)}&phone=${encodeURIComponent(phone)}`;
-          const data = await api(path);
-          render(data.orders);
-        }
+    if payment_method not in PAYMENT_METHODS:
+        payment_method = "click"
 
-        qs("go").addEventListener("click", load);
-        load();
-        </script>
-        """
-        return web.Response(text=_render_base_html("ZARY Admin Orders", body), content_type="text/html")
+    normalized_items: List[Dict[str, Any]] = []
+    total_qty = 0
+    total_amount = 0
 
-    # -------- Admin Panel APIs --------
-    async def api_stats_today(request: web.Request):
-        token = request.query.get("token", "")
-        if not admin_panel_allowed(token):
-            return web.json_response({"error": "forbidden"}, status=403)
-        dt = now_tz()
-        start, end = _today_range_strings(dt)
-        stats = db.stats_range(start, end)
-        return web.json_response({"range": {"start": start, "end": end}, "stats": stats})
+    for item in items:
+        product_id = safe_int(item.get("product_id") or item.get("id"), 0)
+        product = db.shop_product_get(product_id) if product_id else None
 
-    async def api_stats_month(request: web.Request):
-        token = request.query.get("token", "")
-        if not admin_panel_allowed(token):
-            return web.json_response({"error": "forbidden"}, status=403)
-        dt = now_tz()
-        start, end = _month_range_strings(dt)
-        stats = db.stats_range(start, end)
-        top_products = [{"name": n, "count": c} for n, c in db.top_products_range(start, end)]
-        top_cities = [{"city": n, "count": c} for n, c in db.top_cities_range(start, end)]
-        ruuz = db.ru_vs_uz_range(start, end)
-        funnel = db.funnel_range(start, end)
-        return web.json_response({
-            "range": {"start": start, "end": end},
-            "stats": stats,
-            "top_products": top_products,
-            "top_cities": top_cities,
-            "ru_vs_uz": ruuz,
-            "funnel": funnel
+        title = (
+            (product.get("title_ru") if product else None)
+            or item.get("product_name")
+            or item.get("title")
+            or "Item"
+        )
+        price = safe_int(product.get("price"), 0) if product else safe_int(item.get("price"), 0)
+        qty = max(1, safe_int(item.get("qty"), 1))
+        size = (item.get("size") or "").strip()
+
+        normalized_items.append({
+            "product_id": product_id or None,
+            "product_name": title,
+            "name": title,
+            "price": price,
+            "qty": qty,
+            "size": size,
         })
 
-    async def api_orders(request: web.Request):
-        token = request.query.get("token", "")
-        if not admin_panel_allowed(token):
-            return web.json_response({"error": "forbidden"}, status=403)
+        total_qty += qty
+        total_amount += price * qty
 
-        status = request.query.get("status", "").strip()
-        city = request.query.get("city", "").strip()
-        phone = request.query.get("phone", "").strip()
+    order_id = db.order_create({
+        "user_id": None,
+        "username": "",
+        "customer_name": name,
+        "customer_phone": phone,
+        "city": city,
+        "items": normalized_items,
+        "total_qty": total_qty,
+        "total_amount": total_amount,
+        "delivery_service": delivery_type,
+        "delivery_type": delivery_type,
+        "delivery_address": address,
+        "payment_method": payment_method,
+        "payment_status": "pending",
+        "comment": comment,
+        "status": "new",
+        "source": "web",
+    })
 
-        rows = db.orders_filter(status=status, city=city, phone_q=phone, limit=200)
-        orders = []
-        for o in rows:
-            try:
-                items = json.loads(o.get("items") or "[]")
-                items_preview = ", ".join([f"{it.get('name','')} x{it.get('qty',1)}" for it in items[:3]])
-            except Exception:
-                items_preview = ""
-            orders.append({
-                "id": o["id"],
-                "created_at": o.get("created_at",""),
-                "name": o.get("name",""),
-                "phone": o.get("phone",""),
-                "city": o.get("city",""),
-                "status": o.get("status",""),
-                "items_preview": items_preview
-            })
-        return web.json_response({"orders": orders})
+    order = db.order_get(order_id)
+    await send_order_to_admins(order_id)
 
-    async def api_order_status(request: web.Request):
-        token = request.query.get("token", "")
-        if not admin_panel_allowed(token):
-            return web.json_response({"error": "forbidden"}, status=403)
+    if order:
+        await send_payment_stub(order, "ru")
 
-        try:
-            payload = await request.json()
-        except Exception:
-            return web.json_response({"error": "bad_json"}, status=400)
+    return web.json_response({"status": "ok", "order_id": order_id})
 
-        order_id = int(payload.get("order_id", 0) or 0)
-        status = (payload.get("status", "") or "").strip()
-        if order_id <= 0 or status not in ("new","processing","shipped","delivered","cancelled"):
-            return web.json_response({"error": "bad_params"}, status=400)
 
-        db.order_update_status(order_id, status, PRIMARY_ADMIN)
+# =========================================================
+# MEDIA PROXY
+# =========================================================
+async def media_proxy(request: web.Request) -> web.Response:
+    """
+    Placeholder for Telegram file proxy.
+    Сейчас возвращает заглушку, чтобы не ломать магазин без реального file download.
+    Позже можно подключить bot.get_file + CDN/proxy.
+    """
+    file_id = request.match_info.get("file_id", "")
+    if not file_id:
+        return web.Response(text="No file", status=404)
 
-        # notify customer
-        order = db.order_get(order_id)
-        if order:
-            user_row = db.user_get(order["user_id"])
-            lang = user_row["lang"] if user_row else "ru"
-            try:
-                if status == "processing":
-                    await bot.send_message(
-                        order["user_id"],
-                        (f"⚙️ Заказ #{order_id} в обработке!\nМенеджер скоро свяжется.")
-                        if lang == "ru" else
-                        (f"⚙️ Buyurtma #{order_id} ishlanmoqda!\nMenejer tez orada bog'lanadi."),
-                        reply_markup=kb_main(lang, is_admin(order["user_id"]))
-                    )
-                elif status == "shipped":
-                    await bot.send_message(
-                        order["user_id"],
-                        (f"🚚 Заказ #{order_id} отправлен и уже в пути!\nМы сообщим, когда он будет доставлен.\n⏰ 09:00-21:00")
-                        if lang == "ru" else
-                        (f"🚚 Buyurtma #{order_id} jo'natildi va yo'lda!\nYetkazilganda xabar beramiz.\n⏰ 09:00-21:00"),
-                        reply_markup=kb_main(lang, is_admin(order["user_id"]))
-                    )
-                elif status == "delivered":
-                    await bot.send_message(
-                        order["user_id"],
-                        (f"✅ Заказ #{order_id} доставлен!\nСпасибо, что выбрали ZARY & CO 🤍")
-                        if lang == "ru" else
-                        (f"✅ Buyurtma #{order_id} yetkazildi!\nZARY & CO ni tanlaganingiz uchun rahmat 🤍"),
-                        reply_markup=kb_main(lang, is_admin(order["user_id"]))
-                    )
-                    await bot.send_message(order["user_id"], TEXT[lang]["thanks_delivered"], reply_markup=kb_follow_links(lang))
-                elif status == "cancelled":
-                    await bot.send_message(
-                        order["user_id"],
-                        (f"❌ Заказ #{order_id} отменён.\nЕсли это ошибка — напишите менеджеру.")
-                        if lang == "ru" else
-                        (f"❌ Buyurtma #{order_id} bekor qilindi.\nAgar xato bo‘lsa — menejerga yozing."),
-                        reply_markup=kb_main(lang, is_admin(order["user_id"]))
-                    )
-            except Exception as e:
-                print("Web notify failed:", e)
+    svg = """
+    <svg xmlns="http://www.w3.org/2000/svg" width="600" height="600">
+      <rect width="100%" height="100%" fill="#eeeeee"/>
+      <text x="50%" y="50%" dominant-baseline="middle" text-anchor="middle"
+            font-family="Arial" font-size="28" fill="#777777">ZARY PHOTO</text>
+    </svg>
+    """
+    return web.Response(text=svg, content_type="image/svg+xml")
 
-        return web.json_response({"ok": True})
 
-    # routes
-    app.router.add_get("/", health)
-    app.router.add_get("/health", health)
-    app.router.add_get("/cron/monthly", cron_monthly)
-    app.router.add_get("/cron/daily", cron_daily)
+# =========================================================
+# WEB ADMIN
+# =========================================================
+async def admin_dashboard(request: web.Request) -> web.Response:
+    token = request.query.get("token", "")
+    if not admin_panel_allowed(token):
+        return web.Response(text="Access denied", status=403)
 
-    app.router.add_get("/admin", admin_dashboard)
-    app.router.add_get("/admin/orders", admin_orders)
+    stats = db.get_stats_all()
+    products_count = db.shop_products_count()
 
-    app.router.add_get("/admin/api/stats/today", api_stats_today)
-    app.router.add_get("/admin/api/stats/month", api_stats_month)
-    app.router.add_get("/admin/api/orders", api_orders)
-    app.router.add_post("/admin/api/order/status", api_order_status)
+    html_page = f"""
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1"/>
+<title>ZARY ADMIN</title>
+<style>
+body{{font-family:Arial,sans-serif;background:#f5f5f5;padding:30px;color:#111}}
+.wrap{{max-width:1100px;margin:0 auto}}
+.cards{{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:16px;margin-bottom:24px}}
+.card{{background:#fff;padding:18px;border-radius:16px;box-shadow:0 6px 18px rgba(0,0,0,.06)}}
+.num{{font-size:30px;font-weight:700;margin-top:8px}}
+a.btn{{display:inline-block;padding:12px 16px;background:#111;color:#fff;text-decoration:none;border-radius:10px;margin-right:10px;margin-bottom:10px}}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>ZARY ADMIN</h1>
+  <div class="cards">
+    <div class="card"><div>Всего заказов</div><div class="num">{safe_int(stats.get('total'), 0)}</div></div>
+    <div class="card"><div>Новые</div><div class="num">{safe_int(stats.get('new_count'), 0)}</div></div>
+    <div class="card"><div>В обработке</div><div class="num">{safe_int(stats.get('processing'), 0)}</div></div>
+    <div class="card"><div>Доставлены</div><div class="num">{safe_int(stats.get('delivered'), 0)}</div></div>
+    <div class="card"><div>Клиенты</div><div class="num">{safe_int(stats.get('unique_users'), 0)}</div></div>
+    <div class="card"><div>Товары</div><div class="num">{products_count}</div></div>
+  </div>
 
-    runner = web.AppRunner(app)
+  <a class="btn" href="/admin/orders?token={esc(token)}">Заказы</a>
+  <a class="btn" href="/admin/products?token={esc(token)}">Товары</a>
+  <a class="btn" href="/health">Health</a>
+</div>
+</body>
+</html>
+"""
+    return web.Response(text=html_page, content_type="text/html")
+
+
+async def admin_orders_page(request: web.Request) -> web.Response:
+    token = request.query.get("token", "")
+    if not admin_panel_allowed(token):
+        return web.Response(text="Access denied", status=403)
+
+    status = (request.query.get("status") or "").strip()
+    city = (request.query.get("city") or "").strip()
+    phone_q = (request.query.get("phone") or "").strip()
+
+    rows = db.orders_filter(status=status, city=city, phone_q=phone_q, limit=300)
+
+    html_page = f"""
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1"/>
+<title>ZARY Orders</title>
+<style>
+body{{font-family:Arial,sans-serif;background:#f5f5f5;padding:30px}}
+.wrap{{max-width:1300px;margin:0 auto}}
+table{{width:100%;border-collapse:collapse;background:#fff}}
+th,td{{border:1px solid #ddd;padding:10px;text-align:left;font-size:14px;vertical-align:top}}
+th{{background:#111;color:#fff}}
+input,select{{padding:10px;border:1px solid #ddd;border-radius:8px}}
+button{{padding:10px 14px;border:none;background:#111;color:#fff;border-radius:8px;cursor:pointer}}
+a{{display:inline-block;margin-bottom:20px}}
+.form{{display:flex;gap:10px;flex-wrap:wrap;margin-bottom:16px}}
+</style>
+</head>
+<body>
+<div class="wrap">
+<a href="/admin?token={esc(token)}">← Назад</a>
+<h1>Orders</h1>
+
+<form class="form" method="get" action="/admin/orders">
+  <input type="hidden" name="token" value="{esc(token)}"/>
+  <select name="status">
+    <option value="">Все статусы</option>
+    <option value="new" {"selected" if status=="new" else ""}>new</option>
+    <option value="processing" {"selected" if status=="processing" else ""}>processing</option>
+    <option value="confirmed" {"selected" if status=="confirmed" else ""}>confirmed</option>
+    <option value="paid" {"selected" if status=="paid" else ""}>paid</option>
+    <option value="shipped" {"selected" if status=="shipped" else ""}>shipped</option>
+    <option value="delivered" {"selected" if status=="delivered" else ""}>delivered</option>
+    <option value="cancelled" {"selected" if status=="cancelled" else ""}>cancelled</option>
+  </select>
+  <input name="city" placeholder="Город" value="{esc(city)}"/>
+  <input name="phone" placeholder="Телефон" value="{esc(phone_q)}"/>
+  <button type="submit">Фильтр</button>
+</form>
+
+<table>
+<tr>
+<th>ID</th>
+<th>Дата</th>
+<th>Имя</th>
+<th>Телефон</th>
+<th>Город</th>
+<th>Доставка</th>
+<th>Оплата</th>
+<th>Товары</th>
+<th>Сумма</th>
+<th>Статус</th>
+</tr>
+{admin_orders_html_rows(rows)}
+</table>
+</div>
+</body>
+</html>
+"""
+    return web.Response(text=html_page, content_type="text/html")
+
+
+async def admin_products_page(request: web.Request) -> web.Response:
+    token = request.query.get("token", "")
+    if not admin_panel_allowed(token):
+        return web.Response(text="Access denied", status=403)
+
+    rows = db.shop_products_list(published_only=False, limit=500)
+
+    html_page = f"""
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1"/>
+<title>ZARY Products</title>
+<style>
+body{{font-family:Arial,sans-serif;background:#f5f5f5;padding:30px}}
+.wrap{{max-width:1200px;margin:0 auto}}
+table{{width:100%;border-collapse:collapse;background:#fff}}
+th,td{{border:1px solid #ddd;padding:10px;text-align:left;font-size:14px}}
+th{{background:#111;color:#fff}}
+a{{display:inline-block;margin-bottom:20px}}
+</style>
+</head>
+<body>
+<div class="wrap">
+<a href="/admin?token={esc(token)}">← Назад</a>
+<h1>Products</h1>
+<table>
+<tr>
+<th>ID</th>
+<th>Название</th>
+<th>Категория</th>
+<th>Цена</th>
+<th>Старая цена</th>
+<th>Остаток</th>
+<th>Опубликован</th>
+</tr>
+{admin_products_html_rows(rows)}
+</table>
+</div>
+</body>
+</html>
+"""
+    return web.Response(text=html_page, content_type="text/html")
+
+
+# =========================================================
+# HEALTH / CRON
+# =========================================================
+async def health(request: web.Request) -> web.Response:
+    return web.Response(text="OK", status=200)
+
+
+async def cron_daily(request: web.Request) -> web.Response:
+    secret = request.query.get("secret", "")
+    if not cron_allowed(secret):
+        return web.Response(text="Forbidden", status=403)
+
+    await cron_post_daily_to_channel()
+    await check_reminders()
+    return web.Response(text="daily ok", status=200)
+
+
+async def cron_monthly(request: web.Request) -> web.Response:
+    secret = request.query.get("secret", "")
+    if not cron_allowed(secret):
+        return web.Response(text="Forbidden", status=403)
+
+    await generate_monthly_report_to_admins()
+    return web.Response(text="monthly ok", status=200)
+
+
+# =========================================================
+# ROUTES
+# =========================================================
+web_app.router.add_get("/", shop_index)
+web_app.router.add_get("/health", health)
+
+web_app.router.add_get("/api/shop/products", api_shop_products)
+web_app.router.add_post("/api/shop/order", api_shop_order)
+
+web_app.router.add_get("/media/{file_id}", media_proxy)
+
+web_app.router.add_get("/pay/click/{order_id}", pay_click_page)
+web_app.router.add_post("/pay/click/{order_id}/success", pay_click_success)
+web_app.router.add_get("/pay/payme/{order_id}", pay_payme_page)
+web_app.router.add_post("/pay/payme/{order_id}/success", pay_payme_success)
+
+web_app.router.add_get("/admin", admin_dashboard)
+web_app.router.add_get("/admin/orders", admin_orders_page)
+web_app.router.add_get("/admin/products", admin_products_page)
+
+web_app.router.add_get("/cron/daily", cron_daily)
+web_app.router.add_get("/cron/monthly", cron_monthly)
+
+
+# =========================================================
+# STARTUP
+# =========================================================
+async def on_startup():
+    print("Starting reminders loop...")
+    asyncio.create_task(reminders_loop())
+
+
+async def main():
+    print("Starting bot and web server...")
+
+    await on_startup()
+
+    runner = web.AppRunner(web_app)
     await runner.setup()
+
     site = web.TCPSite(runner, "0.0.0.0", PORT)
     await site.start()
-    print(f"✅ Health/Admin server on port {PORT}")
 
+    print(f"Web server started on port {PORT}")
+    print("Bot polling started")
 
-# =========================
-# MAIN
-# =========================
-async def main():
-    await health_server()
-    asyncio.create_task(reminders_loop())
-    print(f"✅ Bot started with {len(ADMIN_IDS)} admins: {ADMIN_IDS}")
-    if CHANNEL_ID:
-        print(f"✅ Channel enabled: {CHANNEL_ID}")
-    if CRON_SECRET:
-        print("✅ Cron endpoints enabled: /cron/monthly /cron/daily")
-    print("✅ Admin panel: /admin?token=YOUR_TOKEN")
     await dp.start_polling(bot)
+
 
 if __name__ == "__main__":
     asyncio.run(main())
 
+
+# =========================================================
+# PART 4/4 END
+# =========================================================
